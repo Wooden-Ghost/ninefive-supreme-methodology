@@ -1,0 +1,387 @@
+(() => {
+  "use strict";
+
+  const MAP = {
+    done: "已做",
+    linkedin: "只有领英无邮箱",
+    none: "皆无",
+    sn: "SN", // 新增SN选项
+    not_done: "未做" // 新增"未做"选项
+  };
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ========= 精准定位：只用你给的结构 =========
+  function findContactCollectInput() {
+    // 只找 label 文本精确等于"是否联系人收集"的那一项
+    const labelEl = [...document.querySelectorAll(".n-form-item-label__text")]
+      .find((el) => (el.textContent || "").trim() === "是否联系人收集");
+
+    if (!labelEl) return null;
+
+    const formItem = labelEl.closest(".n-form-item");
+    if (!formItem) return null;
+
+    // 只在该 form-item 内找 input
+    const input = formItem.querySelector("input.n-input__input-el[type='text']");
+    return input || null;
+  }
+
+  function findUpdateButton() {
+    // 优先找 Naive UI 按钮内容 span
+    const btn1 = [...document.querySelectorAll("button")]
+      .find((b) => (b.querySelector(".n-button__content")?.textContent || "").trim() === "更新");
+    if (btn1) return btn1;
+
+    // 兜底：按钮 innerText
+    const btn2 = [...document.querySelectorAll("button")]
+      .find((b) => (b.innerText || "").trim() === "更新");
+    return btn2 || null;
+  }
+
+  function setVueFriendlyValue(input, value) {
+    input.focus();
+    input.value = value;
+
+    // 关键：触发 Vue / Naive UI 的监听
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(new Event("blur", { bubbles: true }));
+  }
+
+  async function run(mode) {
+    const val = MAP[mode];
+    if (!val) throw new Error("未知模式：" + mode);
+
+    const input = findContactCollectInput();
+    if (!input) throw new Error("没找到'是否联系人收集'的输入框（请确认当前在编辑页，且字段存在）");
+
+    // 可视化提示：短暂高亮一下，避免你担心定位错
+    const oldOutline = input.style.outline;
+    input.style.outline = "2px solid #00a6ab";
+    setTimeout(() => (input.style.outline = oldOutline), 1200);
+
+    setVueFriendlyValue(input, val);
+
+    // 给前端一点时间同步
+    await sleep(150);
+
+    const btn = findUpdateButton();
+    if (!btn) throw new Error("没找到'更新'按钮");
+
+    btn.click();
+  }
+
+  // ========= 滚动到页面底部（直接快速滚动） =========
+  function scrollToBottom() {
+    // 查找所有可能的滚动容器
+    const scrollContainers = document.querySelectorAll('.n-scrollbar-container, .n-scrollbar-content, .n-scrollbar');
+    
+    // 找到可滚动的容器（scrollHeight > clientHeight）
+    let scrollableContainer = null;
+    let maxScrollableHeight = 0;
+    
+    scrollContainers.forEach((container, i) => {
+      if (container.scrollHeight > container.clientHeight) {
+        const scrollableHeight = container.scrollHeight - container.clientHeight;
+        if (scrollableHeight > maxScrollableHeight) {
+          maxScrollableHeight = scrollableHeight;
+          scrollableContainer = container;
+          console.log(`找到可滚动容器 #${i}: clientHeight=${container.clientHeight}, scrollHeight=${container.scrollHeight}, scrollTop=${container.scrollTop}`);
+        }
+      }
+    });
+    
+    if (scrollableContainer) {
+      // 临时高亮显示滚动容器
+      const oldOutline = scrollableContainer.style.outline;
+      scrollableContainer.style.outline = "3px solid #f59e0b";
+      setTimeout(() => {
+        scrollableContainer.style.outline = oldOutline;
+      }, 1000);
+      
+      // 先模拟点击容器内的某个元素，确保焦点在容器内
+      const clickableElement = scrollableContainer.querySelector("input, textarea, button, [tabindex], .n-form-item-feedback-wrapper");
+      if (clickableElement) {
+        clickableElement.click();
+        clickableElement.focus();
+      } else {
+        // 给容器添加tabindex并聚焦
+        const originalTabIndex = scrollableContainer.getAttribute("tabindex");
+        scrollableContainer.setAttribute("tabindex", "-1");
+        scrollableContainer.focus();
+        
+        // 恢复原tabindex
+        if (originalTabIndex !== null) {
+          setTimeout(() => {
+            scrollableContainer.setAttribute("tabindex", originalTabIndex);
+          }, 100);
+        } else {
+          setTimeout(() => {
+            scrollableContainer.removeAttribute("tabindex");
+          }, 100);
+        }
+      }
+      
+      // 立即滚动到底部 - 取消平滑效果，直接设置
+      scrollableContainer.scrollTop = scrollableContainer.scrollHeight;
+      
+      // 使用无平滑效果的scrollTo确保立即滚动
+      scrollableContainer.scrollTo(0, scrollableContainer.scrollHeight);
+      
+      // 添加一个微小的延迟，然后再次检查确保滚动到底部
+      setTimeout(() => {
+        if (scrollableContainer.scrollTop + scrollableContainer.clientHeight < scrollableContainer.scrollHeight - 10) {
+          // 如果还没到底，再滚一次
+          scrollableContainer.scrollTop = scrollableContainer.scrollHeight;
+          scrollableContainer.scrollTo(0, scrollableContainer.scrollHeight);
+        }
+      }, 50);
+      
+      return {
+        container: scrollableContainer,
+        clientHeight: scrollableContainer.clientHeight,
+        scrollHeight: scrollableContainer.scrollHeight,
+        scrollTop: scrollableContainer.scrollTop
+      };
+    } else {
+      // 如果没有找到可滚动容器，回退到滚动整个页面
+      window.scrollTo(0, document.body.scrollHeight || document.documentElement.scrollHeight);
+      return null;
+    }
+  }
+
+  // ========= UI 面板（可拖动） =========
+  // 防重复注入
+  if (window.__crmConsolePanel) {
+    window.__crmConsolePanel.remove();
+    window.__crmConsolePanel = null;
+  }
+
+  const panel = document.createElement("div");
+  panel.style.cssText = `
+    position: fixed;
+    left: ${Math.max(16, window.innerWidth - 320)}px;
+    top: ${Math.max(16, window.innerHeight - 200)}px;
+    z-index: 999999;
+    width: 290px;
+    background: rgba(0,0,0,0.82);
+    border-radius: 10px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.28);
+    color: #fff;
+    font: 12px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial;
+    user-select: none;
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.1);
+  `;
+
+  const header = document.createElement("div");
+  header.style.cssText = `
+    padding: 10px 12px;
+    cursor: move;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid rgba(255,255,255,0.15);
+    background: rgba(0,0,0,0.4);
+    border-radius: 10px 10px 0 0;
+  `;
+
+  const title = document.createElement("div");
+  title.textContent = "CRM快速操作面板";
+  title.style.cssText = "font-weight: 600; letter-spacing: .2px; color: #00a6ab;";
+  header.appendChild(title);
+
+  const close = document.createElement("button");
+  close.textContent = "×";
+  close.title = "关闭";
+  close.style.cssText = `
+    cursor: pointer;
+    border: 0;
+    border-radius: 8px;
+    padding: 4px 10px;
+    background: rgba(255,255,255,0.1);
+    color: #fff;
+    font-size: 16px;
+    transition: background 0.2s;
+  `;
+  close.onmouseover = () => close.style.background = "rgba(255,255,255,0.25)";
+  close.onmouseout = () => close.style.background = "rgba(255,255,255,0.1)";
+  close.onclick = () => {
+    panel.remove();
+    window.__crmConsolePanel = null;
+  };
+  header.appendChild(close);
+
+  const body = document.createElement("div");
+  body.style.cssText = "padding: 12px; display: grid; gap: 10px;";
+
+  const status = document.createElement("div");
+  status.textContent = "状态：就绪";
+  status.style.cssText = "opacity: .9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px;";
+  body.appendChild(status);
+
+  function mkBtn(label, mode, bgColor = "#00a6ab") {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = `
+      cursor: pointer;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px;
+      background: ${bgColor};
+      color: #fff;
+      font-weight: 600;
+      transition: all 0.2s;
+      font-size: 13px;
+    `;
+    
+    b.onmouseover = () => {
+      b.style.filter = "brightness(1.15)";
+      b.style.transform = "translateY(-1px)";
+    };
+    
+    b.onmouseout = () => {
+      b.style.filter = "brightness(1)";
+      b.style.transform = "translateY(0)";
+    };
+    
+    b.onclick = async () => {
+      b.disabled = true;
+      const oldBg = b.style.background;
+      b.style.background = "#555";
+      b.style.cursor = "wait";
+      status.textContent = `状态：执行中（${label}）...`;
+
+      try {
+        await run(mode);
+        status.textContent = `状态：完成（${label}）已点击更新`;
+      } catch (e) {
+        status.textContent = `状态：失败（${label}）${e.message}`;
+        console.error(e);
+      } finally {
+        setTimeout(() => {
+          b.disabled = false;
+          b.style.background = oldBg;
+          b.style.cursor = "pointer";
+        }, 300);
+      }
+    };
+    
+    return b;
+  }
+
+  // 创建两行按钮容器，每行3列
+  const btnRow1 = document.createElement("div");
+  btnRow1.style.cssText = "display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;";
+  
+  const btnRow2 = document.createElement("div");
+  btnRow2.style.cssText = "display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;";
+
+  // 第一行按钮：已做、领英、皆无
+  btnRow1.appendChild(mkBtn("已做", "done", "#00a6ab"));
+  btnRow1.appendChild(mkBtn("领英", "linkedin", "#0077b5"));
+  btnRow1.appendChild(mkBtn("皆无", "none", "#666"));
+
+  // 第二行按钮：未做、SN、END
+  btnRow2.appendChild(mkBtn("未做", "not_done", "#EF4444")); // 红色，表示未完成
+  btnRow2.appendChild(mkBtn("填写SN", "sn", "#8B5CF6")); // 紫色
+  
+  // END按钮（特殊功能：滚动到底部）
+  const endBtn = document.createElement("button");
+  endBtn.textContent = "END";
+  endBtn.style.cssText = `
+    cursor: pointer;
+    border: 0;
+    border-radius: 8px;
+    padding: 10px;
+    background: linear-gradient(135deg, #f59e0b, #d97706);
+    color: #fff;
+    font-weight: 700;
+    transition: all 0.2s;
+    font-size: 13px;
+    letter-spacing: 1px;
+  `;
+  
+  endBtn.onmouseover = () => {
+    endBtn.style.filter = "brightness(1.15)";
+    endBtn.style.transform = "translateY(-1px)";
+  };
+  
+  endBtn.onmouseout = () => {
+    endBtn.style.filter = "brightness(1)";
+    endBtn.style.transform = "translateY(0)";
+  };
+  
+  endBtn.onclick = () => {
+    status.textContent = "状态：快速滚动到底部...";
+    
+    const result = scrollToBottom();
+    
+    if (result) {
+      setTimeout(() => {
+        status.textContent = `状态：已快速滚动到容器底部 (${result.scrollHeight - result.clientHeight}px可滚动区域)`;
+      }, 100);
+    } else {
+      status.textContent = "状态：未找到可滚动容器，已滚动整个页面";
+    }
+  };
+  
+  btnRow2.appendChild(endBtn);
+
+  body.appendChild(btnRow1);
+  body.appendChild(btnRow2);
+
+  // 添加提示信息
+  const hint = document.createElement("div");
+  hint.textContent = "END按钮：快速滚动可滚动容器到底部";
+  hint.style.cssText = "font-size: 10px; opacity: 0.7; margin-top: 5px; text-align: center; font-style: italic;";
+  body.appendChild(hint);
+
+  panel.appendChild(header);
+  panel.appendChild(body);
+  document.body.appendChild(panel);
+  window.__crmConsolePanel = panel;
+
+  // ========= 拖动逻辑 =========
+  let dragging = false;
+  let startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+  const onMouseMove = (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+
+    let newLeft = startLeft + dx;
+    let newTop = startTop + dy;
+
+    // 边界限制
+    const rect = panel.getBoundingClientRect();
+    newLeft = Math.min(Math.max(8, newLeft), window.innerWidth - rect.width - 8);
+    newTop = Math.min(Math.max(8, newTop), window.innerHeight - rect.height - 8);
+
+    panel.style.left = `${newLeft}px`;
+    panel.style.top = `${newTop}px`;
+  };
+
+  const onMouseUp = () => {
+    dragging = false;
+    document.removeEventListener("mousemove", onMouseMove);
+    document.removeEventListener("mouseup", onMouseUp);
+  };
+
+  header.addEventListener("mousedown", (e) => {
+    // 点到关闭按钮不触发拖动
+    if (e.target === close) return;
+    dragging = true;
+    const rect = panel.getBoundingClientRect();
+    startX = e.clientX;
+    startY = e.clientY;
+    startLeft = rect.left;
+    startTop = rect.top;
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  });
+
+  console.log("[CRM Panel] 已注入（可拖动）。刷新页面后需要重新粘贴一次。");
+})();

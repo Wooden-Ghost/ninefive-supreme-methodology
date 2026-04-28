@@ -1,0 +1,1285 @@
+// 查找模糊时间 · 自动运行
+// 版本：v4.2.4
+// 更新：强制压底滚动版 + 等待/完成后持续到底 + 更强复制按钮可见保障
+
+(() => {
+  const SCRIPT_VERSION = "v4.2.4";
+  const APP_KEY = "__BLURRY_TIME_SINGLE_RUNNER_V424__";
+  const LEGACY_APP_KEYS = ["__BLURRY_TIME_SINGLE_RUNNER_V4__", "__BLURRY_TIME_SINGLE_RUNNER_V42__", "__BLURRY_TIME_SINGLE_RUNNER_V422__", "__BLURRY_TIME_SINGLE_RUNNER_V424__"];
+  const PANEL_ID = "__blurry-time-runner-panel__";
+  const STYLE_ID = "__blurry-time-runner-style__";
+  const STORE_KEY = "__BLURRY_TIME_SINGLE_RUNNER_STORE_V424__";
+  const LEGACY_STORE_KEYS = ["__BLURRY_TIME_SINGLE_RUNNER_STORE_V4__", "__BLURRY_TIME_SINGLE_RUNNER_STORE_V42__", "__BLURRY_TIME_SINGLE_RUNNER_STORE_V422__", "__BLURRY_TIME_SINGLE_RUNNER_STORE_V424__"];
+  const RPA_MARKER_ID = "blurry-time-rpa-marker";
+  const PROJECT_NAME = "查找模糊时间";
+  const GLOBAL_TIMEOUT = 7 * 60 * 1000;
+
+  try {
+    for (const key of LEGACY_APP_KEYS) {
+      if (window[key] && typeof window[key].destroy === "function") {
+        window[key].destroy();
+      }
+    }
+  } catch {}
+
+  const store = (() => {
+    try {
+      return JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
+    } catch {
+      return {};
+    }
+  })();
+
+  const state = {
+    running: false,
+    dragging: false,
+    dragOffsetX: 0,
+    dragOffsetY: 0,
+    destroyed: false,
+    bottomPusherTimer: null,
+    bottomPusherInterval: 0
+  };
+
+  function saveStore() {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(store));
+    } catch {}
+  }
+
+  function clearStoredCache() {
+    try {
+      for (const key of LEGACY_STORE_KEYS) {
+        localStorage.removeItem(key);
+      }
+    } catch {}
+
+    for (const key of Object.keys(store)) {
+      delete store[key];
+    }
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function normText(s) {
+    return (s || "").replace(/\s+/g, " ").trim();
+  }
+
+  function isVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return !(
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.opacity === "0" ||
+      rect.width <= 0 ||
+      rect.height <= 0
+    );
+  }
+
+  function isInViewport(el) {
+    if (!isVisible(el)) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < window.innerHeight;
+  }
+
+  function shortErr(err) {
+    if (!err) return "未知错误";
+    return err && err.message ? err.message : String(err);
+  }
+
+  let panelEl = null;
+  let inputEl = null;
+  let buttonEl = null;
+  let clearBtnEl = null;
+  let statusEl = null;
+  let rpaMarkerEl = null;
+
+  function ensureRpaMarker() {
+    if (state.destroyed) return null;
+    let el = document.getElementById(RPA_MARKER_ID);
+    if (!el) {
+      el = document.createElement("div");
+      el.id = RPA_MARKER_ID;
+      document.body.appendChild(el);
+    }
+    rpaMarkerEl = el;
+    return el;
+  }
+
+  function removeRpaMarker() {
+    const marker = document.getElementById(RPA_MARKER_ID);
+    if (marker) marker.remove();
+    rpaMarkerEl = null;
+  }
+
+  function setRpaStatus(status, message = "") {
+    if (state.destroyed) return;
+    const el = ensureRpaMarker();
+    if (!el) return;
+    const safeMessage = String(message || "");
+    el.setAttribute("data-status", status);
+    el.setAttribute("data-message", safeMessage);
+    el.textContent = `RPA_STATUS=${status}\nRPA_MESSAGE=${safeMessage}`;
+    window.__BLURRY_TIME_RPA__ = {
+      status,
+      message: safeMessage,
+      time: new Date().toISOString(),
+      version: SCRIPT_VERSION
+    };
+  }
+
+  function setStatus(text, isError = false) {
+    if (state.destroyed) return;
+    if (statusEl) {
+      statusEl.textContent = text;
+      statusEl.style.color = isError ? "#ff8f8f" : "#d7d7d7";
+    }
+    if (state.running) {
+      setRpaStatus(isError ? "ERROR" : "RUNNING", text);
+    }
+  }
+
+  function clickElement(el) {
+    if (!el) throw new Error("元素不存在，无法点击");
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    el.focus?.();
+    el.click();
+  }
+
+  async function waitFor(fn, label, timeout = GLOBAL_TIMEOUT, interval = 250) {
+    const start = Date.now();
+    let lastErr = null;
+    while (Date.now() - start < timeout) {
+      try {
+        const val = fn();
+        if (val) return val;
+      } catch (e) {
+        lastErr = e;
+      }
+      await sleep(interval);
+    }
+    throw new Error(`等待超时：${label}${lastErr ? ` | ${shortErr(lastErr)}` : ""}`);
+  }
+
+  function isScrollable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const style = getComputedStyle(el);
+    const overflow = `${style.overflowY} ${style.overflow}`;
+    return /(auto|scroll|overlay)/i.test(overflow) && (el.scrollHeight - el.clientHeight > 80);
+  }
+
+  function collectScrollableAncestors(el, out) {
+    let node = el;
+    while (node && node !== document.body && node !== document.documentElement) {
+      if (isScrollable(node)) out.push(node);
+      node = node.parentElement;
+    }
+  }
+
+  function uniqueElements(list) {
+    const out = [];
+    const seen = new Set();
+    for (const el of list.filter(Boolean)) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      out.push(el);
+    }
+    return out;
+  }
+
+  function getScrollTargets() {
+    const targets = [];
+
+    targets.push(document.scrollingElement, document.documentElement, document.body);
+
+    const latestTurn = getLatestTurnSection?.() || null;
+    const prompt = getPromptEl?.() || null;
+    const speechBtn = getSpeechButton?.() || null;
+    const copyBtn = getLatestReplyCopyButton?.() || getBottomMostGenericCopyButton?.() || null;
+
+    collectScrollableAncestors(latestTurn, targets);
+    collectScrollableAncestors(prompt, targets);
+    collectScrollableAncestors(speechBtn, targets);
+    collectScrollableAncestors(copyBtn, targets);
+
+    const extra = [...document.querySelectorAll("main, div, section, article")].filter(el => isVisible(el) && isScrollable(el));
+    extra.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+    targets.push(...extra.slice(0, 12));
+
+    return uniqueElements(targets);
+  }
+
+  function dispatchEndKey(target) {
+    if (!target || typeof target.dispatchEvent !== "function") return;
+
+    const init = {
+      key: "End",
+      code: "End",
+      keyCode: 35,
+      which: 35,
+      bubbles: true,
+      cancelable: true
+    };
+
+    try { target.dispatchEvent(new KeyboardEvent("keydown", init)); } catch {}
+    try { target.dispatchEvent(new KeyboardEvent("keypress", init)); } catch {}
+    try { target.dispatchEvent(new KeyboardEvent("keyup", init)); } catch {}
+  }
+
+  function instantEndScroll() {
+    const active = document.activeElement;
+    const latestTurn = typeof getLatestTurnSection === "function" ? getLatestTurnSection() : null;
+    const prompt = typeof getPromptEl === "function" ? getPromptEl() : null;
+
+    dispatchEndKey(active);
+    dispatchEndKey(prompt);
+    dispatchEndKey(latestTurn);
+    dispatchEndKey(document.body);
+    dispatchEndKey(document.documentElement);
+
+    const targets = getScrollTargets();
+    for (const el of targets) {
+      try {
+        el.scrollTop = Math.max(el.scrollTop || 0, el.scrollHeight || 0);
+      } catch {}
+      try {
+        el.scrollTo({ top: el.scrollHeight || 0, behavior: "instant" });
+      } catch {}
+      try {
+        el.scrollIntoView?.({ block: "end", inline: "nearest", behavior: "instant" });
+      } catch {}
+    }
+
+    const docBottom = Math.max(
+      document.documentElement?.scrollHeight || 0,
+      document.body?.scrollHeight || 0,
+      document.scrollingElement?.scrollHeight || 0
+    );
+
+    try { window.scrollTo({ top: docBottom, left: 0, behavior: "instant" }); } catch {}
+    try { window.scrollTo(0, docBottom); } catch {}
+  }
+
+  function stopBottomPusher() {
+    if (state.bottomPusherTimer) {
+      clearInterval(state.bottomPusherTimer);
+      state.bottomPusherTimer = null;
+      state.bottomPusherInterval = 0;
+    }
+  }
+
+  function startBottomPusher(interval = 420) {
+    if (state.destroyed) return;
+    if (state.bottomPusherTimer && state.bottomPusherInterval === interval) return;
+
+    stopBottomPusher();
+    state.bottomPusherInterval = interval;
+
+    const tick = () => {
+      if (state.destroyed) return;
+      instantEndScroll();
+    };
+
+    tick();
+    state.bottomPusherTimer = setInterval(tick, interval);
+  }
+
+  async function forceBottomNow(times = 4, gap = 100) {
+    for (let i = 0; i < times; i++) {
+      instantEndScroll();
+      await sleep(gap);
+    }
+  }
+
+  function getProjectLinkCandidates() {
+    const list = [];
+
+    const sidebarLinks = [...document.querySelectorAll('a[data-sidebar-item="true"][href*="/project"]')]
+      .filter(a => {
+        const text = normText(a.innerText || a.textContent || "");
+        const href = a.getAttribute("href") || "";
+        return text.includes(PROJECT_NAME) || href.includes("cha-zhao-mo-hu-shi-jian");
+      });
+
+    const otherLinks = [...document.querySelectorAll('a[href*="/project"]')]
+      .filter(a => {
+        const text = normText(a.innerText || a.textContent || "");
+        const aria = a.getAttribute("aria-label") || "";
+        const href = a.getAttribute("href") || "";
+        return text.includes(PROJECT_NAME) || aria.includes(PROJECT_NAME) || href.includes("cha-zhao-mo-hu-shi-jian");
+      });
+
+    list.push(...sidebarLinks, ...otherLinks);
+
+    const out = [];
+    const seen = new Set();
+    for (const el of list) {
+      const key = `${el.getAttribute("href") || ""}||${normText(el.textContent || "")}||${el.getAttribute("aria-label") || ""}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(el);
+      }
+    }
+    return out;
+  }
+
+  function inTargetProject() {
+    const path = location.pathname || "";
+    const title = document.title || "";
+    return (
+      title.includes(PROJECT_NAME) ||
+      path.includes("cha-zhao-mo-hu-shi-jian") ||
+      !!getProjectLinkCandidates().length
+    );
+  }
+
+  function absoluteUrl(href) {
+    try {
+      return new URL(href, location.origin).href;
+    } catch {
+      return "";
+    }
+  }
+
+  function projectHomeFromHref(href) {
+    const abs = absoluteUrl(href || location.href);
+    if (!abs) return "";
+    try {
+      const u = new URL(abs);
+      u.hash = "";
+      u.search = "";
+      u.pathname = u.pathname.replace(/\/c\/[^/]+\/?$/i, "");
+      return u.href;
+    } catch {
+      return abs.replace(/\/c\/[^/]+\/?$/i, "");
+    }
+  }
+
+  function getVisibleProjectLink() {
+    return getProjectLinkCandidates().find(isVisible) || null;
+  }
+
+  function rememberProjectContext() {
+    if (!inTargetProject()) return;
+
+    const currentHome = projectHomeFromHref(location.href);
+    if (currentHome) {
+      store.projectHomeHref = currentHome;
+    }
+
+    const link = getVisibleProjectLink();
+    const linkHome = projectHomeFromHref(link?.getAttribute("href") || "");
+    if (linkHome) {
+      store.projectHomeHref = linkHome;
+    }
+
+    saveStore();
+  }
+
+  function isProjectBlankChatPage() {
+    const prompt = getPromptEl();
+    return !!prompt && isVisible(prompt) && getTurnCount() === 0 && inTargetProject();
+  }
+
+  async function openProjectHomePage() {
+    setStatus("正在回到项目主页…");
+
+    const link = await waitFor(() => {
+      const el = getVisibleProjectLink();
+      return el && isVisible(el) ? el : null;
+    }, "项目主页入口");
+
+    clickElement(link);
+
+    await waitFor(() => {
+      const prompt = getPromptEl();
+      return inTargetProject() && prompt && isVisible(prompt);
+    }, "项目主页");
+
+    rememberProjectContext();
+    await sleep(700);
+  }
+
+  async function ensureProjectPage() {
+    if ((location.pathname.includes("/project") || location.pathname.includes("/c/") || location.pathname.includes("/g/")) && inTargetProject()) {
+      rememberProjectContext();
+      return;
+    }
+
+    setStatus("正在进入项目…");
+
+    const link = await waitFor(() => {
+      const cands = getProjectLinkCandidates().filter(isVisible);
+      return cands[0] || null;
+    }, "项目入口");
+
+    clickElement(link);
+
+    await waitFor(() => {
+      const prompt = getPromptEl();
+      return inTargetProject() && prompt && isVisible(prompt);
+    }, "进入项目页面");
+
+    rememberProjectContext();
+    await sleep(800);
+  }
+
+  function getTurnSections() {
+    return [...document.querySelectorAll('section[data-testid^="conversation-turn-"]')];
+  }
+
+  function getTurnCount() {
+    return getTurnSections().length;
+  }
+
+  function getPromptEl() {
+    const selectors = [
+      '#prompt-textarea[contenteditable="true"][role="textbox"]',
+      '#prompt-textarea.ProseMirror[contenteditable="true"]',
+      '#prompt-textarea[contenteditable="true"]'
+    ];
+
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && isVisible(el)) return el;
+    }
+    return null;
+  }
+
+  function getSendButton() {
+    return document.querySelector('#composer-submit-button[data-testid="send-button"], button[data-testid="send-button"]');
+  }
+
+  function getSpeechButton() {
+    const selectors = [
+      'button[data-testid="composer-speech-button"][aria-label="启动语音功能"]',
+      'button[data-testid="composer-speech-button"]'
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && isVisible(el)) return el;
+    }
+    return null;
+  }
+
+  function getNewChatButton() {
+    const direct = document.querySelector('a[data-testid="create-new-chat-button"], button[data-testid="create-new-chat-button"]');
+    if (direct && isVisible(direct)) return direct;
+
+    const fallback = [...document.querySelectorAll("a,button,[role='button']")].find(el => {
+      if (!isVisible(el)) return false;
+      const text = normText(el.innerText || el.textContent || "");
+      const aria = el.getAttribute("aria-label") || "";
+      return /新聊天|新建聊天|New chat|new conversation/i.test(`${text} ${aria}`);
+    });
+
+    return fallback || null;
+  }
+
+  function isBlankChatPage() {
+    const prompt = getPromptEl();
+    const turns = getTurnCount();
+    return !!prompt && turns === 0;
+  }
+
+  async function ensureFreshChatForThisRun() {
+    if (isProjectBlankChatPage()) return;
+
+    setStatus("正在打开项目内新聊天…");
+    await ensureProjectPage();
+    await openProjectHomePage();
+
+    if (isProjectBlankChatPage()) return;
+
+    const btn = await waitFor(() => {
+      const el = getNewChatButton();
+      return el && isVisible(el) ? el : null;
+    }, "项目内新聊天按钮");
+
+    clickElement(btn);
+
+    await waitFor(() => {
+      const prompt = getPromptEl();
+      return prompt && isVisible(prompt) && getTurnCount() === 0 && inTargetProject();
+    }, "项目内新聊天页面");
+
+    rememberProjectContext();
+    await sleep(700);
+  }
+
+  function clearPrompt(prompt) {
+    prompt.focus();
+
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(prompt);
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    try {
+      document.execCommand("delete", false, null);
+    } catch {}
+
+    if (normText(prompt.innerText || prompt.textContent || "").length > 0) {
+      prompt.innerHTML = '<p><br class="ProseMirror-trailingBreak"></p>';
+    }
+
+    selection.removeAllRanges();
+  }
+
+  function fillPromptViaExecCommand(prompt, text) {
+    prompt.focus();
+    clearPrompt(prompt);
+
+    const lines = String(text).replace(/\r\n/g, "\n").split("\n");
+
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i]) {
+        try {
+          document.execCommand("insertText", false, lines[i]);
+        } catch {}
+      }
+      if (i < lines.length - 1) {
+        try {
+          document.execCommand("insertLineBreak", false, null);
+        } catch {}
+      }
+    }
+
+    prompt.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      cancelable: true,
+      data: text,
+      inputType: "insertText"
+    }));
+  }
+
+  function fillPromptViaDom(prompt, text) {
+    prompt.focus();
+    prompt.innerHTML = "";
+
+    const frag = document.createDocumentFragment();
+    const lines = String(text).replace(/\r\n/g, "\n").split("\n");
+
+    for (const line of lines) {
+      const p = document.createElement("p");
+      if (line) p.textContent = line;
+      else p.appendChild(document.createElement("br"));
+      frag.appendChild(p);
+    }
+
+    prompt.appendChild(frag);
+
+    prompt.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      cancelable: true,
+      data: text,
+      inputType: "insertText"
+    }));
+  }
+
+  async function typePromptText(text) {
+    setStatus("正在填入提问内容…");
+
+    const prompt = await waitFor(() => {
+      const el = getPromptEl();
+      return el && isVisible(el) ? el : null;
+    }, "提问输入框");
+
+    clickElement(prompt);
+    await sleep(120);
+
+    fillPromptViaExecCommand(prompt, text);
+    await sleep(250);
+
+    let current = normText(prompt.innerText || prompt.textContent || "");
+    if (!current) {
+      fillPromptViaDom(prompt, text);
+      await sleep(250);
+      current = normText(prompt.innerText || prompt.textContent || "");
+    }
+
+    await waitFor(() => {
+      const content = normText(prompt.innerText || prompt.textContent || "");
+      return content.length > 0;
+    }, "提问内容写入成功");
+
+    await waitFor(() => {
+      const btn = getSendButton();
+      return btn && isVisible(btn);
+    }, "发送按钮出现");
+
+    await waitFor(() => {
+      const btn = getSendButton();
+      return btn && isVisible(btn) && !btn.disabled;
+    }, "发送按钮可点击");
+  }
+
+  async function sendPrompt() {
+    setStatus("正在发送问题…");
+
+    const btn = await waitFor(() => {
+      const el = getSendButton();
+      return el && isVisible(el) && !el.disabled ? el : null;
+    }, "发送按钮");
+
+    clickElement(btn);
+    await sleep(200);
+    await forceBottomNow(4, 120);
+  }
+
+  function hover(el) {
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + Math.min(rect.width / 2, 20);
+    const y = rect.top + Math.min(rect.height / 2, 20);
+
+    ["pointerover", "mouseover", "mouseenter", "pointermove", "mousemove"].forEach(type => {
+      el.dispatchEvent(new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        clientX: x,
+        clientY: y,
+        view: window
+      }));
+    });
+  }
+
+  function getResponseActions(section) {
+    if (!section) return null;
+
+    const candidates = [
+      'div[aria-label="Response actions"]',
+      'div[aria-label="回复操作"]',
+      'div[role="group"][aria-label*="Response"]',
+      'div[role="group"][aria-label*="回复"]'
+    ];
+
+    for (const sel of candidates) {
+      const el = section.querySelector(sel);
+      if (el) return el;
+    }
+
+    return null;
+  }
+
+  function hoverCopyArea(section) {
+    if (!section) return;
+
+    hover(section);
+
+    const actionWrap = getResponseActions(section);
+    if (actionWrap) {
+      hover(actionWrap);
+      const parent = actionWrap.parentElement;
+      if (parent) hover(parent);
+    }
+
+    let turnMsg = null;
+    try {
+      turnMsg = section.querySelector('[class*="group/turn-messages"]');
+    } catch {}
+
+    if (turnMsg) hover(turnMsg);
+  }
+
+  function getCopyButtonInSection(section) {
+    if (!section) return null;
+
+    hoverCopyArea(section);
+
+    const selectors = [
+      'button[data-testid="copy-turn-action-button"][aria-label="复制回复"]',
+      'button[data-testid="copy-turn-action-button"]',
+      'button[aria-label*="复制"]',
+      'button[aria-label*="Copy"]',
+      'button[title*="复制"]',
+      'button[title*="Copy"]'
+    ];
+
+    for (const sel of selectors) {
+      const btn = [...section.querySelectorAll(sel)].find(isVisible);
+      if (btn) return btn;
+    }
+
+    const loose = [...section.querySelectorAll('button,[role="button"]')].find(btn => {
+      if (!isVisible(btn)) return false;
+      const testid = btn.getAttribute("data-testid") || "";
+      const aria = btn.getAttribute("aria-label") || "";
+      const title = btn.getAttribute("title") || "";
+      const text = normText(btn.innerText || btn.textContent || "");
+      const all = `${testid} | ${aria} | ${title} | ${text}`.toLowerCase();
+      return /copy-turn-action-button|复制|copy/.test(all);
+    });
+
+    if (loose) return loose;
+
+    return null;
+  }
+
+  function getResponseSections() {
+    return getTurnSections().filter(sec => !!getResponseActions(sec) || !!getCopyButtonInSection(sec));
+  }
+
+  function getLatestTurnSection() {
+    const list = getTurnSections();
+    return list.length ? list[list.length - 1] : null;
+  }
+
+  function getLatestResponseSection() {
+    const latestTurn = getLatestTurnSection();
+    if (latestTurn && (getCopyButtonInSection(latestTurn) || getResponseActions(latestTurn))) return latestTurn;
+
+    const turns = getTurnSections();
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const sec = turns[i];
+      if (getCopyButtonInSection(sec) || getResponseActions(sec)) return sec;
+    }
+
+    return null;
+  }
+
+  function getLatestReplyCopyButton() {
+    const section = getLatestResponseSection() || getLatestTurnSection();
+    return getCopyButtonInSection(section);
+  }
+
+  function getBottomMostGenericCopyButton() {
+    const nodes = [...document.querySelectorAll(
+      'button[data-testid="copy-turn-action-button"], button[aria-label*="复制"], button[aria-label*="Copy"], button[title*="复制"], button[title*="Copy"]'
+    )].filter(isVisible);
+
+    if (!nodes.length) return null;
+
+    return nodes.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0];
+  }
+
+  function getStreamingStopButton() {
+    const nodes = [...document.querySelectorAll("button,[role='button']")];
+
+    return nodes.find(el => {
+      if (!isVisible(el)) return false;
+
+      const testid = el.getAttribute("data-testid") || "";
+      const aria = el.getAttribute("aria-label") || "";
+      const title = el.getAttribute("title") || "";
+      const text = normText(el.innerText || el.textContent || "");
+      const all = `${testid} | ${aria} | ${title} | ${text}`;
+
+      return (
+        /(^|[^a-z])stop-button([^a-z]|$)/i.test(testid) ||
+        /停止流式传输|停止生成|Stop streaming|Stop generating/i.test(all)
+      );
+    }) || null;
+  }
+
+  function getSectionFingerprint(section) {
+    if (!section) {
+      return {
+        textLen: 0,
+        pCount: 0,
+        liCount: 0,
+        codeCount: 0,
+        tableCount: 0,
+        scrollHeight: 0,
+        textTail: ""
+      };
+    }
+
+    const text = normText(section.innerText || section.textContent || "");
+    return {
+      textLen: text.length,
+      pCount: section.querySelectorAll("p").length,
+      liCount: section.querySelectorAll("li").length,
+      codeCount: section.querySelectorAll("pre,code").length,
+      tableCount: section.querySelectorAll("table").length,
+      scrollHeight: section.scrollHeight || 0,
+      textTail: text.slice(-80)
+    };
+  }
+
+  function sameFingerprint(a, b) {
+    return !!a && !!b &&
+      a.textLen === b.textLen &&
+      a.pCount === b.pCount &&
+      a.liCount === b.liCount &&
+      a.codeCount === b.codeCount &&
+      a.tableCount === b.tableCount &&
+      a.scrollHeight === b.scrollHeight &&
+      a.textTail === b.textTail;
+  }
+
+  function getBottomSnapshot() {
+    const targets = getScrollTargets();
+    return targets.map(el => `${el.scrollTop || 0}/${el.scrollHeight || 0}/${el.clientHeight || 0}`).join("|");
+  }
+
+  async function scrollToBottomStable() {
+    let last = "";
+    let stable = 0;
+
+    while (stable < 3) {
+      await forceBottomNow(3, 120);
+      const snap = getBottomSnapshot();
+
+      if (snap === last) stable++;
+      else stable = 0;
+
+      last = snap;
+      await sleep(220);
+    }
+
+    await forceBottomNow(2, 90);
+  }
+
+  async function waitUntilGenerationFinished(previousTurnCount) {
+    setStatus("等待回答生成完成…");
+
+    await waitFor(() => {
+      instantEndScroll();
+      return getTurnCount() > previousTurnCount;
+    }, "助手开始回复");
+
+    let lastFp = null;
+    let lastChangedAt = Date.now();
+    let finishCandidateSince = 0;
+    let hasOutputStarted = false;
+
+    const timeoutAt = Date.now() + GLOBAL_TIMEOUT;
+
+    while (Date.now() < timeoutAt) {
+      await forceBottomNow(3, 90);
+
+      const latestTurn = getLatestTurnSection();
+      if (!latestTurn) {
+        await sleep(220);
+        continue;
+      }
+
+      const fp = getSectionFingerprint(latestTurn);
+      const hasStopBtn = !!getStreamingStopButton();
+      const hasSpeechBtn = !!getSpeechButton();
+      const hasActions = !!getResponseActions(latestTurn);
+      const hasCopyBtn = !!getCopyButtonInSection(latestTurn);
+
+      if (!lastFp || !sameFingerprint(lastFp, fp)) {
+        lastFp = fp;
+        lastChangedAt = Date.now();
+      }
+
+      if (
+        fp.textLen >= 20 ||
+        fp.pCount > 0 ||
+        fp.liCount > 0 ||
+        fp.codeCount > 0 ||
+        fp.tableCount > 0 ||
+        fp.scrollHeight > 120
+      ) {
+        hasOutputStarted = true;
+      }
+
+      if (hasStopBtn) {
+        finishCandidateSince = 0;
+        await sleep(180);
+        continue;
+      }
+
+      const primaryFinishedSignal = hasSpeechBtn && (hasActions || hasCopyBtn);
+
+      if (primaryFinishedSignal) {
+        if (!finishCandidateSince) finishCandidateSince = Date.now();
+
+        await forceBottomNow(4, 80);
+
+        if (Date.now() - finishCandidateSince >= 700) {
+          return;
+        }
+
+        await sleep(180);
+        continue;
+      }
+
+      const contentStableMs = Date.now() - lastChangedAt;
+
+      if (hasOutputStarted && contentStableMs >= 4200) {
+        await forceBottomNow(5, 80);
+        return;
+      }
+
+      finishCandidateSince = 0;
+      await sleep(220);
+    }
+
+    throw new Error("等待生成完成超时");
+  }
+
+  async function clickCopyButton() {
+    setStatus("正在复制最新回答…");
+
+    startBottomPusher(220);
+
+    try {
+      const timeoutAt = Date.now() + 15000;
+
+      while (Date.now() < timeoutAt) {
+        await scrollToBottomStable();
+
+        const latestSection = getLatestResponseSection() || getLatestTurnSection();
+        if (latestSection) {
+          latestSection.scrollIntoView({ block: "end", behavior: "instant" });
+          hoverCopyArea(latestSection);
+          await sleep(220);
+        }
+
+        let btn = getLatestReplyCopyButton();
+        if (!btn) btn = getBottomMostGenericCopyButton();
+
+        if (btn) {
+          await forceBottomNow(3, 80);
+          clickElement(btn);
+          await sleep(300);
+          return;
+        }
+
+        await forceBottomNow(4, 90);
+        await sleep(180);
+      }
+
+      throw new Error("未找到可点击的复制按钮");
+    } finally {
+      stopBottomPusher();
+    }
+  }
+
+  async function prepareNextBlankChat() {
+    setStatus("正在为下一轮打开项目内新聊天…");
+
+    await ensureProjectPage();
+    await openProjectHomePage();
+
+    if (isProjectBlankChatPage()) return;
+
+    const btn = await waitFor(() => {
+      const el = getNewChatButton();
+      return el && isVisible(el) ? el : null;
+    }, "下一轮项目内新聊天按钮");
+
+    clickElement(btn);
+
+    await waitFor(() => {
+      const prompt = getPromptEl();
+      return prompt && isVisible(prompt) && getTurnCount() === 0 && inTargetProject();
+    }, "下一轮项目内新聊天页面");
+
+    rememberProjectContext();
+    await sleep(700);
+  }
+
+  function clearCacheAndReset() {
+    if (state.running) {
+      setStatus("运行中请勿清除缓存", true);
+      setRpaStatus("ERROR", `运行中请勿清除缓存 | ${SCRIPT_VERSION}`);
+      return;
+    }
+
+    clearStoredCache();
+
+    if (inputEl) inputEl.value = "";
+
+    const msg = `缓存已清除 | ${SCRIPT_VERSION}`;
+    setStatus(msg);
+    setRpaStatus("IDLE", msg);
+  }
+
+  function installStyle() {
+    const old = document.getElementById(STYLE_ID);
+    if (old) old.remove();
+
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${PANEL_ID} {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        width: 360px;
+        background: #111;
+        color: #fff;
+        border: 1px solid #3f3f3f;
+        z-index: 2147483646;
+        box-shadow: 0 10px 28px rgba(0,0,0,.35);
+        font: 12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+        user-select: none;
+      }
+      #${PANEL_ID} * {
+        box-sizing: border-box;
+      }
+      #${PANEL_ID} .hdr {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 10px;
+        background: #1a1a1a;
+        border-bottom: 1px solid #2c2c2c;
+        cursor: move;
+      }
+      #${PANEL_ID} .ttl {
+        font-weight: 700;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #${PANEL_ID} .close {
+        border: 1px solid #444;
+        background: #1f1f1f;
+        color: #fff;
+        width: 28px;
+        height: 28px;
+        cursor: pointer;
+      }
+      #${PANEL_ID} .bd {
+        padding: 10px;
+      }
+      #${PANEL_ID} textarea {
+        width: 100%;
+        min-height: 120px;
+        resize: vertical;
+        border: 1px solid #444;
+        background: #0f0f0f;
+        color: #fff;
+        padding: 10px;
+        outline: none;
+        font: inherit;
+        line-height: 1.5;
+      }
+      #${PANEL_ID} .row {
+        display: flex;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      #${PANEL_ID} .run,
+      #${PANEL_ID} .clear {
+        flex: 1;
+        height: 36px;
+        color: #fff;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+      }
+      #${PANEL_ID} .run {
+        border: 1px solid #4d78a8;
+        background: #16304f;
+      }
+      #${PANEL_ID} .clear {
+        border: 1px solid #555;
+        background: #262626;
+      }
+      #${PANEL_ID} .run:disabled,
+      #${PANEL_ID} .clear:disabled {
+        opacity: .55;
+        cursor: not-allowed;
+      }
+      #${PANEL_ID} .status {
+        margin-top: 8px;
+        color: #d7d7d7;
+        min-height: 18px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      #${RPA_MARKER_ID} {
+        position: fixed;
+        left: 10px;
+        bottom: 10px;
+        z-index: 2147483647;
+        padding: 6px 8px;
+        background: #000;
+        color: #00ff66;
+        border: 1px solid #2a2a2a;
+        font: 12px/1.35 Consolas, Monaco, monospace;
+        white-space: pre-wrap;
+        pointer-events: none;
+        max-width: 420px;
+      }
+      #${RPA_MARKER_ID}[data-status="ERROR"] {
+        color: #ff5f5f;
+      }
+      #${RPA_MARKER_ID}[data-status="SUCCESS"] {
+        color: #4ea1ff;
+      }
+      #${RPA_MARKER_ID}[data-status="RUNNING"] {
+        color: #ffd166;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function startDrag(e) {
+    if (e.button !== 0) return;
+    if (e.target.closest(".close")) return;
+
+    state.dragging = true;
+    const rect = panelEl.getBoundingClientRect();
+
+    state.dragOffsetX = e.clientX - rect.left;
+    state.dragOffsetY = e.clientY - rect.top;
+
+    panelEl.style.left = rect.left + "px";
+    panelEl.style.top = rect.top + "px";
+    panelEl.style.right = "auto";
+    panelEl.style.bottom = "auto";
+
+    const onMove = ev => {
+      if (!state.dragging) return;
+      const x = Math.max(0, Math.min(ev.clientX - state.dragOffsetX, window.innerWidth - panelEl.offsetWidth));
+      const y = Math.max(0, Math.min(ev.clientY - state.dragOffsetY, window.innerHeight - panelEl.offsetHeight));
+      panelEl.style.left = x + "px";
+      panelEl.style.top = y + "px";
+    };
+
+    const onUp = () => {
+      state.dragging = false;
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+    };
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  }
+
+  async function runOnce() {
+    if (state.running) return;
+
+    const text = inputEl.value;
+    if (!normText(text)) {
+      setStatus("请输入要问的内容", true);
+      setRpaStatus("ERROR", "请输入要问的内容");
+      return;
+    }
+
+    state.running = true;
+    buttonEl.disabled = true;
+    if (clearBtnEl) clearBtnEl.disabled = true;
+    inputEl.disabled = true;
+    store.lastPrompt = text;
+    saveStore();
+    setRpaStatus("RUNNING", `开始执行 ${SCRIPT_VERSION}`);
+
+    try {
+      await ensureProjectPage();
+      await ensureFreshChatForThisRun();
+
+      const previousTurnCount = getTurnCount();
+
+      await typePromptText(text);
+
+      startBottomPusher(420);
+      try {
+        await sendPrompt();
+        await waitUntilGenerationFinished(previousTurnCount);
+        await clickCopyButton();
+      } finally {
+        stopBottomPusher();
+      }
+
+      await prepareNextBlankChat();
+
+      const msg = `本轮完成：已复制最新回答，且已打开下一轮项目内新聊天 | ${SCRIPT_VERSION}`;
+      setStatus(msg);
+      setRpaStatus("SUCCESS", msg);
+    } catch (err) {
+      const msg = shortErr(err);
+      setStatus(`已停止：${msg}`, true);
+      setRpaStatus("ERROR", `${msg} | ${SCRIPT_VERSION}`);
+    } finally {
+      state.running = false;
+      buttonEl.disabled = false;
+      if (clearBtnEl) clearBtnEl.disabled = false;
+      inputEl.disabled = false;
+    }
+  }
+
+  function mountPanel() {
+    const old = document.getElementById(PANEL_ID);
+    if (old) old.remove();
+
+    panelEl = document.createElement("div");
+    panelEl.id = PANEL_ID;
+
+    const header = document.createElement("div");
+    header.className = "hdr";
+    header.addEventListener("pointerdown", startDrag);
+
+    const title = document.createElement("div");
+    title.className = "ttl";
+    title.textContent = `查找模糊时间 · 自动运行 ${SCRIPT_VERSION}`;
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "close";
+    closeBtn.textContent = "×";
+    closeBtn.addEventListener("click", destroy);
+
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+
+    const body = document.createElement("div");
+    body.className = "bd";
+
+    inputEl = document.createElement("textarea");
+    inputEl.placeholder = "输入这一次要问的完整内容";
+    inputEl.value = store.lastPrompt || "";
+
+    const row = document.createElement("div");
+    row.className = "row";
+
+    buttonEl = document.createElement("button");
+    buttonEl.className = "run";
+    buttonEl.textContent = "自动运行";
+    buttonEl.addEventListener("click", runOnce);
+
+    clearBtnEl = document.createElement("button");
+    clearBtnEl.className = "clear";
+    clearBtnEl.textContent = "清除缓存";
+    clearBtnEl.addEventListener("click", clearCacheAndReset);
+
+    row.appendChild(buttonEl);
+    row.appendChild(clearBtnEl);
+
+    statusEl = document.createElement("div");
+    statusEl.className = "status";
+    statusEl.textContent = `待命 | ${SCRIPT_VERSION}`;
+
+    body.appendChild(inputEl);
+    body.appendChild(row);
+    body.appendChild(statusEl);
+
+    panelEl.appendChild(header);
+    panelEl.appendChild(body);
+    document.body.appendChild(panelEl);
+  }
+
+  function destroy() {
+    state.destroyed = true;
+    stopBottomPusher();
+
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) panel.remove();
+
+    const style = document.getElementById(STYLE_ID);
+    if (style) style.remove();
+
+    removeRpaMarker();
+    delete window.__BLURRY_TIME_RPA__;
+    delete window[APP_KEY];
+  }
+
+  installStyle();
+  mountPanel();
+  ensureRpaMarker();
+  setRpaStatus("IDLE", `待命 | ${SCRIPT_VERSION}`);
+
+  window[APP_KEY] = { destroy };
+})();

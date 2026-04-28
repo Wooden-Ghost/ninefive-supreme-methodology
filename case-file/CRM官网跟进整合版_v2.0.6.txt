@@ -1,0 +1,984 @@
+// ==UserScript==
+// @name         CRM官网跟进整合版 v2.0.7
+// @namespace    https://openai.local
+// @version      2.0.7
+// @description  主列表搜索公司，进入详情页后直接进入写记录页填写官网邮件跟进并保存；支持自动模式直接连续跑完与头部锚点最小化。
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+/*
+更新说明
+v2.0.7
+1. 修复上一版打包时混入的非法反斜杠，消除 `Invalid or unexpected token` 语法错误。
+2. 保留当前流程：取消详情页自动文本检查、自动模式直接连续跑完、面板日期框整块可点。
+3. 保存成功后仅等待返回详情页与主列表，不再依赖固定文本校验。
+*/
+
+(() => {
+  'use strict';
+
+  const VERSION = '2.0.7';
+  const PANEL_ID = '__crm_official_follow_integrated_v202__';
+  const STYLE_ID = '__crm_official_follow_integrated_style_v202__';
+  const FIXED_CONTENT = '官网地址邮件已发';
+
+  if (window.__crmOfficialFollowIntegratedDestroy) {
+    try { window.__crmOfficialFollowIntegratedDestroy(); } catch (_) {}
+    window.__crmOfficialFollowIntegratedDestroy = null;
+  }
+
+  const state = {
+    companies: [],
+    index: 0,
+    running: false,
+    busy: false,
+    stopped: false,
+    waitingNext: false,
+    waitingManual: false,
+    autoRun: false,
+    minimized: false,
+    lastText: '',
+    panel: null,
+    refs: {},
+    cleanupFns: [],
+    updateTimer: null,
+    highlightEl: null,
+    currentCompany: '',
+    currentPage: 'other',
+    currentBasis: '-',
+  };
+
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+  function log(msg) {
+    const now = new Date();
+    const ts = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+    const line = `[${ts}] ${msg}`;
+    if (state.refs.log) {
+      state.refs.log.value += `${line}\n`;
+      state.refs.log.scrollTop = state.refs.log.scrollHeight;
+    }
+  }
+
+  function normalizeText(text) {
+    return String(text || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function normalizeCompanyName(text) {
+    return normalizeText(text)
+      .replace(/[®™©℠]/g, '')
+      .replace(/[()（）【】\[\]{}<>《》'"`´’‘“”.,，。:：;；!！?？·•|｜\\/]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function textOf(el) {
+    return (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    if (!(el instanceof Element)) return false;
+    if (isInsidePanel(el)) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return !!(rect.width || rect.height) && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }
+
+  function getPanelRoot() {
+    return document.getElementById(PANEL_ID);
+  }
+
+  function isInsidePanel(el) {
+    const root = getPanelRoot();
+    return !!(root && el instanceof Node && root.contains(el));
+  }
+
+  function queryVisibleAll(selector, root = document) {
+    return Array.from(root.querySelectorAll(selector)).filter(isVisible);
+  }
+
+  function fireEvent(el, type) {
+    let event;
+    if (type.startsWith('mouse') || type === 'click') {
+      event = new MouseEvent(type, { bubbles: true, cancelable: true, view: window });
+    } else if (type.startsWith('pointer')) {
+      event = new PointerEvent(type, { bubbles: true, cancelable: true, pointerType: 'mouse', isPrimary: true });
+    } else {
+      event = new Event(type, { bubbles: true, cancelable: true });
+    }
+    el.dispatchEvent(event);
+  }
+
+  function hardClick(el) {
+    if (!el) throw new Error('目标元素为空，无法点击');
+    try { el.focus({ preventScroll: true }); } catch (_) {}
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+      try { fireEvent(el, type); } catch (_) {}
+    });
+    try { el.click(); } catch (_) {}
+  }
+
+  function setNativeValue(el, value) {
+    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(el, value);
+    else el.value = value;
+    el.setAttribute('value', value);
+    fireEvent(el, 'input');
+    fireEvent(el, 'change');
+    fireEvent(el, 'blur');
+  }
+
+  function pressEnter(el) {
+    const init = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+    el.dispatchEvent(new KeyboardEvent('keydown', init));
+    el.dispatchEvent(new KeyboardEvent('keypress', init));
+    el.dispatchEvent(new KeyboardEvent('keyup', init));
+  }
+
+  async function waitFor(fn, timeout = 10000, interval = 200, desc = '目标') {
+    const start = Date.now();
+    let lastErr = null;
+    while (Date.now() - start < timeout) {
+      try {
+        const result = fn();
+        if (result) return result;
+      } catch (err) {
+        lastErr = err;
+      }
+      await sleep(interval);
+    }
+    throw new Error(`等待超时：${desc}${lastErr ? ` / ${lastErr.message || lastErr}` : ''}`);
+  }
+
+  function setStatusText(msg, isError = false) {
+    if (!state.refs.result) return;
+    state.refs.result.textContent = `结果：${msg}`;
+    state.refs.result.style.color = isError ? '#c62828' : '#1f2328';
+  }
+
+  function findSearchInput() {
+    return queryVisibleAll('input.n-input__input-el[placeholder="通过名称搜索"], input[placeholder="通过名称搜索"]')[0] || null;
+  }
+
+  function findDrawerWrapper() {
+    return queryVisibleAll('.n-drawer-content-wrapper, .n-drawer-content')[0] || null;
+  }
+
+  function findBackButton() {
+    const buttons = queryVisibleAll('button.n-button, button');
+    for (const btn of buttons) {
+      const path = btn.querySelector('svg path');
+      const d = path?.getAttribute('d') || '';
+      if (d.includes('M328 112L184 256l144 144')) return btn;
+    }
+    return null;
+  }
+
+  function findDetailEditButton() {
+    const byAttr = queryVisibleAll('button[label="编辑"]')[0];
+    if (byAttr) return byAttr;
+    return queryVisibleAll('button.n-button, button').find(btn => normalizeText(textOf(btn)) === '编辑') || null;
+  }
+
+  function findDetailRoot() {
+    return queryVisibleAll('.crm-follow-detail')[0] || null;
+  }
+
+  function findDescriptionRoot() {
+    return queryVisibleAll('.crm-description')[0] || null;
+  }
+
+  function findWriteRecordButton() {
+    const root = findDetailRoot();
+    if (!root) return null;
+    return Array.from(root.querySelectorAll('button, .n-button__content')).find(el => isVisible(el) && normalizeText(textOf(el)) === '写记录')?.closest('button') || null;
+  }
+
+  function getCurrentForm() {
+    const forms = [...document.querySelectorAll('form.n-form.crm-form-create')].filter(isVisible);
+    if (!forms.length) return null;
+    const withSave = forms.find(form => [...form.querySelectorAll('button')].some(btn => textOf(btn) === '保存'));
+    return withSave || forms[forms.length - 1] || null;
+  }
+
+  function findFormItemByLabel(form, labels) {
+    return [...form.querySelectorAll('.n-form-item')].find(item => {
+      const label = (item.querySelector('.n-form-item-label__text')?.textContent || '').trim();
+      return labels.includes(label);
+    }) || null;
+  }
+
+  function findSaveButton(form = null) {
+    const scope = form || document;
+    let saveBtn = [...scope.querySelectorAll('button')].find(btn => isVisible(btn) && textOf(btn) === '保存');
+    if (!saveBtn && form) {
+      saveBtn = [...document.querySelectorAll('button')].find(btn => isVisible(btn) && textOf(btn) === '保存');
+    }
+    return saveBtn || null;
+  }
+
+  function findWriteContentTextarea(form = null) {
+    const f = form || getCurrentForm();
+    if (!f) return null;
+    const item = findFormItemByLabel(f, ['跟进内容', '内容', '备注', '记录内容']);
+    if (item) {
+      const ta = [...item.querySelectorAll('textarea.n-input__textarea-el, textarea')].find(isVisible);
+      if (ta) return ta;
+    }
+    return [...f.querySelectorAll('textarea.n-input__textarea-el, textarea')].filter(isVisible)[0] || null;
+  }
+
+  function detectPageType() {
+    const form = getCurrentForm();
+    const saveBtn = findSaveButton(form || undefined);
+    const hasFollowWay = form && !!findFormItemByLabel(form, ['跟进方式']);
+    const hasContent = !!findWriteContentTextarea(form || undefined);
+    if (saveBtn && hasFollowWay && hasContent) {
+      state.currentBasis = 'write_record';
+      return 'write_record';
+    }
+
+    const drawer = findDrawerWrapper();
+    const backBtn = findBackButton();
+    const editBtn = findDetailEditButton();
+    const desc = findDescriptionRoot();
+    const detail = findDetailRoot();
+    const writeBtn = findWriteRecordButton();
+    if (drawer && ((backBtn && editBtn) || (desc && detail) || writeBtn)) {
+      state.currentBasis = 'detail';
+      return 'detail';
+    }
+
+    const mainInput = findSearchInput();
+    if (mainInput && !drawer) {
+      state.currentBasis = 'main';
+      return 'main';
+    }
+
+    state.currentBasis = 'other';
+    return 'other';
+  }
+
+  function clearHighlight() {
+    if (!state.highlightEl) return;
+    state.highlightEl.classList.remove('crm-official-follow-highlight', 'crm-official-follow-blink');
+    state.highlightEl = null;
+  }
+
+  async function scrollIntoMiddle(targetEl) {
+    if (!targetEl) return;
+    const scroller = findScrollableParent(targetEl);
+    if (scroller) {
+      const sr = scroller.getBoundingClientRect();
+      const tr = targetEl.getBoundingClientRect();
+      const nextTop = scroller.scrollTop + (tr.top - sr.top) - (scroller.clientHeight / 2) + (tr.height / 2);
+      try {
+        scroller.scrollTo({ top: Math.max(0, nextTop), behavior: 'smooth' });
+      } catch (_) {
+        scroller.scrollTop = Math.max(0, nextTop);
+      }
+    } else {
+      try {
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+      } catch (_) {
+        targetEl.scrollIntoView(true);
+      }
+    }
+    await sleep(450);
+  }
+
+  function markHighlight(el) {
+    clearHighlight();
+    el.classList.add('crm-official-follow-highlight', 'crm-official-follow-blink');
+    state.highlightEl = el;
+    setTimeout(() => {
+      if (state.highlightEl === el) el.classList.remove('crm-official-follow-blink');
+    }, 1600);
+  }
+
+  function findScrollableParent(el) {
+    let parent = el?.parentElement || null;
+    while (parent && parent !== document.body && parent !== document.documentElement) {
+      const style = getComputedStyle(parent);
+      if (/(auto|scroll|overlay)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight + 8) {
+        return parent;
+      }
+      parent = parent.parentElement;
+    }
+    return null;
+  }
+
+  function findMainCompanyEntry(companyName) {
+    const target = normalizeCompanyName(companyName);
+    const tds = queryVisibleAll('td[data-col-key="name"]');
+    const entries = tds.map(td => {
+      const btn = td.querySelector('button');
+      const textEl = td.querySelector('.one-line-text') || td.querySelector('.n-button__content') || td;
+      const text = textOf(textEl);
+      return { td, btn, text, normalized: normalizeCompanyName(text) };
+    }).filter(x => x.btn && x.text);
+    const exact = entries.find(x => x.normalized === target);
+    if (exact) return exact;
+    const fuzzy = entries.find(x => x.normalized.includes(target) || target.includes(x.normalized));
+    return fuzzy || (entries.length === 1 ? entries[0] : null);
+  }
+
+  function getFollowRecordContents() {
+    return queryVisibleAll('.crm-follow-record-content');
+  }
+
+  function findFollowContentByKeyword(keyword) {
+    const target = normalizeText(keyword);
+    return getFollowRecordContents().find(el => normalizeText(textOf(el)).includes(target)) || null;
+  }
+
+  async function flashElementTwice(el) {
+    await scrollIntoMiddle(el);
+    markHighlight(el);
+    await sleep(900);
+  }
+
+  async function ensureMainPage() {
+    const page = detectPageType();
+    if (page === 'main') return true;
+    if (page === 'detail') {
+      const backBtn = findBackButton();
+      if (!backBtn) throw new Error('当前在详情页，但未找到返回按钮');
+      hardClick(backBtn);
+      await waitFor(() => detectPageType() === 'main', 12000, 250, '返回主列表');
+      return true;
+    }
+    throw new Error(`当前不在主列表页，当前页面：${page}`);
+  }
+
+  async function searchAndOpenCompany(companyName) {
+    const input = await waitFor(() => findSearchInput(), 10000, 200, '搜索框');
+    try { input.focus(); } catch (_) {}
+    input.select?.();
+    setNativeValue(input, '');
+    await sleep(120);
+    setNativeValue(input, companyName);
+    await sleep(120);
+    pressEnter(input);
+    log(`Step.1 搜索公司：${companyName}`);
+
+    await sleep(1200);
+
+    const entry = await waitFor(() => findMainCompanyEntry(companyName), 10000, 250, `搜索结果公司：${companyName}`);
+    hardClick(entry.btn);
+    log(`Step.2 已点击公司：${companyName}（命中节点文本：${entry.text}）`);
+
+    await waitFor(() => detectPageType() === 'detail', 15000, 250, '详情页稳定加载');
+  }
+
+  async function waitDetailStable() {
+    await waitFor(() => {
+      return detectPageType() === 'detail' && findDescriptionRoot() && findDetailRoot() && findWriteRecordButton();
+    }, 15000, 250, '详情页稳定块');
+    await sleep(500);
+  }
+
+async function inspectDetailAndMaybeRun() {
+  await waitDetailStable();
+  log('Step.3 详情页已稳定，直接执行写记录。');
+  return 'need_write';
+}
+
+  async function enterWriteRecordPage() {
+    const btn = await waitFor(() => findWriteRecordButton(), 10000, 250, '写记录按钮');
+    hardClick(btn);
+    log('Step.5 已点击写记录。');
+
+    await waitFor(() => detectPageType() === 'write_record', 15000, 250, '写记录页');
+    await waitWriteRecordFormStable();
+    log('Step.6 写记录页表单已稳定。');
+  }
+
+  async function waitWriteRecordFormStable() {
+    await waitFor(() => {
+      const form = getCurrentForm();
+      if (!form) return false;
+      const saveBtn = findSaveButton(form);
+      const followWayItem = findFormItemByLabel(form, ['跟进方式']);
+      const dateItem = findFormItemByLabel(form, ['跟进时间']);
+      const contentTa = findWriteContentTextarea(form);
+      return !!(saveBtn && followWayItem && dateItem && contentTa);
+    }, 20000, 250, '写记录页表单稳定');
+    await sleep(700);
+  }
+
+  async function openSelectMenu(item) {
+    const clickTargets = [
+      item.querySelector('.n-base-selection-label'),
+      item.querySelector('.n-base-selection'),
+      item.querySelector('.n-base-suffix'),
+      item.querySelector('.n-base-suffix__arrow'),
+      item.querySelector('.n-base-selection-placeholder__inner'),
+      item.querySelector('.n-base-selection-input__content')
+    ].filter(Boolean);
+
+    for (const target of clickTargets) {
+      hardClick(target);
+      await sleep(200);
+      const menu = [...document.querySelectorAll('.n-base-select-menu')].find(isVisible);
+      if (menu) return menu;
+    }
+
+    const focusTarget = item.querySelector('.n-base-selection-label') || item.querySelector('.n-base-selection');
+    if (focusTarget) {
+      try { focusTarget.focus({ preventScroll: true }); } catch (_) {}
+      focusTarget.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter',
+        code: 'Enter',
+        bubbles: true,
+        cancelable: true
+      }));
+      await sleep(220);
+    }
+
+    const menu = [...document.querySelectorAll('.n-base-select-menu')].find(isVisible);
+    if (!menu) throw new Error('没能打开跟进方式下拉框');
+    return menu;
+  }
+
+  async function chooseEmailFollowWay(form) {
+    const item = findFormItemByLabel(form, ['跟进方式']);
+    if (!item) throw new Error('没找到“跟进方式”字段');
+
+    for (let i = 0; i < 3; i++) {
+      const currentValue = textOf(item.querySelector('.n-base-selection-input__content'));
+      if (currentValue === '邮箱') {
+        log('Step.7 已选择跟进方式：邮箱');
+        return;
+      }
+
+      await openSelectMenu(item);
+
+      const option = [...document.querySelectorAll('.n-base-select-option, .n-base-select-option__content')]
+        .find(el => isVisible(el) && textOf(el) === '邮箱');
+
+      if (!option) {
+        await sleep(300);
+        continue;
+      }
+
+      hardClick(option.closest('.n-base-select-option') || option);
+      await sleep(300);
+
+      const selected = textOf(item.querySelector('.n-base-selection-input__content'));
+      if (selected === '邮箱') {
+        log('Step.7 已选择跟进方式：邮箱');
+        return;
+      }
+
+      await sleep(350);
+    }
+
+    throw new Error('跟进方式未成功切换为“邮箱”');
+  }
+
+  async function setFollowDate(form, dateValue) {
+    const item = findFormItemByLabel(form, ['跟进时间']);
+    if (!item) throw new Error('没找到“跟进时间”字段');
+
+    const input = item.querySelector('.n-input__input-el');
+    const wrapper = item.querySelector('.n-date-picker .n-input') || item.querySelector('.n-date-picker');
+    if (!input) throw new Error('没找到“跟进时间”输入框');
+
+    try { input.focus({ preventScroll: true }); } catch (_) {}
+    setNativeValue(input, dateValue);
+    await sleep(160);
+
+    if ((input.value || '') !== dateValue) {
+      setNativeValue(input, dateValue);
+      await sleep(160);
+    }
+
+    if (wrapper) {
+      fireEvent(wrapper, 'change');
+      fireEvent(wrapper, 'blur');
+    }
+    log(`Step.8 已填写跟进时间：${dateValue}`);
+  }
+
+  async function fillContent(form) {
+    const ta = findWriteContentTextarea(form);
+    if (!ta) throw new Error('没找到“跟进内容”输入框');
+    try { ta.focus({ preventScroll: true }); } catch (_) {}
+    setNativeValue(ta, FIXED_CONTENT);
+    await sleep(150);
+    log(`Step.9 已填写跟进内容：${FIXED_CONTENT}`);
+  }
+
+  async function clickSave(form) {
+    const saveBtn = findSaveButton(form);
+    if (!saveBtn) throw new Error('没找到“保存”按钮');
+    hardClick(saveBtn);
+    log('Step.10 已点击保存，等待表单提交。');
+    await sleep(400);
+  }
+
+
+  async function runWriteRecord() {
+    const form = getCurrentForm();
+    if (!form) throw new Error('没找到当前记录表单');
+
+    const dateValue = (state.refs.date?.value || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) {
+      throw new Error('跟进时间格式错误，应为 YYYY-MM-DD');
+    }
+
+    await chooseEmailFollowWay(form);
+    await setFollowDate(form, dateValue);
+    await fillContent(form);
+    await clickSave(form);
+
+    log('Step.11 等待写记录页关闭并返回详情页。');
+    await waitFor(() => detectPageType() === 'detail', 20000, 250, '保存后返回详情页');
+    await waitDetailStable();
+
+    log('Step.12 已回到详情页，本条写记录已完成。');
+    state.lastText = '已完成官网邮件跟进';
+  }
+
+  async function backToMainPage() {
+    const page = detectPageType();
+    if (page === 'main') return;
+    if (page === 'detail') {
+      const backBtn = findBackButton();
+      if (!backBtn) throw new Error('详情页未找到返回按钮');
+      hardClick(backBtn);
+      await waitFor(() => detectPageType() === 'main', 15000, 250, '返回主列表');
+      log('Step.12 已返回主页面。');
+      return;
+    }
+    throw new Error(`当前页面不是 detail/main，无法自动回主页面：${page}`);
+  }
+
+async function processCompany(companyName) {
+  state.currentCompany = companyName;
+  state.lastText = '-';
+  updateStatus();
+
+  await ensureMainPage();
+  await searchAndOpenCompany(companyName);
+
+  await inspectDetailAndMaybeRun();
+  await enterWriteRecordPage();
+  await runWriteRecord();
+  await backToMainPage();
+}
+
+function parseCompanies(raw) {
+    return String(raw || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  }
+
+async function processNext() {
+  if (state.busy || !state.running || state.stopped) return;
+  if (state.index >= state.companies.length) {
+    state.running = false;
+    state.waitingNext = false;
+    state.waitingManual = false;
+    setStatusText('全部完成');
+    updateStatus();
+    log('全部公司处理完成。');
+    return;
+  }
+
+  state.busy = true;
+  updateStatus();
+
+  try {
+    const companyName = state.companies[state.index];
+    log('------------------------------');
+    log(`开始处理：${companyName}`);
+    setStatusText('处理中');
+    await processCompany(companyName);
+
+    if (state.autoRun) {
+      if (state.index < state.companies.length - 1) {
+        log('自动模式：当前公司已完成，准备继续下一家。');
+      }
+      state.index += 1;
+    } else {
+      state.running = false;
+      state.waitingNext = true;
+      setStatusText('当前公司已完成，请点击“下一个”');
+    }
+  } catch (err) {
+    state.running = false;
+    state.waitingNext = false;
+    state.waitingManual = false;
+    setStatusText(`失败：${err.message || err}`, true);
+    log(`处理失败：${err.message || err}`);
+  } finally {
+    state.busy = false;
+    updateStatus();
+  }
+
+  if (state.autoRun && !state.stopped && state.running) {
+    await sleep(400);
+    await processNext();
+  }
+}
+
+async function handleStart() {
+    const companies = parseCompanies(state.refs.input.value || '');
+    if (!companies.length) {
+      alert('请先粘贴公司名单，每行一个。');
+      return;
+    }
+    state.companies = companies;
+    state.index = 0;
+    state.running = true;
+    state.stopped = false;
+    state.waitingNext = false;
+    state.waitingManual = false;
+    clearHighlight();
+    setStatusText('开始执行');
+    updateStatus();
+    log(`已载入 ${companies.length} 家公司，开始执行。`);
+    await processNext();
+  }
+
+  async function handleNext() {
+    if (state.busy) return;
+    if (state.index >= state.companies.length) return;
+    state.index += 1;
+    state.running = true;
+    state.waitingNext = false;
+    state.waitingManual = false;
+    setStatusText('继续下一家');
+    updateStatus();
+    await processNext();
+  }
+
+  function handleStop() {
+    state.stopped = true;
+    state.running = false;
+    state.waitingNext = false;
+    state.waitingManual = false;
+    setStatusText('已停止');
+    updateStatus();
+    log('已停止。');
+  }
+
+  function updateStatus() {
+    if (!state.panel || !document.body.contains(state.panel)) return;
+    state.currentPage = detectPageType();
+    const total = state.companies.length;
+    const current = total ? Math.min(state.index + 1, total) : 0;
+    const currentName = state.companies[state.index] || '-';
+    let stage = '空闲';
+    if (state.busy) stage = '运行中';
+    else if (state.waitingNext) stage = '等待下一个';
+    else if (state.running) stage = '运行中';
+
+    state.refs.status.textContent = `进度：${current}/${total} ｜ 状态：${stage} ｜ 当前：${currentName}`;
+    state.refs.value.textContent = `字段：${state.lastText || '-'} ｜ 页面：${state.currentPage}`;
+
+    state.refs.start.disabled = state.running || state.busy;
+    state.refs.next.disabled = state.busy || !state.waitingNext;
+    state.refs.stop.disabled = (!state.running && !state.waitingNext) || state.busy;
+    state.refs.auto.checked = !!state.autoRun;
+  }
+
+  function destroyPanel() {
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) panel.remove();
+    state.cleanupFns.forEach(fn => {
+      try { fn(); } catch (_) {}
+    });
+    state.cleanupFns = [];
+    if (state.updateTimer) clearInterval(state.updateTimer);
+    state.updateTimer = null;
+    document.getElementById(STYLE_ID)?.remove();
+    clearHighlight();
+    window.__crmOfficialFollowIntegratedDestroy = null;
+  }
+
+  function handleClose() {
+    handleStop();
+    destroyPanel();
+  }
+
+  function lockPanelTopAnchor() {
+    const panel = state.panel;
+    if (!panel) return;
+    const rect = panel.getBoundingClientRect();
+    panel.style.left = `${rect.left}px`;
+    panel.style.top = `${rect.top}px`;
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  }
+
+  function toggleMinimize() {
+    const panel = state.panel;
+    if (!panel) return;
+    lockPanelTopAnchor();
+    state.minimized = !state.minimized;
+    panel.classList.toggle('crm-minimized', state.minimized);
+    state.refs.min.textContent = state.minimized ? '＋' : '－';
+  }
+
+  function makeDraggable(panel, handle) {
+    let dragging = false;
+    let startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+    function onMouseMove(e) {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      panel.style.left = `${startLeft + dx}px`;
+      panel.style.top = `${startTop + dy}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    }
+
+    function onMouseUp() {
+      dragging = false;
+      document.body.style.userSelect = '';
+    }
+
+    handle.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button, textarea, input, label, .date-clickbox')) return;
+      const rect = panel.getBoundingClientRect();
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      dragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    state.cleanupFns.push(() => document.removeEventListener('mousemove', onMouseMove));
+    state.cleanupFns.push(() => document.removeEventListener('mouseup', onMouseUp));
+  }
+
+  function ensureStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${PANEL_ID} {
+        position: fixed;
+        right: 16px;
+        top: 120px;
+        width: 400px;
+        background: #fff;
+        color: #1f2328;
+        z-index: 999999;
+        border: 1px solid #cfd7df;
+        box-shadow: 0 8px 28px rgba(0,0,0,.12);
+        font: 12px/1.4 Arial, sans-serif;
+      }
+      #${PANEL_ID}, #${PANEL_ID} * { box-sizing: border-box; border-radius: 0 !important; }
+      #${PANEL_ID} .head {
+        padding: 10px 12px;
+        border-bottom: 1px solid #e5e9ef;
+        background: #f7f8fa;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        cursor: move;
+        user-select: none;
+      }
+      #${PANEL_ID} .head-right { display:flex; gap:8px; align-items:center; color:#4b5563; }
+      #${PANEL_ID} .head-btn {
+        width: 24px;
+        height: 24px;
+        border: 1px solid #cfd7df;
+        background: #fff;
+        cursor: pointer;
+        line-height: 1;
+        padding: 0;
+        font-size: 16px;
+      }
+      #${PANEL_ID} .body { padding: 10px 12px 12px; }
+      #${PANEL_ID}.crm-minimized .body { display: none; }
+      #${PANEL_ID} .box {
+        padding: 8px;
+        border: 1px solid #e5e9ef;
+        background: #fafbfc;
+        margin-bottom: 8px;
+        line-height: 1.45;
+        word-break: break-all;
+      }
+      #${PANEL_ID} .line { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+      #${PANEL_ID} textarea {
+        width:100%;
+        height:132px;
+        resize:vertical;
+        border:1px solid #cfd7df;
+        padding:8px;
+        outline:none;
+        font-size:12px;
+        background:#fff;
+      }
+      #${PANEL_ID} textarea[data-role="log"] {
+        user-select:text;
+        -webkit-user-select:text;
+        pointer-events:auto;
+        cursor:text;
+      }
+      #${PANEL_ID} .date-row { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+      #${PANEL_ID} .date-clickbox {
+        flex:1;
+        border:1px solid #cfd7df;
+        height:32px;
+        display:flex;
+        align-items:center;
+        background:#fff;
+        cursor:text;
+        padding:0 8px;
+      }
+      #${PANEL_ID} .date-clickbox input {
+        width:100%;
+        height:100%;
+        border:none;
+        outline:none;
+        background:transparent;
+        cursor:text;
+      }
+      #${PANEL_ID} .buttons {
+        display:grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap:8px;
+        margin-top:8px;
+      }
+      #${PANEL_ID} button.action {
+        height:34px;
+        border:1px solid #cfd7df;
+        background:#fff;
+        cursor:pointer;
+      }
+      #${PANEL_ID} button.action:hover:not(:disabled) { background:#f3f4f6; }
+      #${PANEL_ID} button.action:disabled { opacity:.45; cursor:not-allowed; }
+      .crm-official-follow-highlight {
+        outline: 3px solid #ff3b30 !important;
+        outline-offset: 2px !important;
+        background: rgba(255,59,48,.06) !important;
+      }
+      .crm-official-follow-blink {
+        animation: crmOfficialFollowBlink .34s linear 4;
+      }
+      @keyframes crmOfficialFollowBlink { 0%{opacity:1} 50%{opacity:.18} 100%{opacity:1} }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function todayStr() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function ensurePanel() {
+    if (document.getElementById(PANEL_ID)) return;
+    ensureStyle();
+
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="head">
+        <span>CRM官网跟进整合版 v${VERSION}</span>
+        <div class="head-right">
+          <span>可拖动</span>
+          <button class="head-btn" data-role="min" type="button">－</button>
+          <button class="head-btn" data-role="close" type="button">×</button>
+        </div>
+      </div>
+      <div class="body">
+        <div class="box" data-role="status">进度：0/0 ｜ 状态：空闲 ｜ 当前：-</div>
+        <div class="box" data-role="value">字段：- ｜ 页面：other</div>
+        <div class="box" data-role="result">结果：就绪</div>
+        <div class="line">
+          <label><input type="checkbox" data-role="auto"> 自动模式</label>
+        </div>
+        <div class="date-row">
+          <label>跟进时间</label>
+          <div class="date-clickbox" data-role="date-box">
+            <input data-role="date" type="date" value="${todayStr()}">
+          </div>
+        </div>
+        <textarea data-role="input" placeholder="每行一个公司名"></textarea>
+        <div class="buttons">
+          <button class="action" data-role="start" type="button">开始</button>
+          <button class="action" data-role="next" type="button" disabled>下一个</button>
+          <button class="action" data-role="stop" type="button" disabled>停止</button>
+        </div>
+        <textarea data-role="log" style="height:146px;margin-top:8px;" readonly placeholder="运行日志"></textarea>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    state.panel = panel;
+    state.refs = {
+      head: panel.querySelector('.head'),
+      min: panel.querySelector('[data-role="min"]'),
+      close: panel.querySelector('[data-role="close"]'),
+      status: panel.querySelector('[data-role="status"]'),
+      value: panel.querySelector('[data-role="value"]'),
+      result: panel.querySelector('[data-role="result"]'),
+      auto: panel.querySelector('[data-role="auto"]'),
+      dateBox: panel.querySelector('[data-role="date-box"]'),
+      date: panel.querySelector('[data-role="date"]'),
+      input: panel.querySelector('[data-role="input"]'),
+      log: panel.querySelector('[data-role="log"]'),
+      start: panel.querySelector('[data-role="start"]'),
+      next: panel.querySelector('[data-role="next"]'),
+      stop: panel.querySelector('[data-role="stop"]'),
+    };
+
+    state.refs.auto.addEventListener('change', e => {
+      state.autoRun = !!e.target.checked;
+      log(`自动模式：${state.autoRun ? '开启' : '关闭'}`);
+      updateStatus();
+    });
+    state.refs.start.addEventListener('click', handleStart);
+    state.refs.next.addEventListener('click', handleNext);
+    state.refs.stop.addEventListener('click', handleStop);
+    state.refs.min.addEventListener('click', toggleMinimize);
+    state.refs.close.addEventListener('click', handleClose);
+    const openDatePicker = (e) => {
+      e?.preventDefault?.();
+      e?.stopPropagation?.();
+      const input = state.refs.date;
+      if (!input) return;
+      try { input.focus({ preventScroll: true }); } catch (_) {}
+      try { input.showPicker?.(); } catch (_) {}
+    };
+    state.refs.dateBox.addEventListener('click', openDatePicker);
+    state.refs.date.addEventListener('click', openDatePicker);
+    state.refs.date.addEventListener('mousedown', (e) => e.stopPropagation());
+
+    makeDraggable(panel, state.refs.head);
+    updateStatus();
+    log('CRM官网跟进整合版已就绪。');
+  }
+
+  function boot() {
+    ensurePanel();
+    window.__crmOfficialFollowIntegratedDestroy = handleClose;
+    if (state.updateTimer) clearInterval(state.updateTimer);
+    state.updateTimer = setInterval(updateStatus, 1000);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    boot();
+  }
+})();

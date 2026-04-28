@@ -1,0 +1,1673 @@
+// ==UserScript==
+// @name         SN 导出 v1.4.0
+// @namespace    https://app.snov.io/
+// @version      1.4.0
+// @description  自动化导出 Snov.io 潜在客户；按参考面板结构重写样式，修复底部大块黑色空白；开始时自动切回潜在客户，导出成功后自动跳转公司；保留搜索等待、侦察与折叠面板逻辑
+// @author       开发者
+// @match        https://app.snov.io/prospects*
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+// 更新说明
+// v1.4.0
+// 1. 切回【潜在客户】后，新增页面稳定等待逻辑，不再仅凭左侧菜单高亮就继续执行。
+// 2. 新增潜在客户页面工具栏侦测，要求主操作区与导出菜单按钮真正出现并稳定后才进入下一步。
+// 3. 导出菜单按钮定位改为优先限制在潜在客户页顶部工具栏内，避免页面尚未刷新完时误点其他按钮。
+// 4. 新增切页后的缓冲与稳定日志，降低切页瞬间误判与误点击概率。
+//
+// // v1.3.9
+// 1. 面板样式按 Snov 搜索筛选面板的结构回退重写，不再使用 flex 高度联动。
+// 2. 删除导致外层高度异常的复杂高度控制，只保留日志框固定高度，其余区域自然撑开。
+// 3. addStyles 改为先移除旧样式再注入新样式，避免样式残留叠加。
+// 4. 仅修复面板显示问题，不改动原有导出业务流程。
+//
+// v1.3.8
+// 1. 修复面板底部大块黑色空白：根面板取消整屏最大高度限制，改为内容自适应高度。
+// 2. 根面板取消 overflow:hidden，避免外层容器被异常拉高后出现整块黑底空白。
+// 3. 明确 body / 列容器为自适应高度，仅日志框自己固定高度并滚动。
+// 4. 面板整体改为 flex 竖向结构，进一步避免内部区域把外层高度撑错。
+//
+// v1.3.7
+// 1. 点击【开始自动导出】时，先尝试切换到左侧【潜在客户】菜单，确保回到联系人导出界面。
+// 2. 检测到导出成功后，延迟 0.5 秒自动点击左侧【公司】菜单。
+// 3. 新增左侧菜单定位与等待逻辑，优先使用 data-route-name / href / 文本多重定位，降低菜单点击失败概率。
+//
+// v1.3.6
+// 1. 【检测搜索状态（侦察）】与【导出侦察信息】默认隐藏到【操作日志】区域中，点击【操作日志】文本再展开/收起。
+// 2. 【操作日志】文本外观不改，只增加点击切换隐藏工具区的行为。
+// 3. 进一步压缩面板整体留白与日志区高度，减少底部大块无意义黑色遮挡。
+// 4. 面板改为强制自适应高度，避免残留空白高度。
+//
+// v1.3.5
+// 1. 修复 xlink:href 选择器转义错误，避免在检测搜索状态时直接报 querySelector 无效选择器。
+// 2. 等待邮箱搜索完成逻辑继续保留顶部状态块 + 列表行内状态双通道判定，不再只盯单一顶部块。
+// 3. 只要页面仍存在任一有效“正在搜索邮箱地址”状态，就继续等待，避免搜索未完就提前导出。
+// 4. 检测到搜索状态全部消失后，额外缓冲 3 秒再继续导出，降低页面刚刷新完就立刻点击导致的误判。
+// 5. 压缩面板底部空白区域，日志区改为更合理高度，减少大块无意义黑色留白。
+//
+// v1.3.3
+// 1. 运行按钮改为【开始自动导出 / 停止导出】一体化切换，不再单独显示停止按钮。
+// 2. 【启动前等待邮箱搜索完成】改为固定启用，不再在面板中显示。
+// 3. 导出完成判定改为优先只盯成功提示：data-test="prospects-export-info-alert" / 文本“导出成功”“下载您的列表”。
+// 4. 导出成功等待超时改为 2 分钟；“正在导出”只作为过程日志，不再作为必须命中条件。
+// 5. 点击导出确认后不再因短时间内没看到“正在导出”而提前报错，直接进入导出结果等待。
+// 6. 面板样式改为与上方 SN 搜索脚本一致的小型深色面板风格，日志区固定高度。
+//
+// v1.3.2
+// 1. 新增【检测搜索状态（侦察）】按钮。
+// 2. 新增【导出侦察信息】按钮。
+// 3. 搜索状态侦察最长等待 5 分钟。
+
+(function () {
+    'use strict';
+
+    let isInitialized = false;
+
+    let exportButtonLocator = {
+        selector: null,
+        lastText: '导出潜在客户'
+    };
+
+    const SEARCH_RECON_TIMEOUT_MS = 5 * 60 * 1000;
+    const SEARCH_RECON_INTERVAL_MS = 1000;
+    const EXPORT_SUCCESS_TIMEOUT_MS = 2 * 60 * 1000;
+    const EMAIL_SEARCH_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
+    const EMAIL_SEARCH_STABLE_BUFFER_MS = 3000;
+    const PROSPECTS_PAGE_READY_TIMEOUT_MS = 20000;
+    const PROSPECTS_PAGE_STABLE_BUFFER_MS = 1500;
+
+    const reconState = {
+        running: false,
+        startedAt: '',
+        endedAt: '',
+        result: 'idle',
+        lastMessage: '',
+        reportLines: [],
+        latestSnapshot: null,
+        latestCandidates: [],
+        bestCandidate: null
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => setTimeout(init, 800));
+    } else {
+        setTimeout(init, 800);
+    }
+
+    function init() {
+        if (isInitialized) return;
+        isInitialized = true;
+
+        const oldPanel = document.getElementById('snov-auto-export-panel');
+        if (oldPanel) oldPanel.remove();
+
+        addStyles();
+        createControlPanel();
+    }
+
+    function createControlPanel() {
+        const panel = document.createElement('div');
+        panel.id = 'snov-auto-export-panel';
+        panel.innerHTML = `
+            <div class="snx-hdr">
+                <div>SN 导出 v1.4.0 <span class="snx-tag" id="status-indicator">就绪</span></div>
+                <div class="snx-x" id="close-btn" title="移除">×</div>
+            </div>
+            <div class="snx-body">
+                <div class="snx-col">
+                    <button id="run-export" class="snx-btn snx-btn-primary">开始自动导出</button>
+                    <button id="relocate-export-btn" class="snx-btn">重新定位导出按钮</button>
+                </div>
+                <div class="snx-log-label" id="toggle-log-tools">操作日志</div>
+                <div id="log-tools" class="snx-log-tools is-hidden">
+                    <button id="detect-search-status" class="snx-btn">检测搜索状态（侦察）</button>
+                    <button id="export-search-recon" class="snx-btn">导出侦察信息</button>
+                </div>
+                <div id="export-log" class="snx-status"><div>面板已加载（v1.4.0）</div></div>
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        setupPanelEvents(panel, panel.querySelector('.snx-hdr'));
+        setupButtonEvents();
+        setupGlobalFunctions();
+    }
+
+    function setupPanelEvents(panel, titleBar) {
+        let isDragging = false;
+        let startX = 0;
+        let startY = 0;
+        let startLeft = 0;
+        let startTop = 0;
+
+        titleBar.addEventListener('mousedown', function (e) {
+            if (e.target.closest('#close-btn')) return;
+
+            isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            startLeft = panel.offsetLeft;
+            startTop = panel.offsetTop;
+
+            document.addEventListener('mousemove', onDrag);
+            document.addEventListener('mouseup', stopDrag);
+        });
+
+        function onDrag(e) {
+            if (!isDragging) return;
+
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+
+            let newLeft = startLeft + dx;
+            let newTop = startTop + dy;
+
+            const maxX = window.innerWidth - panel.offsetWidth;
+            const maxY = window.innerHeight - panel.offsetHeight;
+
+            newLeft = Math.max(0, Math.min(newLeft, maxX));
+            newTop = Math.max(0, Math.min(newTop, maxY));
+
+            panel.style.left = `${newLeft}px`;
+            panel.style.top = `${newTop}px`;
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+        }
+
+        function stopDrag() {
+            isDragging = false;
+            document.removeEventListener('mousemove', onDrag);
+            document.removeEventListener('mouseup', stopDrag);
+        }
+
+        document.getElementById('close-btn').addEventListener('click', function () {
+            panel.style.display = 'none';
+        });
+    }
+
+    function setupButtonEvents() {
+        document.getElementById('run-export').addEventListener('click', toggleExportAutomation);
+        document.getElementById('relocate-export-btn').addEventListener('click', relocateExportButton);
+        document.getElementById('detect-search-status').addEventListener('click', runSearchStatusRecon);
+        document.getElementById('export-search-recon').addEventListener('click', exportSearchReconReport);
+        document.getElementById('toggle-log-tools').addEventListener('click', toggleLogTools);
+    }
+
+    function toggleLogTools() {
+        const tools = document.getElementById('log-tools');
+        if (!tools) return;
+        tools.classList.toggle('is-hidden');
+    }
+
+    function setupGlobalFunctions() {
+        window.snovAuto = {
+            run: runExportAutomation,
+            stop: stopExportAutomation,
+            test: testExportStep,
+            log: logMessage,
+            relocate: relocateExportButton,
+            refreshLocator: refreshExportButtonLocator,
+            detectSearchStatus: runSearchStatusRecon,
+            exportRecon: exportSearchReconReport,
+            scanSearchNow: scanSearchStatusNow
+        };
+    }
+
+    function logMessage(message, type = 'info') {
+        const time = new Date().toLocaleTimeString();
+        const logElement = document.getElementById('export-log');
+        if (!logElement) return;
+
+        const logItem = document.createElement('div');
+        logItem.style.cssText = `
+            padding: 3px 0;
+            border-bottom: 1px solid rgba(255,255,255,.06);
+            color: ${type === 'error' ? '#ff8f8f' : type === 'success' ? '#8fe2a4' : type === 'warn' ? '#ffd27a' : '#d7dde8'};
+            font-weight: ${type === 'error' ? 'bold' : 'normal'};
+            word-break: break-word;
+        `;
+        logItem.textContent = `[${time}] ${message}`;
+
+        logElement.appendChild(logItem);
+        logElement.scrollTop = logElement.scrollHeight;
+    }
+
+    function updateStatus(status, isRunning = false) {
+        const statusEl = document.getElementById('status-indicator');
+        const runBtn = document.getElementById('run-export');
+
+        if (!statusEl || !runBtn) return;
+
+        statusEl.textContent = status;
+        statusEl.className = 'snx-tag' + (isRunning ? ' is-running' : '');
+
+        runBtn.textContent = isRunning ? '停止导出' : '开始自动导出';
+        runBtn.className = 'snx-btn ' + (isRunning ? 'snx-btn-danger' : 'snx-btn-primary');
+        runBtn.disabled = false;
+    }
+
+    function toggleExportAutomation() {
+        if (window.isExportRunning) {
+            stopExportAutomation();
+            return;
+        }
+        runExportAutomation();
+    }
+
+    function wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function ensureRunning() {
+        if (!window.isExportRunning) {
+            throw new Error('任务已停止');
+        }
+    }
+
+    function waitForCondition(fn, timeout = 10000, interval = 250) {
+        return new Promise((resolve, reject) => {
+            const start = Date.now();
+
+            const check = () => {
+                if (!window.isExportRunning && window.isExportRunning !== undefined) {
+                    reject(new Error('任务已停止'));
+                    return;
+                }
+
+                try {
+                    const result = fn();
+                    if (result) {
+                        resolve(result);
+                        return;
+                    }
+                } catch (e) {}
+
+                if (Date.now() - start > timeout) {
+                    reject(new Error('等待超时'));
+                    return;
+                }
+
+                setTimeout(check, interval);
+            };
+
+            check();
+        });
+    }
+
+    function isVisible(el) {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        return style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            el.offsetParent !== null;
+    }
+
+    function isEnabled(el) {
+        if (!el) return false;
+        return !el.disabled && !el.hasAttribute('disabled') && el.getAttribute('aria-disabled') !== 'true';
+    }
+
+    function safeClick(element) {
+        if (!element) return false;
+
+        try {
+            element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+        } catch (e) {}
+
+        try {
+            element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+            element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+            element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+            element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            return true;
+        } catch (e) {
+            try {
+                element.click();
+                return true;
+            } catch (e2) {
+                return false;
+            }
+        }
+    }
+
+    function limitText(text, maxLen = 260) {
+        const s = String(text || '').replace(/\s+/g, ' ').trim();
+        if (s.length <= maxLen) return s;
+        return s.slice(0, maxLen) + '...';
+    }
+
+    function getElementText(el) {
+        return (el?.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function buildStableSelector(el) {
+        if (!el) return null;
+
+        if (el.id) {
+            return `#${CSS.escape(el.id)}`;
+        }
+
+        const dataTest = el.getAttribute('data-test');
+        if (dataTest) {
+            return `[data-test="${CSS.escape(dataTest)}"]`;
+        }
+
+        const trackingId = el.getAttribute('plerdy-tracking-id');
+        if (trackingId) {
+            return `[plerdy-tracking-id="${trackingId}"]`;
+        }
+
+        const classes = [...el.classList].filter(Boolean).slice(0, 4);
+        if (classes.length) {
+            return `${el.tagName.toLowerCase()}.${classes.map(c => CSS.escape(c)).join('.')}`;
+        }
+
+        return el.tagName.toLowerCase();
+    }
+
+    function getCssPath(el) {
+        if (!el || el.nodeType !== 1) return '';
+        const parts = [];
+        let node = el;
+        while (node && node.nodeType === 1 && node !== document.body) {
+            let part = node.tagName.toLowerCase();
+            if (node.id) {
+                part += `#${node.id}`;
+                parts.unshift(part);
+                break;
+            }
+            const cls = [...node.classList].filter(Boolean).slice(0, 2);
+            if (cls.length) {
+                part += '.' + cls.join('.');
+            }
+            const parent = node.parentElement;
+            if (parent) {
+                const sameTagSiblings = [...parent.children].filter(child => child.tagName === node.tagName);
+                if (sameTagSiblings.length > 1) {
+                    part += `:nth-of-type(${sameTagSiblings.indexOf(node) + 1})`;
+                }
+            }
+            parts.unshift(part);
+            node = node.parentElement;
+        }
+        return parts.join(' > ');
+    }
+
+    function getEmailSearchingBlock() {
+        const blocks = document.querySelectorAll('.check-verification-block');
+
+        for (const block of blocks) {
+            if (!isVisible(block)) continue;
+
+            const text = (block.textContent || '').trim();
+            const hasAnimatedLoadingIcon = !!block.querySelector('use[xlink\\:href="#loading_icon__animated"]');
+            const hasSearchingText = text.includes('正在搜索邮箱地址');
+
+            if (hasAnimatedLoadingIcon && hasSearchingText) {
+                return block;
+            }
+        }
+
+        return null;
+    }
+
+    function collectActiveEmailSearchingElements() {
+        const matches = [];
+        const seen = new Set();
+
+        function pushMatch(el, source) {
+            if (!el || seen.has(el) || !isVisible(el)) return;
+            const text = getElementText(el);
+            if (!text.includes('正在搜索邮箱地址')) return;
+            seen.add(el);
+            matches.push({
+                element: el,
+                source,
+                text,
+                selector: buildStableSelector(el),
+                cssPath: getCssPath(el)
+            });
+        }
+
+        document.querySelectorAll('.check-verification-block').forEach(block => {
+            const text = getElementText(block);
+            const hasAnimatedLoadingIcon = !!block.querySelector('use[xlink\\:href="#loading_icon__animated"]');
+            if (hasAnimatedLoadingIcon && text.includes('正在搜索邮箱地址')) {
+                pushMatch(block, 'top-block');
+            }
+        });
+
+        document.querySelectorAll('.generic__searching, .stop-drag, .row-info, td.row__cell--relative').forEach(el => {
+            const text = getElementText(el);
+            if (!text.includes('正在搜索邮箱地址')) return;
+
+            const searchingNode = el.classList.contains('generic__searching')
+                ? el
+                : (el.querySelector('.generic__searching') || el);
+
+            pushMatch(searchingNode, 'row-inline');
+        });
+
+        document.querySelectorAll('div, span').forEach(el => {
+            if (seen.has(el) || !isVisible(el)) return;
+            const text = getElementText(el);
+            if (!text.includes('正在搜索邮箱地址')) return;
+            if (text.length > 80) return;
+            pushMatch(el, 'text-fallback');
+        });
+
+        return matches;
+    }
+
+    function getExportingBlock() {
+        const blocks = document.querySelectorAll('.check-verification-block');
+
+        for (const block of blocks) {
+            const text = (block.textContent || '').trim();
+            const hasAnimatedLoadingIcon = !!block.querySelector('use[xlink\\:href="#loading_icon__animated"]');
+            const hasExportingText = text.includes('正在导出');
+
+            if (hasAnimatedLoadingIcon && hasExportingText) {
+                return block;
+            }
+        }
+
+        return null;
+    }
+
+    function getExportSuccessAlert() {
+        const candidates = [
+            ...document.querySelectorAll('[data-test="prospects-export-info-alert"]'),
+            ...document.querySelectorAll('.snovio-alert.snovio-alert--success.alert--margin'),
+            ...document.querySelectorAll('.snovio-alert.snovio-alert--success')
+        ];
+
+        for (const el of candidates) {
+            const text = getElementText(el);
+            if (!text) continue;
+            if (text.includes('导出成功') || text.includes('下载您的列表')) {
+                return el;
+            }
+        }
+
+        return null;
+    }
+
+    function collectSearchStatusCandidates() {
+        const candidateSet = new Set();
+        const keywordSelectors = [
+            '.check-verification-block',
+            '[data-test*="search"]',
+            '[class*="search"]',
+            '[class*="verification"]',
+            '[class*="loading"]',
+            '[class*="alert"]'
+        ];
+
+        keywordSelectors.forEach(selector => {
+            document.querySelectorAll(selector).forEach(el => {
+                if (isVisible(el)) candidateSet.add(el);
+            });
+        });
+
+        document.querySelectorAll('div, section, article, span, p').forEach(el => {
+            if (!isVisible(el)) return;
+            const text = getElementText(el);
+            if (!text) return;
+            if (text.length > 180) return;
+            if (
+                text.includes('正在搜索邮箱地址') ||
+                text.includes('搜索邮箱地址') ||
+                text.includes('搜索邮箱') ||
+                text.includes('邮箱地址') ||
+                text.includes('搜索中')
+            ) {
+                candidateSet.add(el);
+            }
+        });
+
+        const candidates = [];
+        candidateSet.forEach(el => {
+            const text = getElementText(el);
+            const hasAnimatedLoadingIcon = !!el.querySelector('use[xlink\\:href="#loading_icon__animated"]');
+            const hasStaticLoadingIcon = !!el.querySelector('use[xlink\\:href*="#loading_icon"]');
+            const className = (el.className || '').toString();
+            const dataTest = el.getAttribute('data-test') || '';
+
+            let score = 0;
+            if (text.includes('正在搜索邮箱地址')) score += 100;
+            if (text.includes('搜索邮箱地址')) score += 60;
+            if (text.includes('搜索邮箱')) score += 40;
+            if (text.includes('邮箱地址')) score += 20;
+            if (text.includes('搜索中')) score += 15;
+            if (hasAnimatedLoadingIcon) score += 50;
+            if (hasStaticLoadingIcon) score += 10;
+            if (/check-verification-block/i.test(className)) score += 20;
+            if (/search|verification|loading/i.test(className)) score += 10;
+            if (/search|verification/i.test(dataTest)) score += 10;
+
+            const rect = el.getBoundingClientRect();
+            candidates.push({
+                element: el,
+                score,
+                text: limitText(text, 320),
+                dataTest,
+                className: limitText(className, 200),
+                selector: buildStableSelector(el),
+                cssPath: getCssPath(el),
+                hasAnimatedLoadingIcon,
+                hasStaticLoadingIcon,
+                rect: {
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    w: Math.round(rect.width),
+                    h: Math.round(rect.height)
+                },
+                html: limitText(el.outerHTML || '', 800)
+            });
+        });
+
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates.slice(0, 20);
+    }
+
+    function scanSearchStatusNow() {
+        const exactBlock = getEmailSearchingBlock();
+        const candidates = collectSearchStatusCandidates();
+        const best = exactBlock
+            ? {
+                element: exactBlock,
+                score: 999,
+                text: limitText(getElementText(exactBlock), 320),
+                dataTest: exactBlock.getAttribute('data-test') || '',
+                className: limitText((exactBlock.className || '').toString(), 200),
+                selector: buildStableSelector(exactBlock),
+                cssPath: getCssPath(exactBlock),
+                hasAnimatedLoadingIcon: !!exactBlock.querySelector('use[xlink\\:href="#loading_icon__animated"]'),
+                hasStaticLoadingIcon: !!exactBlock.querySelector('use[xlink\\:href*="#loading_icon"]'),
+                rect: (() => {
+                    const rect = exactBlock.getBoundingClientRect();
+                    return {
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height)
+                    };
+                })(),
+                html: limitText(exactBlock.outerHTML || '', 800)
+            }
+            : (candidates[0] || null);
+
+        const found = !!exactBlock || (!!best && best.score >= 70);
+
+        return {
+            found,
+            best,
+            candidates,
+            exactMatch: !!exactBlock,
+            scannedAt: new Date().toLocaleString(),
+            url: location.href,
+            title: document.title
+        };
+    }
+
+    function appendReconLine(line) {
+        reconState.reportLines.push(line);
+    }
+
+    function resetReconState() {
+        reconState.running = false;
+        reconState.startedAt = '';
+        reconState.endedAt = '';
+        reconState.result = 'idle';
+        reconState.lastMessage = '';
+        reconState.reportLines = [];
+        reconState.latestSnapshot = null;
+        reconState.latestCandidates = [];
+        reconState.bestCandidate = null;
+    }
+
+    async function runSearchStatusRecon() {
+        if (reconState.running) {
+            logMessage('搜索状态侦察已在运行中', 'warn');
+            return;
+        }
+
+        resetReconState();
+        reconState.running = true;
+        reconState.startedAt = new Date().toLocaleString();
+        reconState.result = 'running';
+        appendReconLine('Snov Search Status Recon Report');
+        appendReconLine(`generatedAt: ${reconState.startedAt}`);
+        appendReconLine(`timeoutMs: ${SEARCH_RECON_TIMEOUT_MS}`);
+        appendReconLine(`startUrl: ${location.href}`);
+        appendReconLine(`title: ${document.title}`);
+        appendReconLine('');
+
+        logMessage('开始侦察搜索状态，最长等待 5 分钟...');
+
+        const start = Date.now();
+        let lastHeartbeat = 0;
+
+        try {
+            while (Date.now() - start < SEARCH_RECON_TIMEOUT_MS) {
+                const snapshot = scanSearchStatusNow();
+                reconState.latestSnapshot = snapshot;
+                reconState.latestCandidates = snapshot.candidates;
+                reconState.bestCandidate = snapshot.best;
+
+                if (snapshot.found) {
+                    reconState.result = 'found';
+                    reconState.endedAt = new Date().toLocaleString();
+                    reconState.lastMessage = snapshot.exactMatch ? '命中精确搜索状态块' : '命中高分候选搜索状态块';
+
+                    appendReconLine(`[FOUND] ${reconState.endedAt}`);
+                    appendReconLine(`message: ${reconState.lastMessage}`);
+                    appendReconLine(`url: ${snapshot.url}`);
+                    appendReconLine(`title: ${snapshot.title}`);
+                    appendReconLine('');
+                    appendReconLine(formatCandidateBlock(snapshot.best, 'bestCandidate'));
+                    appendReconLine('');
+                    appendReconLine(formatCandidateList(snapshot.candidates));
+
+                    logMessage(`已侦察到搜索状态：${reconState.lastMessage}`, 'success');
+                    return true;
+                }
+
+                const now = Date.now();
+                if (now - lastHeartbeat >= 10000) {
+                    const elapsedSec = Math.floor((now - start) / 1000);
+                    const topScore = snapshot.best ? snapshot.best.score : 0;
+                    logMessage(`侦察中... 已等待 ${elapsedSec} 秒，当前最高候选分数 ${topScore}`);
+                    lastHeartbeat = now;
+                }
+
+                await wait(SEARCH_RECON_INTERVAL_MS);
+            }
+
+            reconState.result = 'timeout';
+            reconState.endedAt = new Date().toLocaleString();
+            reconState.lastMessage = '5 分钟内未命中可确认的搜索状态块';
+
+            appendReconLine(`[TIMEOUT] ${reconState.endedAt}`);
+            appendReconLine(`message: ${reconState.lastMessage}`);
+            appendReconLine(`url: ${location.href}`);
+            appendReconLine(`title: ${document.title}`);
+            appendReconLine('');
+
+            if (reconState.bestCandidate) {
+                appendReconLine(formatCandidateBlock(reconState.bestCandidate, 'bestCandidateWhenTimeout'));
+                appendReconLine('');
+            }
+            appendReconLine(formatCandidateList(reconState.latestCandidates));
+
+            logMessage('搜索状态侦察超时：5 分钟内未命中明确状态', 'error');
+            return false;
+        } catch (error) {
+            reconState.result = 'error';
+            reconState.endedAt = new Date().toLocaleString();
+            reconState.lastMessage = error.message || String(error);
+            appendReconLine(`[ERROR] ${reconState.endedAt}`);
+            appendReconLine(`message: ${reconState.lastMessage}`);
+            logMessage(`搜索状态侦察失败：${reconState.lastMessage}`, 'error');
+            return false;
+        } finally {
+            reconState.running = false;
+        }
+    }
+
+    function formatCandidateBlock(candidate, title = 'candidate') {
+        if (!candidate) return `${title}: (none)`;
+        return [
+            `===== ${title} =====`,
+            `score: ${candidate.score}`,
+            `text: ${candidate.text || ''}`,
+            `selector: ${candidate.selector || ''}`,
+            `data-test: ${candidate.dataTest || ''}`,
+            `class: ${candidate.className || ''}`,
+            `cssPath: ${candidate.cssPath || ''}`,
+            `loadingAnimated: ${candidate.hasAnimatedLoadingIcon ? 'yes' : 'no'}`,
+            `loadingIcon: ${candidate.hasStaticLoadingIcon ? 'yes' : 'no'}`,
+            `rect: x=${candidate.rect?.x ?? ''}, y=${candidate.rect?.y ?? ''}, w=${candidate.rect?.w ?? ''}, h=${candidate.rect?.h ?? ''}`,
+            `html: ${candidate.html || ''}`
+        ].join('\n');
+    }
+
+    function formatCandidateList(candidates) {
+        const list = Array.isArray(candidates) ? candidates : [];
+        const lines = [`===== candidates | count=${list.length} =====`];
+        list.forEach((candidate, index) => {
+            lines.push('');
+            lines.push(formatCandidateBlock(candidate, `candidate #${index + 1}`));
+        });
+        return lines.join('\n');
+    }
+
+    function buildSearchReconReportText() {
+        const lines = [];
+        if (reconState.reportLines.length) {
+            lines.push(...reconState.reportLines);
+        } else {
+            const snapshot = scanSearchStatusNow();
+            lines.push('Snov Search Status Recon Report');
+            lines.push(`generatedAt: ${new Date().toLocaleString()}`);
+            lines.push(`startUrl: ${location.href}`);
+            lines.push(`title: ${document.title}`);
+            lines.push('');
+            lines.push(`result: ${snapshot.found ? 'found' : 'not_found'}`);
+            lines.push(`exactMatch: ${snapshot.exactMatch ? 'yes' : 'no'}`);
+            lines.push('');
+            if (snapshot.best) {
+                lines.push(formatCandidateBlock(snapshot.best, 'bestCandidate'));
+                lines.push('');
+            }
+            lines.push(formatCandidateList(snapshot.candidates));
+        }
+        return lines.join('\n');
+    }
+
+    function downloadTextFile(filename, content) {
+        const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function exportSearchReconReport() {
+        const report = buildSearchReconReportText();
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        downloadTextFile(`snov_search_status_recon_${stamp}.txt`, report);
+        logMessage('侦察信息已导出', 'success');
+    }
+
+    async function waitForEmailSearchComplete(maxWait = EMAIL_SEARCH_WAIT_TIMEOUT_MS) {
+        const initialMatches = collectActiveEmailSearchingElements();
+
+        if (!initialMatches.length) {
+            logMessage('未检测到邮箱搜索状态，直接继续');
+            return true;
+        }
+
+        logMessage(`检测到邮箱仍在搜索，当前命中 ${initialMatches.length} 处状态，等待完成...`);
+
+        const start = Date.now();
+        let lastLogAt = 0;
+        let stableStartAt = null;
+
+        while (Date.now() - start < maxWait) {
+            ensureRunning();
+
+            const matches = collectActiveEmailSearchingElements();
+            if (!matches.length) {
+                if (!stableStartAt) {
+                    stableStartAt = Date.now();
+                    logMessage(`搜索状态已全部消失，开始 ${EMAIL_SEARCH_STABLE_BUFFER_MS / 1000} 秒缓冲确认...`, 'success');
+                }
+
+                const stableElapsed = Date.now() - stableStartAt;
+                if (stableElapsed >= EMAIL_SEARCH_STABLE_BUFFER_MS) {
+                    logMessage('邮箱搜索已完成，继续导出流程', 'success');
+                    return true;
+                }
+
+                await wait(300);
+                continue;
+            }
+
+            stableStartAt = null;
+
+            const now = Date.now();
+            if (now - lastLogAt > 15000) {
+                const elapsedSec = Math.floor((now - start) / 1000);
+                const topCount = matches.filter(item => item.source === 'top-block').length;
+                const rowCount = matches.filter(item => item.source === 'row-inline').length;
+                logMessage(`邮箱仍在搜索，已等待 ${elapsedSec} 秒；顶部 ${topCount} 处，列表 ${rowCount} 处，总计 ${matches.length} 处...`);
+                lastLogAt = now;
+            }
+
+            await wait(1000);
+        }
+
+        throw new Error('等待邮箱搜索完成超时（已超过 10 分钟）');
+    }
+
+    function getOpenedDropdown() {
+        const dropdowns = document.querySelectorAll('.app-dropdown__drop.style-scroll');
+
+        for (const dropdown of dropdowns) {
+            const text = (dropdown.textContent || '').trim();
+            if (text.includes('导出潜在客户')) {
+                return dropdown;
+            }
+        }
+
+        return null;
+    }
+
+    function getClickableParent(el, root) {
+        let current = el;
+        while (current && current !== root && current !== document.body) {
+            if (
+                current.tagName === 'BUTTON' ||
+                current.tagName === 'A' ||
+                current.getAttribute('role') === 'button' ||
+                current.classList.contains('app-dropdown__drop-item') ||
+                typeof current.onclick === 'function'
+            ) {
+                return current;
+            }
+            current = current.parentElement;
+        }
+        return el;
+    }
+
+    function findExportButtonInDropdown(dropdown) {
+        if (!dropdown) return null;
+
+        const candidates = [...dropdown.querySelectorAll('div, span, button, a, svg, use')];
+
+        for (const el of candidates) {
+            const text = getElementText(el);
+            const localContainer = el.closest('div, button, a, span') || el;
+            const hasExportIcon =
+                !!localContainer.querySelector?.('use[xlink\\:href="#export_icon"]') ||
+                !!el.querySelector?.('use[xlink\\:href="#export_icon"]') ||
+                (el.tagName === 'USE' && el.getAttribute('xlink:href') === '#export_icon');
+
+            if (text.includes('导出潜在客户') && hasExportIcon) {
+                return getClickableParent(localContainer, dropdown);
+            }
+        }
+
+        for (const el of candidates) {
+            const text = getElementText(el);
+            if (text.includes('导出潜在客户')) {
+                const base = el.closest('div, button, a, span') || el;
+                return getClickableParent(base, dropdown);
+            }
+        }
+
+        const iconUse = dropdown.querySelector('use[xlink\\:href="#export_icon"]');
+        if (iconUse) {
+            const base = iconUse.closest('div, button, a, span') || iconUse;
+            return getClickableParent(base, dropdown);
+        }
+
+        return null;
+    }
+
+    function refreshExportButtonLocator() {
+        const dropdown = getOpenedDropdown();
+        if (!dropdown) {
+            throw new Error('未检测到已展开菜单，请先手动或自动展开 ... 菜单');
+        }
+
+        const exportBtn = findExportButtonInDropdown(dropdown);
+        if (!exportBtn) {
+            throw new Error('在当前菜单中未找到导出潜在客户按钮');
+        }
+
+        exportButtonLocator.selector = buildStableSelector(exportBtn);
+        return exportBtn;
+    }
+
+    function relocateExportButton() {
+        try {
+            const btn = refreshExportButtonLocator();
+            logMessage(`已重新定位导出按钮：${buildStableSelector(btn)}`, 'success');
+        } catch (error) {
+            logMessage(`重新定位失败：${error.message}`, 'error');
+        }
+    }
+
+    async function clickExportMenu() {
+        if (getOpenedDropdown()) {
+            logMessage('检测到菜单已展开，跳过点击菜单');
+            return true;
+        }
+
+        logMessage('步骤1: 点击导出菜单');
+
+        const preferred = getPreferredExportMenuButton();
+        if (preferred) {
+            if (safeClick(preferred)) {
+                logMessage(`已点击导出菜单按钮: ${buildStableSelector(preferred)}`);
+                await waitForCondition(() => !!getOpenedDropdown(), 5000, 200);
+                return true;
+            }
+        }
+
+        const toolbar = getProspectsToolbarRoot();
+        const fallbackCandidates = getProspectsMenuButtonCandidates(toolbar || document);
+
+        for (const item of fallbackCandidates) {
+            const element = item.element;
+            if (!isVisible(element)) continue;
+
+            if (safeClick(element)) {
+                logMessage(`已点击导出菜单按钮: ${buildStableSelector(element)}`);
+                await waitForCondition(() => !!getOpenedDropdown(), 5000, 200);
+                return true;
+            }
+        }
+
+        throw new Error('未找到导出菜单按钮');
+    }
+
+    async function clickExportLeads() {
+        logMessage('步骤2: 点击导出潜在客户');
+
+        const dropdown = getOpenedDropdown();
+        if (!dropdown) {
+            throw new Error('未检测到已展开的菜单');
+        }
+
+        let element = null;
+
+        if (exportButtonLocator.selector) {
+            try {
+                const cached =
+                    dropdown.querySelector(exportButtonLocator.selector) ||
+                    document.querySelector(exportButtonLocator.selector);
+
+                if (cached && isVisible(cached)) {
+                    element = cached;
+                    logMessage(`使用缓存定位找到导出按钮：${exportButtonLocator.selector}`);
+                }
+            } catch (e) {}
+        }
+
+        if (!element) {
+            element = findExportButtonInDropdown(dropdown);
+            if (element) {
+                exportButtonLocator.selector = buildStableSelector(element);
+                logMessage(`已动态重新定位导出按钮：${exportButtonLocator.selector}`);
+            }
+        }
+
+        if (!element) {
+            throw new Error('未找到导出潜在客户按钮');
+        }
+
+        if (!safeClick(element)) {
+            throw new Error('点击导出潜在客户失败');
+        }
+
+        logMessage('成功点击导出潜在客户，等待导出对话框打开...', 'success');
+
+        await waitForCondition(() => {
+            return document.querySelector('.export__type-filters') ||
+                document.querySelector('button[data-test="export-prospects-confirm"]');
+        }, 8000, 250);
+
+        return true;
+    }
+
+    async function selectEmailStatusesInExportDialog() {
+        logMessage('步骤3: 选择邮箱状态');
+
+        const exportFilters = document.querySelector('.export__type-filters');
+        if (!exportFilters) {
+            throw new Error('未找到导出筛选器容器');
+        }
+
+        const emailSection = exportFilters.querySelector('.t-filters__section--email');
+        if (!emailSection) {
+            throw new Error('未找到导出对话框中的邮箱状态区域');
+        }
+
+        const emailItems = emailSection.querySelectorAll('.t-filters__item');
+        logMessage(`找到 ${emailItems.length} 个邮箱状态选项`);
+
+        if (emailItems.length === 0) {
+            throw new Error('未找到邮箱状态选项');
+        }
+
+        let selectedCount = 0;
+        for (const item of emailItems) {
+            ensureRunning();
+
+            if (!item.classList.contains('t-filters__item--active')) {
+                if (safeClick(item)) {
+                    selectedCount++;
+                    await wait(250);
+                }
+            } else {
+                selectedCount++;
+            }
+        }
+
+        logMessage(`已选择 ${selectedCount}/${emailItems.length} 个邮箱状态`, 'success');
+        return selectedCount > 0;
+    }
+
+    async function selectLinkedInProfilesInExportDialog() {
+        logMessage('步骤4: 选择领英资料');
+
+        const exportFilters = document.querySelector('.export__type-filters');
+        if (!exportFilters) {
+            throw new Error('未找到导出筛选器容器');
+        }
+
+        const linkedinSection = exportFilters.querySelector('.t-filters__section--linkedin');
+        if (!linkedinSection) {
+            throw new Error('未找到导出对话框中的领英资料区域');
+        }
+
+        const linkedinItems = linkedinSection.querySelectorAll('.t-filters__item');
+        logMessage(`找到 ${linkedinItems.length} 个领英资料选项`);
+
+        if (linkedinItems.length === 0) {
+            throw new Error('未找到领英资料选项');
+        }
+
+        let selectedCount = 0;
+        for (const item of linkedinItems) {
+            ensureRunning();
+
+            if (!item.classList.contains('t-filters__item--active')) {
+                if (safeClick(item)) {
+                    selectedCount++;
+                    await wait(250);
+                }
+            } else {
+                selectedCount++;
+            }
+        }
+
+        logMessage(`已选择 ${selectedCount}/${linkedinItems.length} 个领英资料`, 'success');
+        return selectedCount > 0;
+    }
+
+    async function clickExportConfirm() {
+        logMessage('步骤5: 点击导出确认');
+
+        const selector = 'button[data-test="export-prospects-confirm"]';
+
+        const button = await waitForCondition(() => {
+            const el = document.querySelector(selector);
+            return el && isVisible(el) && isEnabled(el) ? el : null;
+        }, 10000, 250);
+
+        logMessage('已找到导出确认按钮，准备点击');
+
+        if (!safeClick(button)) {
+            throw new Error('点击导出确认按钮失败');
+        }
+
+        logMessage('已点击导出确认，开始等待导出结果...', 'success');
+        await wait(1200);
+        return true;
+    }
+
+    function getSubmenuRoot() {
+        return document.querySelector('#snov-submenu');
+    }
+
+    function getProspectsMenuLink() {
+        const root = getSubmenuRoot();
+        if (!root) return null;
+        return (
+            root.querySelector('a[data-route-name="prospectsRoot"]') ||
+            root.querySelector('a[href="/prospects"]') ||
+            [...root.querySelectorAll('a.snovAside__submenu-link')].find(el => getElementText(el).includes('潜在客户')) ||
+            null
+        );
+    }
+
+    function getCompaniesMenuLink() {
+        const root = getSubmenuRoot();
+        if (!root) return null;
+        return (
+            root.querySelector('a[data-route-name="companiesRoot"]') ||
+            root.querySelector('a[href="/companies"]') ||
+            [...root.querySelectorAll('a.snovAside__submenu-link')].find(el => getElementText(el).includes('公司')) ||
+            null
+        );
+    }
+
+
+    function findCommonAncestor(elements) {
+        const valid = (elements || []).filter(Boolean);
+        if (!valid.length) return null;
+        if (valid.length === 1) return valid[0].parentElement || valid[0];
+
+        const ancestorChains = valid.map(el => {
+            const chain = [];
+            let cur = el;
+            while (cur && cur !== document.body) {
+                chain.push(cur);
+                cur = cur.parentElement;
+            }
+            chain.push(document.body);
+            return chain;
+        });
+
+        for (const candidate of ancestorChains[0]) {
+            if (ancestorChains.every(chain => chain.includes(candidate))) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    function findVisibleElementByText(texts, root = document) {
+        const wanted = Array.isArray(texts) ? texts : [texts];
+        const selectors = 'button, a, div, span';
+        const nodes = root.querySelectorAll(selectors);
+
+        for (const node of nodes) {
+            if (!isVisible(node)) continue;
+            const text = getElementText(node);
+            if (!text) continue;
+            if (wanted.some(t => text.includes(t))) {
+                return node;
+            }
+        }
+        return null;
+    }
+
+    function getProspectsToolbarRoot() {
+        const addBtn = findVisibleElementByText('添加潜在客户');
+        const sendBtn = findVisibleElementByText('发送营销邮件');
+        const verifyBtn = findVisibleElementByText('验证邮箱地址');
+
+        const common = findCommonAncestor([addBtn, sendBtn, verifyBtn].filter(Boolean));
+        if (common && common !== document.body) {
+            return common;
+        }
+
+        return addBtn?.parentElement || sendBtn?.parentElement || verifyBtn?.parentElement || null;
+    }
+
+    function getProspectsMenuButtonCandidates(root = null) {
+        const scope = root || document;
+        const candidates = [];
+        const seen = new Set();
+
+        const push = (el, scoreBase = 0) => {
+            if (!el || seen.has(el) || !isVisible(el)) return;
+            seen.add(el);
+
+            const text = getElementText(el);
+            const rect = el.getBoundingClientRect();
+            let score = scoreBase;
+
+            if (el.matches('button.prospects-context-menu__btn')) score += 100;
+            if (el.matches('button.snv-btn--with-icon-only')) score += 80;
+            if (el.getAttribute('aria-label')) score += 10;
+            if (!text || text === '...' || text === '⋯') score += 20;
+            if (rect.width <= 64) score += 15;
+            if (rect.height <= 48) score += 10;
+            if (el.querySelector('svg, use')) score += 10;
+
+            candidates.push({ element: el, score, text, rect });
+        };
+
+        scope.querySelectorAll('button.prospects-context-menu__btn, button.snv-btn--with-icon-only').forEach(el => push(el, 0));
+        scope.querySelectorAll('button').forEach(el => {
+            const text = getElementText(el);
+            if (!text || text === '...' || text === '⋯' || (el.querySelector('svg, use') && el.getBoundingClientRect().width <= 64)) {
+                push(el, -10);
+            }
+        });
+
+        candidates.sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            return a.rect.x - b.rect.x;
+        });
+
+        return candidates;
+    }
+
+    function getPreferredExportMenuButton() {
+        const toolbar = getProspectsToolbarRoot();
+        const scoped = toolbar ? getProspectsMenuButtonCandidates(toolbar) : [];
+        if (scoped.length) return scoped[0].element;
+
+        const global = getProspectsMenuButtonCandidates(document);
+        return global.length ? global[0].element : null;
+    }
+
+    function getProspectsPageReadySnapshot() {
+        const prospectsLink = getProspectsMenuLink();
+        const pathOk = /\/prospects(?:\/|$)/.test(location.pathname);
+        const menuActive = !!(prospectsLink && prospectsLink.classList.contains('active'));
+        const toolbar = getProspectsToolbarRoot();
+        const menuButton = getPreferredExportMenuButton();
+
+        return {
+            pathOk,
+            menuActive,
+            toolbarReady: !!toolbar,
+            menuButtonReady: !!menuButton,
+            toolbar,
+            menuButton
+        };
+    }
+
+    async function waitForProspectsPageReady(timeout = PROSPECTS_PAGE_READY_TIMEOUT_MS) {
+        logMessage('已切回潜在客户，等待页面刷新完成...');
+
+        const start = Date.now();
+        let stableSince = 0;
+        let lastLogAt = 0;
+
+        while (Date.now() - start < timeout) {
+            ensureRunning();
+
+            const snapshot = getProspectsPageReadySnapshot();
+            const ready = snapshot.pathOk && snapshot.menuActive && snapshot.toolbarReady && snapshot.menuButtonReady;
+
+            if (ready) {
+                if (!stableSince) {
+                    stableSince = Date.now();
+                }
+
+                if (Date.now() - stableSince >= PROSPECTS_PAGE_STABLE_BUFFER_MS) {
+                    logMessage('潜在客户页面已稳定，可继续导出', 'success');
+                    return true;
+                }
+            } else {
+                stableSince = 0;
+            }
+
+            const now = Date.now();
+            if (now - lastLogAt > 2000) {
+                logMessage(
+                    `等待潜在客户页稳定：路径=${snapshot.pathOk ? '1' : '0'}，菜单=${snapshot.menuActive ? '1' : '0'}，工具栏=${snapshot.toolbarReady ? '1' : '0'}，导出菜单=${snapshot.menuButtonReady ? '1' : '0'}`
+                );
+                lastLogAt = now;
+            }
+
+            await wait(250);
+        }
+
+        throw new Error('切回潜在客户后等待页面稳定超时');
+    }
+
+    async function switchToProspectsPageIfNeeded() {
+        const link = getProspectsMenuLink();
+        if (!link) {
+            logMessage('未找到左侧【潜在客户】菜单，继续按当前页面执行', 'warn');
+            return false;
+        }
+
+        const isActive = link.classList.contains('active') || /\/prospects(?:\/|$)/.test(location.pathname);
+        if (isActive) {
+            logMessage('当前已在潜在客户界面');
+            return true;
+        }
+
+        logMessage('开始前切回【潜在客户】界面...');
+        if (!safeClick(link)) {
+            throw new Error('点击左侧【潜在客户】菜单失败');
+        }
+
+        await waitForCondition(() => {
+            const nowLink = getProspectsMenuLink();
+            return !!(nowLink && nowLink.classList.contains('active')) || /\/prospects(?:\/|$)/.test(location.pathname);
+        }, 10000, 250);
+
+        await wait(300);
+        logMessage('已切回【潜在客户】界面', 'success');
+        return true;
+    }
+
+    async function switchToCompaniesPageAfterExport() {
+        const link = getCompaniesMenuLink();
+        if (!link) {
+            logMessage('未找到左侧【公司】菜单，跳转公司页已跳过', 'warn');
+            return false;
+        }
+
+        logMessage('导出成功，0.5 秒后切换到【公司】界面...');
+        await wait(500);
+        ensureRunning();
+
+        if (!safeClick(link)) {
+            throw new Error('点击左侧【公司】菜单失败');
+        }
+
+        await waitForCondition(() => {
+            const nowLink = getCompaniesMenuLink();
+            return !!(nowLink && nowLink.classList.contains('active')) || /\/companies(?:\/|$)/.test(location.pathname);
+        }, 10000, 250);
+        logMessage('已切换到【公司】界面', 'success');
+        return true;
+    }
+
+    async function waitForExportCompletion(maxWait = EXPORT_SUCCESS_TIMEOUT_MS) {
+        logMessage('等待导出成功提示，最长 2 分钟...');
+
+        const start = Date.now();
+        let lastLogAt = 0;
+        let sawExporting = false;
+
+        while (Date.now() - start < maxWait) {
+            ensureRunning();
+
+            const successAlert = getExportSuccessAlert();
+            if (successAlert) {
+                const downloadLink = successAlert.querySelector('a.btn-export, a[data-test="prospects-export-alert-no-google"]');
+                if (downloadLink) {
+                    logMessage('🎉 导出完成，可下载列表', 'success');
+                } else {
+                    logMessage('🎉 导出完成', 'success');
+                }
+                return true;
+            }
+
+            const exportingBlock = getExportingBlock();
+            if (exportingBlock && !sawExporting) {
+                sawExporting = true;
+                logMessage('已检测到“正在导出”状态，继续等待导出成功...', 'success');
+            } else if (exportingBlock) {
+                sawExporting = true;
+            }
+
+            const now = Date.now();
+            if (now - lastLogAt > 10000) {
+                const elapsedSec = Math.floor((now - start) / 1000);
+                if (exportingBlock) {
+                    logMessage(`正在导出，已等待 ${elapsedSec} 秒...`);
+                } else if (sawExporting) {
+                    logMessage(`导出处理中，已等待 ${elapsedSec} 秒...`);
+                } else {
+                    logMessage(`等待导出成功提示，已等待 ${elapsedSec} 秒...`);
+                }
+                lastLogAt = now;
+            }
+
+            await wait(1000);
+        }
+
+        throw new Error('等待导出成功超时（已超过 2 分钟）');
+    }
+
+    async function runExportAutomation() {
+        if (window.isExportRunning) {
+            logMessage('导出已在运行中', 'warn');
+            return;
+        }
+
+        window.isExportRunning = true;
+        updateStatus('运行中', true);
+        logMessage('🚀 开始自动导出流程...');
+
+        try {
+            ensureRunning();
+            await switchToProspectsPageIfNeeded();
+
+            ensureRunning();
+            await waitForProspectsPageReady();
+
+            ensureRunning();
+            await waitForEmailSearchComplete();
+
+            ensureRunning();
+            await clickExportMenu();
+
+            ensureRunning();
+            await clickExportLeads();
+
+            ensureRunning();
+            const emailResult = await selectEmailStatusesInExportDialog();
+            if (!emailResult) {
+                logMessage('邮箱状态选择可能失败，继续执行...', 'error');
+            }
+
+            await wait(300);
+
+            ensureRunning();
+            const linkedinResult = await selectLinkedInProfilesInExportDialog();
+            if (!linkedinResult) {
+                logMessage('领英资料选择可能失败，继续执行...', 'error');
+            }
+
+            await wait(500);
+
+            ensureRunning();
+            await clickExportConfirm();
+
+            ensureRunning();
+            await waitForExportCompletion(EXPORT_SUCCESS_TIMEOUT_MS);
+
+            ensureRunning();
+            await switchToCompaniesPageAfterExport();
+
+        } catch (error) {
+            logMessage(`❌ 自动导出失败: ${error.message}`, 'error');
+        } finally {
+            window.isExportRunning = false;
+            updateStatus('就绪', false);
+        }
+    }
+
+    function stopExportAutomation() {
+        window.isExportRunning = false;
+        updateStatus('已停止', false);
+        logMessage('导出已停止', 'warn');
+    }
+
+    async function testExportStep(step) {
+        if (!window.isExportRunning) {
+            window.isExportRunning = true;
+            updateStatus('测试中', true);
+        }
+
+        try {
+            logMessage(`测试步骤: ${step}`);
+
+            switch (step) {
+                case 'go-prospects':
+                    return await switchToProspectsPageIfNeeded();
+                case 'wait-email':
+                    return await waitForEmailSearchComplete();
+                case 'menu':
+                    return await clickExportMenu();
+                case 'export':
+                    return await clickExportLeads();
+                case 'email':
+                    return await selectEmailStatusesInExportDialog();
+                case 'linkedin':
+                    return await selectLinkedInProfilesInExportDialog();
+                case 'confirm':
+                    return await clickExportConfirm();
+                case 'wait-export':
+                    return await waitForExportCompletion();
+                case 'go-companies':
+                    return await switchToCompaniesPageAfterExport();
+                case 'relocate':
+                    relocateExportButton();
+                    return true;
+                case 'detect-search':
+                    return await runSearchStatusRecon();
+                default:
+                    logMessage('未知测试步骤', 'error');
+                    return false;
+            }
+        } catch (e) {
+            logMessage(`测试失败: ${e.message}`, 'error');
+            return false;
+        } finally {
+            window.isExportRunning = false;
+            updateStatus('就绪', false);
+        }
+    }
+
+    function addStyles() {
+        const oldStyle = document.getElementById('snov-auto-export-panel-style');
+        if (oldStyle) oldStyle.remove();
+
+        const style = document.createElement('style');
+        style.id = 'snov-auto-export-panel-style';
+        style.textContent = `
+            #snov-auto-export-panel{
+                position:fixed;
+                right:12px;
+                bottom:12px;
+                z-index:999999;
+                width:252px;
+                background:#2b2b2b;
+                color:#f5f7fb;
+                border:1px solid rgba(255,255,255,.10);
+                border-radius:14px;
+                box-shadow:0 14px 36px rgba(0,0,0,.34);
+                font:12px/1.38 "Segoe UI",Arial,sans-serif;
+                user-select:none;
+                overflow:hidden;
+                height:auto !important;
+                min-height:unset !important;
+                max-height:none !important;
+            }
+
+            #snov-auto-export-panel,
+            #snov-auto-export-panel *{
+                box-sizing:border-box;
+            }
+
+            #snov-auto-export-panel .snx-hdr{
+                padding:8px 10px 7px;
+                cursor:move;
+                font-weight:700;
+                display:flex;
+                align-items:center;
+                justify-content:space-between;
+                border-bottom:1px solid rgba(255,255,255,.08);
+                background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.01));
+            }
+
+            #snov-auto-export-panel .snx-body{
+                padding:9px 10px 10px;
+            }
+
+            #snov-auto-export-panel .snx-col{
+                display:grid;
+                gap:8px;
+            }
+
+            #snov-auto-export-panel .snx-btn{
+                width:100%;
+                height:32px;
+                padding:0 10px;
+                border-radius:11px;
+                border:1px solid rgba(255,255,255,.14);
+                background:rgba(255,255,255,.06);
+                color:#f5f7fb;
+                cursor:pointer;
+                font-weight:600;
+            }
+
+            #snov-auto-export-panel .snx-btn:hover{
+                background:rgba(255,255,255,.14);
+            }
+
+            #snov-auto-export-panel .snx-btn:disabled{
+                opacity:.48;
+                cursor:not-allowed;
+            }
+
+            #snov-auto-export-panel .snx-btn-primary{
+                background:rgba(72,163,95,.78);
+                border-color:rgba(72,163,95,.82);
+                color:#fff;
+            }
+
+            #snov-auto-export-panel .snx-btn-primary:hover{
+                background:rgba(72,163,95,.92);
+            }
+
+            #snov-auto-export-panel .snx-btn-danger{
+                background:rgba(230,72,72,.82);
+                border-color:rgba(230,72,72,.86);
+                color:#fff;
+            }
+
+            #snov-auto-export-panel .snx-btn-danger:hover{
+                background:rgba(230,72,72,.94);
+            }
+
+            #snov-auto-export-panel .snx-log-label{
+                font-size:11px;
+                opacity:.86;
+                margin:8px 0 4px;
+                font-weight:600;
+            }
+
+            #snov-auto-export-panel .snx-log-tools{
+                display:grid;
+                gap:8px;
+                margin:0 0 6px;
+            }
+
+            #snov-auto-export-panel .snx-log-tools.is-hidden{
+                display:none;
+            }
+
+            #snov-auto-export-panel .snx-status{
+                margin-top:8px;
+                padding:8px 9px;
+                border-radius:11px;
+                border:1px solid rgba(255,255,255,.06);
+                background:rgba(255,255,255,.05);
+                white-space:pre-wrap;
+                user-select:text;
+                overflow:auto;
+                height:154px;
+                min-height:154px;
+                max-height:154px;
+                font-size:11px;
+                line-height:1.48;
+                scrollbar-width:thin;
+            }
+
+            #snov-auto-export-panel .snx-tag{
+                font-size:11px;
+                opacity:.88;
+                font-weight:600;
+                display:inline-flex;
+                align-items:center;
+                justify-content:center;
+                min-width:40px;
+                height:20px;
+                padding:0 8px;
+                margin-left:6px;
+                border-radius:999px;
+                border:1px solid rgba(255,255,255,.14);
+                background:rgba(255,255,255,.06);
+            }
+
+            #snov-auto-export-panel .snx-tag.is-running{
+                background:rgba(230,72,72,.22);
+                border-color:rgba(230,72,72,.42);
+            }
+
+            #snov-auto-export-panel .snx-x{
+                width:22px;
+                height:22px;
+                display:inline-flex;
+                align-items:center;
+                justify-content:center;
+                border-radius:8px;
+                border:1px solid rgba(255,255,255,.14);
+                background:rgba(255,255,255,.06);
+                cursor:pointer;
+                font-size:14px;
+                line-height:1;
+            }
+
+            #snov-auto-export-panel .snx-x:hover{
+                background:rgba(255,255,255,.14);
+            }
+        `;
+        document.head.appendChild(style);
+    }
+})();
