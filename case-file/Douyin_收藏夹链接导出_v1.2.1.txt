@@ -1,0 +1,1240 @@
+// ==UserScript==
+// @name         抖音收藏夹链接导出 v1.2.1
+// @namespace    https://chatgpt.local/douyin-favorite-export
+// @version      1.2.1
+// @description  从收藏夹进入的视频详情页开始，按方向键/备用动作切换视频，采集标题预览、类型、链接并导出 CSV。
+// @author       ChatGPT
+// @match        https://www.douyin.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+/*
+更新说明 v1.2.1
+1. 移除“进入链接”“判断状态”“复制链接”按钮及对应入口功能，避免阶段边界混乱。
+2. “开始爬取”只允许在“从收藏夹进入的视频播放页”运行；普通推荐页、搜索页、TA作品页、普通视频详情页均会拒绝爬取。
+3. 状态区改为显示当前界面与是否可开始爬取，不再显示容易误导的通用“已完成加载”。
+4. 保留 v1.1.0 已确认较满意的爬取与 CSV 导出逻辑：读取当前播放视频 ID + 当前详情区标题/文案，通过 ArrowDown/滚轮/右侧卡片备用动作切换，确认 ID 变化后才记录。
+5. 清除缓存只清空结果、计数和运行状态，不清空日志；采集完成后不自动导出 CSV，需要人工点击【导出CSV】。
+
+更新说明 v1.2.1
+1. 修复旧版本面板关闭后定时刷新仍可能干扰新面板的问题：使用新 UI DOM ID，并加入单实例运行时销毁逻辑。
+2. 关闭面板会销毁本实例的状态刷新定时器、拖拽监听、待执行 timeout 和运行状态。
+3. 状态区拆分为页面状态与脚本运行状态；“暂停”只由用户点击暂停按钮触发，不再由播放器卡顿/加载状态推导。
+4. 状态刷新改为节流刷新，且只有文本变化时才写 DOM，减少视频加载卡顿时的闪烁。
+*/
+
+(function () {
+  'use strict';
+
+  const RUNTIME_KEY = '__dy_fav_export_runtime__';
+  try {
+    if (window[RUNTIME_KEY] && typeof window[RUNTIME_KEY].destroy === 'function') {
+      window[RUNTIME_KEY].destroy('new-instance');
+    }
+  } catch (e) {}
+
+  const APP = {
+    name: '抖音收藏夹链接导出',
+    version: '1.2.1',
+    panelId: '__dy_fav_export_121_panel__',
+    oldPanelId: '__dy_fav_export_panel__',
+    styleId: '__dy_fav_export_121_style__',
+    storageKey: '__dy_fav_export_121_v121__',
+    busy: false,
+    running: false,
+    paused: false,
+    stopping: false,
+    targetName: '',
+    expectedCount: 0,
+    results: new Map(),
+    logs: [],
+    lastState: null,
+    statusTimer: null,
+    lockedRightScrollerSelector: '',
+    switchFailCount: 0,
+    duplicateCount: 0,
+    destroyed: false,
+    timeouts: new Set(),
+    cleanups: [],
+    lastStateText: '',
+    lastStatText: '',
+  };
+
+  function destroyInstance(reason = 'destroy') {
+    APP.destroyed = true;
+    APP.running = false;
+    APP.busy = false;
+    APP.paused = false;
+    APP.stopping = true;
+    if (APP.statusTimer) {
+      clearInterval(APP.statusTimer);
+      APP.statusTimer = null;
+    }
+    for (const t of APP.timeouts) {
+      try { clearTimeout(t); } catch {}
+    }
+    APP.timeouts.clear();
+    for (const fn of APP.cleanups.splice(0)) {
+      try { fn(); } catch {}
+    }
+    try { document.getElementById(APP.panelId)?.remove(); } catch {}
+    if (window[RUNTIME_KEY]?.version === APP.version) {
+      try { delete window[RUNTIME_KEY]; } catch { window[RUNTIME_KEY] = null; }
+    }
+  }
+
+  window[RUNTIME_KEY] = { version: APP.version, destroy: destroyInstance };
+
+  const sleep = (ms) => new Promise((resolve) => {
+    if (APP.destroyed) return resolve();
+    const t = setTimeout(() => {
+      APP.timeouts.delete(t);
+      resolve();
+    }, ms);
+    APP.timeouts.add(t);
+  });
+
+  function nowText() {
+    return new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  }
+
+  function isInPanel(el) {
+    return !!(el && el.closest && el.closest('#' + APP.panelId));
+  }
+
+  function textOf(el) {
+    return (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function visible(el) {
+    if (!el || isInPanel(el)) return false;
+    const r = el.getBoundingClientRect();
+    const s = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  }
+
+  function clickable(el) {
+    if (!visible(el)) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'a' || tag === 'button' || el.getAttribute('role') === 'button' || el.getAttribute('role') === 'tab' || window.getComputedStyle(el).cursor === 'pointer' || !!el.onclick;
+  }
+
+  function cssPath(el) {
+    if (!el) return '';
+    if (el.id) return `${el.tagName.toLowerCase()}#${CSS.escape(el.id)}`;
+    const parts = [];
+    let cur = el;
+    for (let i = 0; cur && cur.nodeType === 1 && i < 5; i++, cur = cur.parentElement) {
+      let part = cur.tagName.toLowerCase();
+      if (cur.id) {
+        part += '#' + CSS.escape(cur.id);
+        parts.unshift(part);
+        break;
+      }
+      const cls = [...cur.classList].filter(Boolean).slice(0, 3).map((c) => '.' + CSS.escape(c)).join('');
+      if (cls) part += cls;
+      parts.unshift(part);
+    }
+    return parts.join(' > ');
+  }
+
+  function pickVisible(selector, root = document) {
+    try { return [...root.querySelectorAll(selector)].find(visible) || null; } catch { return null; }
+  }
+
+  function pickAllVisible(selector, root = document) {
+    try { return [...root.querySelectorAll(selector)].filter(visible); } catch { return []; }
+  }
+
+  function centerOf(el) {
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), rect: r };
+  }
+
+  function mouseClick(el, label = '') {
+    if (!el) return false;
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+    const { x, y } = centerOf(el);
+    const target = document.elementFromPoint(x, y) || el;
+    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+      try { target.dispatchEvent(new MouseEvent(type, opts)); } catch {}
+    });
+    try { target.click?.(); } catch {}
+    if (label) log(`点击：${label}；坐标=(${x},${y})；元素=${cssPath(target)}`, 'info');
+    return true;
+  }
+
+  function clickAtElementCenter(el, label = '') {
+    return mouseClick(el, label);
+  }
+
+  function log(msg, level = 'info', detail = null) {
+    const line = `[${nowText()}] ${msg}`;
+    APP.logs.push({ time: new Date().toISOString(), localTime: nowText(), msg, level, detail });
+    const box = document.getElementById('__dy_fav_export_121_log__');
+    if (box) {
+      const div = document.createElement('div');
+      div.className = `dyfe-log-line dyfe-${level}`;
+      div.textContent = line;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
+  }
+
+  function loadConfig() {
+    try { return JSON.parse(localStorage.getItem(APP.storageKey) || '{}') || {}; } catch { return {}; }
+  }
+
+  function saveConfig(patch) {
+    const next = { ...loadConfig(), ...patch };
+    localStorage.setItem(APP.storageKey, JSON.stringify(next));
+  }
+
+  function getTargetName() {
+    const el = document.getElementById('__dy_fav_export_121_target__');
+    return (el?.value || '').trim();
+  }
+
+  function setRunButtons() {
+    const bPause = document.getElementById('__dy_fav_export_121_pause__');
+    if (bPause) bPause.textContent = APP.paused ? '继续' : '暂停/继续';
+    const bStart = document.getElementById('__dy_fav_export_121_start__');
+    if (bStart) bStart.disabled = APP.running || APP.busy;
+  }
+
+  function createPanel() {
+    [APP.oldPanelId, APP.panelId].forEach((id) => {
+      const old = document.getElementById(id);
+      if (old) old.remove();
+    });
+
+    APP.logs = []; // 重新打开面板时清空日志；清除缓存不会清日志。
+    const cfg = loadConfig();
+    const panel = document.createElement('div');
+    panel.id = APP.panelId;
+    panel.innerHTML = `
+      <div class="dyfe-title" id="__dy_fav_export_121_drag__">
+        <span>${APP.name} v${APP.version}</span>
+        <div class="dyfe-title-btns">
+          <button id="__dy_fav_export_121_min__" title="最小化">—</button>
+          <button id="__dy_fav_export_121_close__" title="关闭面板">×</button>
+        </div>
+      </div>
+      <div class="dyfe-body" id="__dy_fav_export_121_body__">
+        <input id="__dy_fav_export_121_target__" value="${escapeHtml(cfg.targetName || '视频学习')}" placeholder="目标收藏夹名称，例如：视频学习" />
+        <div id="__dy_fav_export_121_statebox__" class="dyfe-statebox">界面：检测中</div>
+        <div id="__dy_fav_export_121_stat__" class="dyfe-stat">已采集：0｜目标：-</div>
+        <div class="dyfe-grid">
+          <button id="__dy_fav_export_121_start__" class="dyfe-primary">开始爬取</button>
+          <button id="__dy_fav_export_121_pause__">暂停/继续</button>
+          <button id="__dy_fav_export_121_stop__" class="dyfe-danger">停止</button>
+          <button id="__dy_fav_export_121_export__">导出CSV</button>
+          <button id="__dy_fav_export_121_clear__" class="dyfe-danger2 dyfe-span2">清除缓存</button>
+        </div>
+        <div class="dyfe-log" id="__dy_fav_export_121_log__"></div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    injectStyle();
+    bindPanelEvents(panel);
+    startStatusTimer();
+    makeDraggable(panel, document.getElementById('__dy_fav_export_121_drag__'));
+    log(`脚本已加载：${APP.name} v${APP.version}。仅在从收藏夹进入的视频播放页运行；会切换当前播放视频并导出 CSV。`, 'info');
+    refreshStatus();
+  }
+
+  function bindPanelEvents(panel) {
+    document.getElementById('__dy_fav_export_121_start__').addEventListener('click', startCrawlStage);
+    document.getElementById('__dy_fav_export_121_pause__').addEventListener('click', togglePause);
+    document.getElementById('__dy_fav_export_121_stop__').addEventListener('click', stopCurrentAction);
+    document.getElementById('__dy_fav_export_121_export__').addEventListener('click', () => exportCsv(true));
+    document.getElementById('__dy_fav_export_121_clear__').addEventListener('click', clearCacheOnly);
+    document.getElementById('__dy_fav_export_121_target__').addEventListener('change', (e) => saveConfig({ targetName: e.target.value.trim() }));
+    document.getElementById('__dy_fav_export_121_min__').addEventListener('click', () => {
+      document.getElementById('__dy_fav_export_121_body__').classList.toggle('dyfe-hidden');
+    });
+    document.getElementById('__dy_fav_export_121_close__').addEventListener('click', () => {
+      log('面板已关闭：本实例的状态刷新与运行监听已销毁。', 'info');
+      destroyInstance('panel-close');
+    });
+  }
+
+  function injectStyle() {
+    if (document.getElementById(APP.styleId)) return;
+    const style = document.createElement('style');
+    style.id = APP.styleId;
+    style.textContent = `
+      #${APP.panelId} { position: fixed; right: 22px; bottom: 22px; width: 430px; z-index: 2147483647; background: #11131a; color: #e9edf5; border: 1px solid #3a4052; font: 13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif; box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+      #${APP.panelId} * { box-sizing: border-box; }
+      #${APP.panelId} .dyfe-title { height: 34px; display:flex; align-items:center; justify-content:space-between; padding: 0 8px; background:#050609; border-bottom:1px solid #3a4052; cursor: move; user-select:none; font-weight:700; }
+      #${APP.panelId} .dyfe-title-btns button { width: 26px; height: 24px; margin-left: 4px; background:#151923; color:#fff; border:1px solid #50586d; cursor:pointer; }
+      #${APP.panelId} .dyfe-body { padding: 9px; }
+      #${APP.panelId} .dyfe-hidden { display:none; }
+      #${APP.panelId} input { width:100%; height:30px; background:#1d2230; color:#fff; border:1px solid #4a5268; padding:0 8px; outline:none; margin-bottom:6px; }
+      #${APP.panelId} .dyfe-statebox { min-height:31px; padding:6px 7px; background:#151a25; border:1px solid #30384b; color:#d9f2ff; margin-bottom:6px; }
+      #${APP.panelId} .dyfe-stat { padding:5px 7px; background:#191e2a; border:1px solid #30384b; color:#f6f0c9; margin-bottom:8px; }
+      #${APP.panelId} .dyfe-grid { display:grid; grid-template-columns: repeat(2, 1fr); gap:6px; }
+      #${APP.panelId} .dyfe-span2 { grid-column: 1 / span 2; }
+      #${APP.panelId} button { height:30px; background:#252b3a; color:#f2f5ff; border:1px solid #4a5268; cursor:pointer; }
+      #${APP.panelId} button:disabled { opacity:.55; cursor:not-allowed; }
+      #${APP.panelId} button:hover:not(:disabled) { filter:brightness(1.15); }
+      #${APP.panelId} .dyfe-primary { background:#0e5133; border-color:#1f8b5a; }
+      #${APP.panelId} .dyfe-danger { background:#551c24; border-color:#a23a49; }
+      #${APP.panelId} .dyfe-danger2 { background:#3c2b0a; border-color:#8d6d20; }
+      #${APP.panelId} .dyfe-log { margin-top:8px; height:185px; overflow:auto; background:#07080d; border:1px solid #30384b; padding:6px; user-select:text; white-space:pre-wrap; }
+      #${APP.panelId} .dyfe-log-line { margin: 0 0 3px; word-break:break-word; }
+      #${APP.panelId} .dyfe-info { color:#cfd6e8; }
+      #${APP.panelId} .dyfe-ok { color:#6fe29d; }
+      #${APP.panelId} .dyfe-warn { color:#ffd166; }
+      #${APP.panelId} .dyfe-error { color:#ff7b8a; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function makeDraggable(panel, handle) {
+    let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
+    const onDown = (e) => {
+      if (e.target.tagName === 'BUTTON') return;
+      dragging = true;
+      const r = panel.getBoundingClientRect();
+      sx = e.clientX; sy = e.clientY; sl = r.left; st = r.top;
+      panel.style.right = 'auto'; panel.style.bottom = 'auto'; panel.style.left = sl + 'px'; panel.style.top = st + 'px';
+      e.preventDefault();
+    };
+    const onMove = (e) => {
+      if (!dragging || APP.destroyed) return;
+      panel.style.left = Math.max(0, Math.min(window.innerWidth - 80, sl + e.clientX - sx)) + 'px';
+      panel.style.top = Math.max(0, Math.min(window.innerHeight - 34, st + e.clientY - sy)) + 'px';
+    };
+    const onUp = () => { dragging = false; };
+    handle.addEventListener('mousedown', onDown);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    APP.cleanups.push(() => handle.removeEventListener('mousedown', onDown));
+    APP.cleanups.push(() => window.removeEventListener('mousemove', onMove));
+    APP.cleanups.push(() => window.removeEventListener('mouseup', onUp));
+  }
+
+  function startStatusTimer() {
+    if (APP.statusTimer) clearInterval(APP.statusTimer);
+    APP.statusTimer = setInterval(() => {
+      if (!APP.destroyed) refreshStatus();
+    }, 2200);
+  }
+
+
+  function isFavoritePlaybackState(st = null) {
+    st = st || detectState();
+    if (st.state !== 'D') return false;
+    const url = location.href;
+    const modal = modalRoot();
+    const modalId = modal?.id || '';
+    const modalClass = modal?.className || '';
+    const hasFavoriteUrl = /showTab=favorite_collection/.test(url) || /showSubTab=favorite_folder/.test(url) || /favorite_collection/.test(url);
+    const hasFavoriteModal = /favorite_collection|favorite_folder/.test(modalId) || /favorite_collection|favorite_folder/.test(String(modalClass));
+    const hasFavoriteContext = st.topFavoriteActive && st.folderSubActive && st.collectionNavVisible;
+    const hasRightFolder = st.rightFolderTabVisible || !!rightFolderTab();
+    return !!(hasRightFolder && (hasFavoriteUrl || hasFavoriteModal || hasFavoriteContext));
+  }
+
+  function startEligibilityText(st = null) {
+    st = st || detectState();
+    if (isFavoritePlaybackState(st)) return '可开始爬取';
+    if (st.state === 'D') return '不可爬取：当前播放页不是收藏夹来源';
+    return '不可爬取：需先人工进入目标收藏夹并打开视频播放页';
+  }
+
+  function renderTextIfChanged(el, text, cacheKey) {
+    if (!el) return;
+    if (APP[cacheKey] === text) return;
+    APP[cacheKey] = text;
+    el.textContent = text;
+  }
+
+  function runStateText() {
+    if (APP.running) return APP.paused ? '已暂停' : '爬取中';
+    if (APP.busy) return '执行中';
+    if (APP.stopping) return '停止中';
+    return '空闲';
+  }
+
+  function refreshStatus(st = null, overrideText = '') {
+    if (APP.destroyed) return;
+    st = st || detectState();
+    APP.lastState = st;
+    const box = document.getElementById('__dy_fav_export_121_statebox__');
+    const stat = document.getElementById('__dy_fav_export_121_stat__');
+    const target = getTargetName() || APP.targetName || '-';
+    const pageLoadingText = st.loading ? '加载中' : '页面稳定';
+    const stateText = overrideText || `界面：${st.label}｜页面：${pageLoadingText}｜${startEligibilityText(st)}｜目标：${target}`;
+    const statText = `运行：${runStateText()}｜已采集：${APP.results.size}｜目标：${APP.expectedCount || '-'}`;
+    renderTextIfChanged(box, stateText, 'lastStateText');
+    renderTextIfChanged(stat, statText, 'lastStatText');
+    setRunButtons();
+  }
+
+  function parseVideoIdFromUrl(url = location.href) {
+    const m = String(url).match(/[?&]modal_id=(\d{8,})|\/video\/(\d{8,})|\/note\/(\d{8,})/);
+    return m ? (m[1] || m[2] || m[3]) : '';
+  }
+
+  function parseActiveVideoId() {
+    const fromUrl = parseVideoIdFromUrl(location.href);
+    if (fromUrl) return fromUrl;
+    const active = pickVisible('[data-e2e="feed-active-video"][data-e2e-vid], #slideMode[data-e2e-vid], #sliderVideo[data-e2e-vid]');
+    const vid = active?.getAttribute('data-e2e-vid');
+    if (vid) return vid;
+    const clsNode = pickVisible('[class*="video_"]');
+    const cls = clsNode?.className || '';
+    const m = String(cls).match(/video_(\d{8,})/);
+    return m ? m[1] : '';
+  }
+
+  function standardLink(type, id) {
+    return `https://www.douyin.com/${type || 'video'}/${id}`;
+  }
+
+  function inferTypeFromLocation() {
+    if (/\/note\//.test(location.href)) return 'note';
+    return 'video';
+  }
+
+  function tabSelected(el) {
+    return !!(el && (el.getAttribute('aria-selected') === 'true' || /active/.test(el.className || '')));
+  }
+
+  function topFavoriteTab() {
+    return pickVisible('#semiTabfavorite_collection, [data-tabkey="semiTabfavorite_collection"], [aria-controls="semiTabPanelfavorite_collection"]');
+  }
+
+  function topFavoriteActive() {
+    return tabSelected(topFavoriteTab()) || /showTab=favorite_collection/.test(location.href);
+  }
+
+  function subFolderTab() {
+    return pickVisible('#semiTabfavorite_folder, [data-tabkey="semiTabfavorite_folder"], [aria-controls="semiTabPanelfavorite_folder"]');
+  }
+
+  function subVideoTab() {
+    return pickVisible('#semiTabvideo, [data-tabkey="semiTabvideo"], [aria-controls="semiTabPanelvideo"]');
+  }
+
+  function rightFolderTab() {
+    return pickVisible('#semiTabcollection_folder_card, [data-tabkey="collection_folder_card"], [data-tabkey="semiTabcollection_folder_card"], [aria-controls="semiTabPanelcollection_folder_card"]');
+  }
+
+  function rightFolderActive() {
+    return tabSelected(rightFolderTab());
+  }
+
+  function collectionNav() {
+    return pickVisible('#collection-navigation');
+  }
+
+  function modalRoot() {
+    return pickVisible('[data-e2e="modal-video-container"], #dy-modal-video-container-favorite_collection, .modal-video-container');
+  }
+
+  function rightRoot() {
+    return pickVisible('#videoSideCard') || pickVisible('#relatedVideoCard') || pickVisible('[data-e2e="related-user-card-list"]');
+  }
+
+  function leftNavigation() {
+    return pickVisible('[data-e2e="douyin-navigation"]') || pickVisible('nav') || null;
+  }
+
+  function getVisibleTabs() {
+    return pickAllVisible('[role="tab"]').map((el) => ({ text: textOf(el), id: el.id || '', selected: tabSelected(el), selector: cssPath(el), rect: rectObj(el) }));
+  }
+
+  function rectObj(el) {
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+  }
+
+  function countRealDocLinks() {
+    return collectLinkItems(document, { rightOnly: false, includeClickNeeded: false }).length;
+  }
+
+  function detectState() {
+    const url = location.href;
+    const title = document.title || '';
+    const hasModalId = /[?&]modal_id=\d+/.test(url);
+    const modalVisible = !!modalRoot();
+    const activeVideoId = parseActiveVideoId();
+    const rightCardVisible = !!rightRoot();
+    const rightFolderTabVisible = !!rightFolderTab();
+    const rightFolderTabActive = rightFolderActive();
+    const topFavActive = topFavoriteActive();
+    const folderSubActive = tabSelected(subFolderTab()) || /showSubTab=favorite_folder/.test(url);
+    const videoSubActive = tabSelected(subVideoTab()) || /showSubTab=video/.test(url);
+    const navVisible = !!collectionNav();
+    const leftNavVisible = !!leftNavigation();
+    const tabs = getVisibleTabs();
+    const bodyText = textOf(document.body).slice(0, 3000);
+    const loading = /加载中|正在加载|骨架/.test(bodyText) || !!pickVisible('[class*="loading" i], [id*="loading" i]');
+    const realLinks = countRealDocLinks();
+
+    let state = 'O';
+    let label = '无法识别';
+    let reason = '未匹配可操作状态';
+
+    if ((hasModalId || modalVisible || activeVideoId) && rightCardVisible) {
+      state = 'D'; label = '视频详情页-右侧收藏夹栏'; reason = '检测到视频详情/播放层与右侧栏';
+    } else if (/\/user\/self/.test(url) && topFavActive && folderSubActive && navVisible && realLinks > 0) {
+      state = 'C'; label = '收藏夹网格页'; reason = '收藏tab+收藏夹二级tab+左侧收藏夹导航+视频卡片';
+    } else if (/\/user\/self/.test(url) && topFavActive && folderSubActive) {
+      state = 'B'; label = '收藏页-收藏夹列表页'; reason = '收藏tab+收藏夹二级tab';
+    } else if (/\/user\/self/.test(url) && topFavActive && videoSubActive) {
+      state = 'A'; label = '收藏页-视频页'; reason = '收藏tab+视频二级tab';
+    } else if (/\/user\/self/.test(url) && topFavoriteTab()) {
+      state = 'P'; label = '个人主页非收藏页'; reason = '个人主页 tabs 已出现，但当前不在收藏页';
+    } else if (leftNavVisible || /\/jingxuan|recommend=1|^https:\/\/www\.douyin\.com\/?(?:\?|$)/.test(url)) {
+      state = 'H'; label = '首页/精选/推荐入口页'; reason = '检测到左侧导航或首页 URL';
+    }
+
+    return {
+      state, label, reason, url, title, loading,
+      hasModalId, modalVisible, activeVideoId,
+      rightCardVisible, rightFolderTabVisible, rightFolderTabActive,
+      topFavoriteActive: topFavActive, folderSubActive, videoSubActive,
+      collectionNavVisible: navVisible,
+      realLinkCountDoc: realLinks,
+      visibleTabs: tabs,
+    };
+  }
+
+  function normalizeTypeAndId(raw) {
+    const s = String(raw || '');
+    let m = s.match(/\/video\/(\d{8,})/);
+    if (m) return { type: 'video', id: m[1] };
+    m = s.match(/\/note\/(\d{8,})/);
+    if (m) return { type: 'note', id: m[1] };
+    m = s.match(/[?&]modal_id=(\d{8,})/);
+    if (m) return { type: 'video', id: m[1] };
+    return null;
+  }
+
+  function cleanTitle(s) {
+    let t = String(s || '').replace(/\s+/g, ' ').trim();
+    t = t.replace(/^(\d+(\.\d+)?万?|播放中|正在播放|已选中|听抖音|点击推荐)\s*/g, '').trim();
+    t = t.replace(/\b\d{2}:\d{2}\s*\/\s*\d{2}:\d{2}\b/g, '').replace(/倍速|智能|清屏|连播|顺序连播/g, '').trim();
+    if (t.length > 220) t = t.slice(0, 220);
+    return t;
+  }
+
+  function rejectUrl(url) {
+    if (!url) return '空链接';
+    if (/source=Baiduspider/i.test(url)) return 'SEO/Baiduspider 链接';
+    if (/\/search\//.test(url) || /keyword=/.test(url)) return '搜索链接';
+    if (!/\/video\/\d+|\/note\/\d+/.test(url)) return '非作品链接';
+    return '';
+  }
+
+  function getTitleFromCard(el) {
+    if (!el) return '';
+    const imgAlt = [...el.querySelectorAll('img[alt]')].map((img) => img.getAttribute('alt')).find((x) => x && x.trim().length > 4);
+    return cleanTitle(imgAlt || textOf(el));
+  }
+
+  function extractUrlFromElement(el) {
+    const a = el?.matches?.('a') ? el : el?.querySelector?.('a[href*="/video/"], a[href*="/note/"]');
+    let href = a?.href || a?.getAttribute?.('href') || '';
+    if (!href) return '';
+    if (href.startsWith('//')) href = location.protocol + href;
+    if (href.startsWith('/')) href = location.origin + href;
+    return href;
+  }
+
+  function collectLinkItems(root = document, opts = {}) {
+    const includeClickNeeded = opts.includeClickNeeded !== false;
+    const rightOnly = !!opts.rightOnly;
+    const cards = new Set();
+    const selectors = [
+      'a[href*="/video/"]', 'a[href*="/note/"]',
+      'a.TyuBARdT', 'a.IdxE71f8', 'li', '[data-e2e="related-user-card-list"] li'
+    ];
+    for (const sel of selectors) {
+      try { root.querySelectorAll(sel).forEach((el) => cards.add(el)); } catch {}
+    }
+    const out = [];
+    for (const el of cards) {
+      if (!visible(el) || isInPanel(el)) continue;
+      if (rightOnly && !isRightSideElement(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 20 || r.height < 20) continue;
+      const url = extractUrlFromElement(el);
+      const bad = rejectUrl(url);
+      if (url && !bad) {
+        const info = normalizeTypeAndId(url);
+        if (!info) continue;
+        out.push({ type: info.type, id: info.id, link: standardLink(info.type, info.id), title: getTitleFromCard(el), el, source: 'href' });
+      } else if (includeClickNeeded && rightOnly) {
+        const txt = textOf(el);
+        if (/播放中|正在播放/.test(txt)) continue;
+        if (r.width >= 65 && r.height >= 65) out.push({ type: 'video', id: '', link: '', title: getTitleFromCard(el), el, source: 'click-needed' });
+      }
+    }
+    const seen = new Set();
+    return out.filter((x) => {
+      const k = x.link || cssPath(x.el) + '|' + Math.round(x.el.getBoundingClientRect().top);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }
+
+  function isRightSideElement(el) {
+    const root = rightRoot();
+    if (root && root.contains(el)) return true;
+    const r = el.getBoundingClientRect();
+    return r.left > window.innerWidth * 0.58;
+  }
+
+  function getCurrentVideoTitle() {
+    const active = pickVisible('[data-e2e="feed-active-video"]') || pickVisible('#slideMode') || pickVisible('#sliderVideo') || modalRoot();
+    if (!active) return '';
+    const right = rightRoot();
+    let candidates = [];
+    const imgs = [...active.querySelectorAll('img[alt]')]
+      .filter((img) => !right?.contains(img))
+      .map((img) => img.getAttribute('alt'));
+    candidates.push(...imgs);
+    const nodes = [...active.querySelectorAll('p, span, div')]
+      .filter((el) => !right?.contains(el))
+      .map(textOf)
+      .filter(Boolean);
+    candidates.push(...nodes);
+    candidates = candidates.map(cleanTitle).filter((t) => t.length >= 8 && !/倍速|智能|清屏|连播|听抖音|播放中|正在播放|评论|收藏夹|TA的作品|问AI|相关推荐/.test(t));
+    candidates.sort((a, b) => b.length - a.length);
+    return candidates[0] || '';
+  }
+
+  function currentVideoItem() {
+    const id = parseActiveVideoId();
+    if (!id) return null;
+    const type = inferTypeFromLocation();
+    return { type, id, link: standardLink(type, id), title: getCurrentVideoTitle(), source: 'active-video' };
+  }
+
+  function addResult(item) {
+    if (!item?.id) return false;
+    const key = `${item.type || 'video'}:${item.id}`;
+    const old = APP.results.get(key);
+    const value = {
+      type: item.type || 'video',
+      id: item.id,
+      link: item.link || standardLink(item.type || 'video', item.id),
+      title: cleanTitle(item.title || ''),
+      source: item.source || '',
+      time: new Date().toISOString(),
+    };
+    if (old) {
+      if (!old.title && value.title) APP.results.set(key, { ...old, title: value.title });
+      return false;
+    }
+    APP.results.set(key, value);
+    refreshStatus();
+    return true;
+  }
+
+  async function waitFor(predicate, timeout = 10000, interval = 250, label = '') {
+    const start = Date.now();
+    let last = null;
+    while (Date.now() - start < timeout) {
+      if (APP.stopping) return null;
+      try {
+        last = predicate();
+        if (last) return last;
+      } catch (e) { last = e; }
+      await sleep(interval);
+    }
+    if (label) log(`等待超时：${label}`, 'warn', { last });
+    return null;
+  }
+
+  async function waitIfPaused() {
+    while (APP.paused && APP.running && !APP.stopping) {
+      refreshStatus(null, '运行：已暂停｜缓存保留，点击【继续】后恢复');
+      await sleep(800);
+    }
+  }
+
+  function findClickableAncestor(el, maxDepth = 6) {
+    let cur = el;
+    let best = el;
+    for (let i = 0; cur && i < maxDepth; i++, cur = cur.parentElement) {
+      if (!visible(cur) || isInPanel(cur)) continue;
+      const r = cur.getBoundingClientRect();
+      if (r.width >= 30 && r.height >= 20 && r.width <= 500 && r.height <= 220) best = cur;
+      if (clickable(cur)) return cur;
+    }
+    return best;
+  }
+
+  function findLeftMy() {
+    const nav = leftNavigation();
+    if (!nav) return null;
+    const exact = [...nav.querySelectorAll('a, button, div, span, p')]
+      .filter(visible)
+      .filter((el) => textOf(el).replace(/\s/g, '') === '我的')
+      .sort((a, b) => textOf(a).length - textOf(b).length);
+    const el = exact[0];
+    return el ? findClickableAncestor(el, 5) : null;
+  }
+
+  async function ensureMyPage() {
+    let st = detectState();
+    refreshStatus(st);
+    if (['P', 'A', 'B', 'C', 'D'].includes(st.state)) return true;
+    if (st.state !== 'H') {
+      log(`当前页面无法进入个人页：${st.label}；${st.reason}`, 'warn', st);
+      return false;
+    }
+    const my = findLeftMy();
+    if (my) {
+      log(`动作：点击左侧“我的”；点击前=${st.label}；元素=${cssPath(my)}`, 'info');
+      mouseClick(my);
+      await waitFor(() => /\/user\/self/.test(location.href) || detectState().state !== 'H', 6500, 250, '点击左侧我的后进入个人页');
+    } else {
+      log('未找到左侧“我的”入口，直接使用 /user/self 兜底。', 'warn');
+    }
+    st = detectState();
+    if (!/\/user\/self/.test(location.href) && !['P', 'A', 'B', 'C', 'D'].includes(st.state)) {
+      log('点击左侧“我的”未跳转，使用 URL 兜底进入 /user/self。', 'warn');
+      location.href = location.origin + '/user/self?from_tab_name=main';
+      await waitFor(() => /\/user\/self/.test(location.href) && topFavoriteTab(), 12000, 350, 'URL 兜底进入个人页');
+    }
+    await sleep(800);
+    st = detectState();
+    refreshStatus(st);
+    log(`进入个人页检测：${st.label}；${st.reason}`, ['P', 'A', 'B', 'C', 'D'].includes(st.state) ? 'ok' : 'warn', st);
+    return ['P', 'A', 'B', 'C', 'D'].includes(st.state);
+  }
+
+  async function ensureFavoriteTop() {
+    let st = detectState();
+    if (['A', 'B', 'C', 'D'].includes(st.state) && st.topFavoriteActive) return true;
+    if (st.state === 'D') return true;
+    const tab = topFavoriteTab();
+    if (!tab) {
+      log('未找到顶部“收藏”主标签。', 'error');
+      return false;
+    }
+    log(`动作：点击顶部“收藏”；点击前=${st.label}；元素=${cssPath(tab)}`, 'info');
+    mouseClick(tab);
+    let ok = await waitFor(() => topFavoriteActive() || /showTab=favorite_collection/.test(location.href), 8500, 250, '顶部收藏激活');
+    if (!ok && /\/user\/self/.test(location.href)) {
+      log('点击顶部“收藏”未确认激活，使用 URL 参数兜底。', 'warn');
+      location.href = location.origin + '/user/self?from_tab_name=main&showTab=favorite_collection';
+      ok = await waitFor(() => topFavoriteActive(), 10000, 300, 'URL 兜底进入收藏页');
+    }
+    await sleep(800);
+    st = detectState();
+    refreshStatus(st);
+    log(`顶部收藏后检测：${st.label}；${st.reason}`, ok || ['A', 'B', 'C'].includes(st.state) ? 'ok' : 'warn', st);
+    return !!ok || ['A', 'B', 'C'].includes(st.state);
+  }
+
+  async function ensureSubFolder(name) {
+    let st = detectState();
+    if (st.state === 'D') return true;
+    if ((st.state === 'B' || st.state === 'C') && st.folderSubActive) return true;
+    const tab = subFolderTab();
+    if (!tab) {
+      log('未找到二级“收藏夹”标签。', 'error');
+      return false;
+    }
+    log(`动作：点击二级“收藏夹”；点击前=${st.label}；元素=${cssPath(tab)}`, 'info');
+    mouseClick(tab);
+    const ok = await waitFor(() => tabSelected(subFolderTab()) || /showSubTab=favorite_folder/.test(location.href), 9000, 250, '二级收藏夹激活');
+    await sleep(500);
+    st = detectState();
+    refreshStatus(st, `界面：${st.label} / 等待收藏夹项目加载`);
+    log(`二级收藏夹后检测：${st.label}；${st.reason}`, ok || ['B', 'C'].includes(st.state) ? 'ok' : 'warn', st);
+    if (name) {
+      const loaded = await waitFor(() => {
+        const nav = collectionNav();
+        const txt = textOf(nav || document.body);
+        return nav && txt.includes(name) ? nav : null;
+      }, 18000, 400, `目标收藏夹“${name}”渲染`);
+      if (!loaded) return false;
+      log(`目标收藏夹已加载：${name}`, 'ok');
+    }
+    return true;
+  }
+
+  function updateExpectedCount(name) {
+    if (!name) return;
+    const nav = collectionNav();
+    const txt = textOf(nav || document.body);
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(esc + '\\D{0,20}(\\d{1,5})');
+    const m = txt.match(re);
+    if (m) APP.expectedCount = Number(m[1]) || APP.expectedCount || 0;
+    refreshStatus();
+  }
+
+  function findCollectionElement(name) {
+    const nav = collectionNav();
+    const roots = [nav, document.body].filter(Boolean);
+    const scored = [];
+    for (const root of roots) {
+      const nodes = [...root.querySelectorAll('a, button, [role="button"], div, p, span')].filter(visible);
+      for (const el of nodes) {
+        if (isInPanel(el)) continue;
+        const t = textOf(el);
+        if (!t.includes(name) || /新建收藏夹/.test(t)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 35 || r.height < 12) continue;
+        let score = 0;
+        if (root === nav) score += 80;
+        if (t === name) score += 50;
+        if (new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\d+').test(t)) score += 25;
+        if (clickable(el)) score += 10;
+        if (r.left > 70 && r.top > 250) score += 8;
+        score -= Math.min(t.length / 20, 10);
+        scored.push({ el, score, text: t, rect: r });
+      }
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored[0]?.el;
+    return best ? findClickableAncestor(best, 7) : null;
+  }
+
+  async function ensureTargetCollection(name) {
+    let st = detectState();
+    if (st.state === 'D') {
+      updateExpectedCount(name);
+      return true;
+    }
+    const loaded = await waitFor(() => {
+      const nav = collectionNav();
+      const txt = textOf(nav || document.body);
+      return nav && txt.includes(name) ? nav : null;
+    }, 18000, 400, `目标收藏夹“${name}”出现`);
+    if (!loaded) {
+      log(`目标收藏夹未加载或不存在：${name}`, 'error');
+      return false;
+    }
+    updateExpectedCount(name);
+    const el = await waitFor(() => findCollectionElement(name), 7000, 300, `目标收藏夹“${name}”可点击`);
+    if (!el) {
+      log(`找到目标收藏夹文本，但未找到可点击元素：${name}`, 'error');
+      return false;
+    }
+    log(`动作：点击目标收藏夹“${name}”；元素=${cssPath(el)}；文本=${textOf(el).slice(0, 80)}`, 'info');
+    mouseClick(el);
+    const ok = await waitFor(() => {
+      const s = detectState();
+      const links = countRealDocLinks();
+      return s.state === 'C' || s.state === 'D' || links > 0;
+    }, 14000, 350, '进入具体收藏夹网格页');
+    await sleep(900);
+    st = detectState();
+    updateExpectedCount(name);
+    refreshStatus(st);
+    log(`目标收藏夹进入后检测：${st.label}；文档链接=${countRealDocLinks()}`, ok ? 'ok' : 'warn', st);
+    return !!ok || ['C', 'D'].includes(st.state);
+  }
+
+  function findFirstGridCard() {
+    const items = collectLinkItems(document, { rightOnly: false, includeClickNeeded: false })
+      .filter((x) => {
+        const r = x.el.getBoundingClientRect();
+        return !isRightSideElement(x.el) && r.left > 280 && r.top > 220 && r.width > 70 && r.height > 70;
+      })
+      .sort((a, b) => a.el.getBoundingClientRect().top - b.el.getBoundingClientRect().top || a.el.getBoundingClientRect().left - b.el.getBoundingClientRect().left);
+    return items[0]?.el || null;
+  }
+
+  async function ensureDetailPage() {
+    let st = detectState();
+    if (st.state === 'D') return true;
+    if (st.state !== 'C') {
+      log(`当前不是具体收藏夹网格页，无法打开首个详情：${st.label}`, 'warn', st);
+      return false;
+    }
+    const card = await waitFor(() => findFirstGridCard(), 12000, 350, '首个作品卡片出现');
+    if (!card) {
+      log('未找到可点击的首个作品卡片。', 'error');
+      return false;
+    }
+    log(`动作：点击首个作品进入详情页；元素=${cssPath(card)}`, 'info');
+    mouseClick(card);
+    const ok = await waitFor(() => detectState().state === 'D', 16000, 350, '打开视频详情页');
+    await sleep(1200);
+    st = detectState();
+    refreshStatus(st);
+    log(`详情页检测：${st.label}；activeVideoId=${st.activeVideoId || '-'}`, ok ? 'ok' : 'warn', st);
+    return !!ok;
+  }
+
+  async function ensureRightFavoriteTab() {
+    const tab = await waitFor(() => rightFolderTab(), 8000, 250, '右侧收藏夹标签出现');
+    if (!tab) {
+      log('右侧未找到“收藏夹”标签。', 'error');
+      return false;
+    }
+    if (rightFolderActive()) {
+      log('右侧“收藏夹”标签已激活。', 'ok');
+      return true;
+    }
+    log(`动作：点击右侧“收藏夹”；元素=${cssPath(tab)}`, 'info');
+    mouseClick(tab);
+    const ok = await waitFor(() => rightFolderActive(), 9000, 250, '右侧收藏夹激活');
+    await sleep(900);
+    log(`右侧收藏夹激活：${ok ? '成功' : '未确认'}`, ok ? 'ok' : 'warn');
+    return !!ok;
+  }
+
+  function findRightScroller() {
+    const root = rightRoot();
+    if (!root) return null;
+    const candidates = [
+      ...pickAllVisible('[data-e2e="related-user-card-list"] .GJqJcJnh, .GJqJcJnh', root),
+      ...pickAllVisible('[data-e2e="related-user-card-list"], #relatedVideoCard, #videoSideCard', root),
+      root,
+    ];
+    let best = null;
+    let bestScore = -1;
+    for (const el of candidates) {
+      if (!visible(el)) continue;
+      const r = el.getBoundingClientRect();
+      const overflow = el.scrollHeight - el.clientHeight;
+      let score = 0;
+      if (el.classList.contains('GJqJcJnh')) score += 80;
+      if (el.getAttribute('data-e2e') === 'related-user-card-list') score += 50;
+      if (overflow > 20) score += 30;
+      if (r.left > window.innerWidth * 0.55) score += 25;
+      score += Math.min(40, Math.max(0, overflow / 10));
+      if (score > bestScore) { best = el; bestScore = score; }
+    }
+    return best;
+  }
+
+  async function waitRightListLoaded(timeout = 18000) {
+    refreshStatus(null, '界面：视频详情页 / 等待右侧收藏夹列表加载');
+    const ok = await waitFor(() => {
+      const root = rightRoot();
+      const scroller = findRightScroller();
+      if (!root || !rightFolderActive()) return null;
+      const liCount = root.querySelectorAll('li').length;
+      const text = textOf(root);
+      const hrefCount = collectLinkItems(root, { rightOnly: true, includeClickNeeded: false }).length;
+      if (liCount > 0 || hrefCount > 0) return { root, scroller, liCount, hrefCount, text: text.slice(0, 80) };
+      if (!/加载中/.test(text) && scroller) return { root, scroller, liCount, hrefCount, text: text.slice(0, 80) };
+      return null;
+    }, timeout, 400, '右侧收藏夹列表加载');
+    if (ok) log(`右侧列表已就绪：li=${ok.liCount}，href=${ok.hrefCount}，滚动容器=${cssPath(ok.scroller)}`, 'ok', ok);
+    return !!ok;
+  }
+
+  async function waitCurrentVideoReady() {
+    const ok = await waitFor(() => {
+      const id = parseActiveVideoId();
+      const active = pickVisible('[data-e2e="feed-active-video"], #slideMode, #sliderVideo');
+      return id && active ? { id, active } : null;
+    }, 10000, 250, '当前视频 ID 和播放层稳定');
+    if (ok) {
+      await sleep(1200); // 等视频加载一点再切换，避免焦点/队列未就绪。
+      return ok;
+    }
+    return null;
+  }
+
+  function getMainVideoClickable() {
+    const active = pickVisible('[data-e2e="feed-active-video"], #slideMode, #sliderVideo') || modalRoot();
+    if (!active) return document.body;
+    const right = rightRoot();
+    const r = active.getBoundingClientRect();
+    if (right) {
+      const rr = right.getBoundingClientRect();
+      const fake = { getBoundingClientRect: () => ({ left: r.left, top: r.top, width: Math.max(80, rr.left - r.left - 20), height: r.height, x: r.left, y: r.top }) };
+      return active;
+    }
+    return active;
+  }
+
+  function dispatchArrowDown() {
+    const active = getMainVideoClickable();
+    try { mouseClick(active, '主视频区域获取焦点'); } catch {}
+    const opts = { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true, cancelable: true };
+    [document.activeElement, document.body, document, window].forEach((t) => {
+      try { t.dispatchEvent(new KeyboardEvent('keydown', opts)); } catch {}
+    });
+    [document.activeElement, document.body, document, window].forEach((t) => {
+      try { t.dispatchEvent(new KeyboardEvent('keyup', opts)); } catch {}
+    });
+  }
+
+  function dispatchWheelOnMain() {
+    const active = getMainVideoClickable();
+    const r = active.getBoundingClientRect();
+    const x = Math.round(r.left + Math.min(r.width * 0.5, Math.max(100, r.width - 120)));
+    const y = Math.round(r.top + r.height * 0.5);
+    const evt = new WheelEvent('wheel', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, deltaY: Math.max(500, Math.round(window.innerHeight * 0.9)), deltaMode: 0 });
+    try { active.dispatchEvent(evt); } catch {}
+    try { window.dispatchEvent(evt); } catch {}
+  }
+
+  function findNextRightCard() {
+    const root = rightRoot();
+    if (!root) return null;
+    const cards = [...root.querySelectorAll('[data-e2e="related-user-card-list"] li, li')]
+      .filter(visible)
+      .filter((li) => {
+        const t = textOf(li);
+        const r = li.getBoundingClientRect();
+        if (/播放中|正在播放/.test(t)) return false;
+        return r.width > 55 && r.height > 55 && r.left > window.innerWidth * 0.55;
+      })
+      .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top || a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+    return cards[0] || null;
+  }
+
+  async function waitVideoIdChanged(beforeId, timeout = 8000, label = '') {
+    const changed = await waitFor(() => {
+      const id = parseActiveVideoId();
+      return id && id !== beforeId ? id : null;
+    }, timeout, 250, label || '等待视频切换');
+    if (changed) await sleep(900);
+    return changed;
+  }
+
+  async function switchToNextVideo() {
+    const beforeId = parseActiveVideoId();
+    if (!beforeId) {
+      log('切换前未读取到 activeVideoId，无法切换。', 'error');
+      return null;
+    }
+
+    log(`切换前ID：${beforeId}；动作：ArrowDown`, 'info');
+    dispatchArrowDown();
+    let afterId = await waitVideoIdChanged(beforeId, 8500, 'ArrowDown 后 ID 变化');
+    if (afterId) {
+      log(`切换成功：ArrowDown；${beforeId} → ${afterId}`, 'ok');
+      return afterId;
+    }
+    log(`ArrowDown 未切换：${beforeId} → ${parseActiveVideoId() || '-'}`, 'warn');
+
+    log(`备用动作：鼠标滚轮滚动主视频区域；切换前ID=${beforeId}`, 'info');
+    dispatchWheelOnMain();
+    afterId = await waitVideoIdChanged(beforeId, 7500, '滚轮后 ID 变化');
+    if (afterId) {
+      log(`切换成功：Wheel；${beforeId} → ${afterId}`, 'ok');
+      return afterId;
+    }
+    log(`Wheel 未切换：${beforeId} → ${parseActiveVideoId() || '-'}`, 'warn');
+
+    const card = findNextRightCard();
+    if (card) {
+      log(`备用动作：点击右侧下一个非播放中卡片；切换前ID=${beforeId}；元素=${cssPath(card)}`, 'info');
+      clickAtElementCenter(card, '右侧下一卡片');
+      afterId = await waitVideoIdChanged(beforeId, 9000, '右侧卡片点击后 ID 变化');
+      if (afterId) {
+        log(`切换成功：右侧卡片；${beforeId} → ${afterId}`, 'ok');
+        return afterId;
+      }
+      log(`右侧卡片点击后 ID 未变化，判定未切换：${beforeId} → ${parseActiveVideoId() || '-'}`, 'warn');
+    } else {
+      log('未找到可点击的右侧备用卡片。', 'warn');
+    }
+    return null;
+  }
+
+  async function startCrawlStage() {
+    if (APP.running || APP.busy) {
+      log('当前已有动作在执行。', 'warn');
+      return;
+    }
+    const st = detectState();
+    if (!isFavoritePlaybackState(st)) {
+      if (st.state === 'D') {
+        log('当前是视频播放页，但不是从收藏夹进入的播放页，不能开始爬取。请先人工进入目标收藏夹，再打开其中任意视频播放页。', 'warn', st);
+      } else {
+        log(`当前不能开始爬取：${st.label}。请先人工进入目标收藏夹，并打开其中任意视频播放页。`, 'warn', st);
+      }
+      refreshStatus(st);
+      return;
+    }
+    APP.running = true;
+    APP.stopping = false;
+    APP.paused = false;
+    APP.switchFailCount = 0;
+    APP.duplicateCount = 0;
+    refreshStatus(st, '界面：收藏夹来源视频详情页｜爬取中');
+    log('开始爬取：已确认当前为收藏夹来源播放页；从当前视频开始，按 ArrowDown 切换下一条。', 'info');
+
+    try {
+      await ensureRightFavoriteTab();
+      await waitRightListLoaded();
+      await waitCurrentVideoReady();
+      const current = currentVideoItem();
+      if (current) {
+        const added = addResult(current);
+        log(`${added ? '新增当前视频' : '当前视频已存在'}：${current.link}`, added ? 'ok' : 'info');
+      }
+
+      const maxLoops = Math.max(20, (APP.expectedCount || 180) + 25);
+      for (let i = 0; i < maxLoops && APP.running && !APP.stopping; i++) {
+        await waitIfPaused();
+        if (APP.stopping || !APP.running) break;
+
+        if (APP.expectedCount && APP.results.size >= APP.expectedCount) {
+          log(`已达到目标数量：${APP.results.size}/${APP.expectedCount}，停止爬取。`, 'ok');
+          break;
+        }
+
+        await waitCurrentVideoReady();
+        const before = parseActiveVideoId();
+        const after = await switchToNextVideo();
+        if (!after || after === before) {
+          APP.switchFailCount += 1;
+          log(`本次未切换成功，连续失败=${APP.switchFailCount}`, 'warn');
+          if (APP.switchFailCount >= 4) {
+            log('连续多次无法切换，停止爬取。', 'warn');
+            break;
+          }
+          continue;
+        }
+        APP.switchFailCount = 0;
+        await waitCurrentVideoReady();
+        const item = currentVideoItem();
+        if (!item) {
+          log('切换后未读取到当前视频信息。', 'warn');
+          continue;
+        }
+        const added = addResult(item);
+        if (added) {
+          APP.duplicateCount = 0;
+          log(`新增：${item.link}｜标题=${item.title || '未读取到标题'}`, 'ok');
+        } else {
+          APP.duplicateCount += 1;
+          log(`已存在：${item.link}｜重复计数=${APP.duplicateCount}`, 'info');
+          if (!APP.expectedCount && APP.duplicateCount >= 8) {
+            log('连续读取到重复视频，停止爬取。', 'warn');
+            break;
+          }
+        }
+        refreshStatus();
+      }
+      log(`爬取结束：共缓存 ${APP.results.size} 条。请点击【导出CSV】导出。`, 'ok');
+    } catch (e) {
+      log(`爬取失败：${e.message || e}`, 'error');
+    } finally {
+      APP.running = false;
+      APP.paused = false;
+      APP.stopping = false;
+      refreshStatus();
+    }
+  }
+
+  function togglePause() {
+    if (!APP.running) {
+      log('当前没有正在爬取的任务，无法暂停/继续。', 'warn');
+      return;
+    }
+    APP.paused = !APP.paused;
+    log(APP.paused ? '已暂停。缓存和当前页面保留。' : '已继续。', APP.paused ? 'warn' : 'ok');
+    refreshStatus();
+  }
+
+  function stopCurrentAction() {
+    if (!APP.running && !APP.busy) {
+      log('当前没有正在执行的动作。', 'warn');
+      return;
+    }
+    APP.stopping = true;
+    APP.paused = false;
+    log('已请求停止。当前步骤结束后停止。', 'warn');
+    refreshStatus();
+  }
+
+  function clearCacheOnly() {
+    APP.results.clear();
+    APP.expectedCount = 0;
+    APP.switchFailCount = 0;
+    APP.duplicateCount = 0;
+    APP.lockedRightScrollerSelector = '';
+    log('已清除缓存：结果、计数和运行状态已清空；日志保留。', 'warn');
+    refreshStatus();
+  }
+
+  function makeRows() {
+    return [...APP.results.values()].map((x, idx) => ({
+      序号: idx + 1,
+      '标题/文案预览': cleanTitle(x.title || ''),
+      类型: x.type || 'video',
+      链接: x.link,
+    }));
+  }
+
+  function csvEscape(v) {
+    const s = String(v ?? '');
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+
+  function exportCsv(manual = true) {
+    if (!APP.results.size) {
+      log('没有可导出的缓存结果。', 'warn');
+      return;
+    }
+    const rows = makeRows();
+    const header = ['序号', '标题/文案预览', '类型', '链接'];
+    const csv = '\ufeff' + [header.join(','), ...rows.map((r) => header.map((h) => csvEscape(r[h])).join(','))].join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const name = APP.targetName || getTargetName() || '收藏夹';
+    const ts = new Date().toISOString().slice(0, 16).replace(/[-T:]/g, '').slice(0, 12);
+    a.href = url;
+    a.download = `抖音收藏夹_${name}_${ts}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    log(`已导出 CSV：${rows.length} 条。`, manual ? 'ok' : 'info');
+  }
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    }
+  }
+
+  async function copyLinks() {
+    const links = [...APP.results.values()].map((x) => x.link).join('\n');
+    if (!links) {
+      log('没有可复制的链接。', 'warn');
+      return;
+    }
+    const ok = await copyText(links);
+    log(ok ? `已复制 ${APP.results.size} 条链接。` : '复制失败。', ok ? 'ok' : 'error');
+  }
+
+  function boot() {
+    createPanel();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();

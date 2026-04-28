@@ -1,0 +1,1201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>分页（TXT导入）</title>
+  <style>
+    :root{
+      --bg:#ffffff;
+      --text:#111827;
+      --muted:#6b7280;
+      --border:rgba(0,0,0,.10);
+      --shadow:0 18px 40px rgba(0,0,0,.14);
+      --font:20px;
+      --lh:1.9;
+      --maxw:760px;
+      --pad:28px;
+      --radius:16px;
+    }
+    [data-theme="dark"]{
+      --bg:#0b0f16;
+      --text:#e5e7eb;
+      --muted:#9ca3af;
+      --border:rgba(255,255,255,.12);
+      --shadow:0 18px 40px rgba(0,0,0,.45);
+    }
+    *{box-sizing:border-box;}
+    html,body{height:100%;}
+    body{
+      margin:0;
+      background:var(--bg);
+      color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC", Arial, sans-serif;
+      transition: background .2s ease, color .2s ease;
+    }
+
+    /* ===== Immersive page ===== */
+    .page{
+      max-width:var(--maxw);
+      margin:0 auto;
+      padding:var(--pad);
+      font-size:var(--font);
+      line-height:var(--lh);
+    }
+    .indent p{ text-indent:2em; }
+    h2{
+      margin:6px 0 16px 0;
+      font-size:22px;
+      font-weight:900;
+      letter-spacing:.02em;
+      line-height:1.25;
+    }
+    p{ margin: 12px 0; word-break:break-word; }
+    .end{
+      text-align:center;
+      color:var(--muted);
+      font-size:13px;
+      margin: 22px 0 10px;
+    }
+
+    /* ===== Hidden edge-hotzones (no visible buttons) ===== */
+    .edge{
+      position:fixed; top:0; bottom:0; width:22px;
+      z-index:10;
+      background:transparent;
+    }
+    .edge.left{ left:0; }
+    .edge.right{ right:0; }
+    .edge:hover{ cursor:pointer; }
+
+    /* ===== Modal / overlay ===== */
+    .overlay{
+      position:fixed; inset:0;
+      background:rgba(0,0,0,.28);
+      backdrop-filter: blur(8px);
+      display:none;
+      z-index:9998;
+    }
+    .overlay.show{ display:block; }
+
+    .modal{
+      position:fixed;
+      top:50%; left:50%;
+      transform:translate(-50%,-50%);
+      width:min(760px, 94vw);
+      max-height:min(86vh, 760px);
+      overflow:hidden;
+      background: color-mix(in srgb, var(--bg) 92%, #000 8%);
+      border:1px solid var(--border);
+      border-radius:20px;
+      box-shadow: var(--shadow);
+      display:none;
+      z-index:9999;
+    }
+    .modal.show{ display:flex; flex-direction:column; }
+    .modal header{
+      padding:14px 16px;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:12px;
+      border-bottom:1px solid var(--border);
+    }
+    .modal header .title{
+      font-weight:900;
+      letter-spacing:.08em;
+      font-size:13px;
+      color:var(--muted);
+    }
+    .btn{
+      border:1px solid var(--border);
+      background:transparent;
+      color:var(--text);
+      padding:7px 10px;
+      border-radius:12px;
+      cursor:pointer;
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .btn.primary{
+      background: color-mix(in srgb, var(--border) 24%, transparent);
+    }
+    .tabs{
+      display:flex;
+      gap:8px;
+      padding:10px 16px;
+      border-bottom:1px solid var(--border);
+      flex-wrap:wrap;
+    }
+    .tab{
+      border:1px solid var(--border);
+      background:transparent;
+      color:var(--text);
+      padding:7px 10px;
+      border-radius:999px;
+      font-size:12px;
+      cursor:pointer;
+      opacity:.82;
+    }
+    .tab.active{
+      opacity:1;
+      background: color-mix(in srgb, var(--border) 22%, transparent);
+    }
+    .panel{
+      padding:14px 16px 18px;
+      overflow:auto;
+      flex:1;
+    }
+    .group{
+      border:1px solid var(--border);
+      border-radius:16px;
+      padding:12px 12px;
+      margin-bottom:12px;
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+    }
+    .group h3{
+      margin:0 0 10px 0;
+      font-size:13px;
+      color:var(--muted);
+      letter-spacing:.08em;
+    }
+    .row{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      margin:10px 0;
+      font-size:13px;
+    }
+    .hint{
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.45;
+    }
+    input[type="range"]{ width:240px; }
+    input[type="color"]{
+      width:46px; height:30px;
+      border:1px solid var(--border);
+      border-radius:8px;
+      background:transparent;
+      padding:0;
+    }
+    input[type="checkbox"]{ transform:scale(1.05); }
+    textarea{
+      width:100%;
+      min-height:120px;
+      resize:vertical;
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:10px;
+      background:transparent;
+      color:var(--text);
+      font-size:12px;
+      line-height:1.5;
+      outline:none;
+    }
+    .toc a{
+      display:block;
+      padding:9px 10px;
+      border-radius:12px;
+      text-decoration:none;
+      color:var(--text);
+      font-size:13px;
+      line-height:1.35;
+    }
+    .toc a:hover{ background: color-mix(in srgb, var(--border) 22%, transparent); }
+    .toc a.active{ background: color-mix(in srgb, var(--border) 30%, transparent); }
+
+    .k{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+      font-size:12px;
+      color:var(--muted);
+    }
+
+    /* ===== Splash ===== */
+    .splash{
+      position:fixed; inset:0;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      background:rgba(0,0,0,.30);
+      backdrop-filter: blur(6px);
+      z-index:10000;
+    }
+    .splash .box{
+      width:min(680px, 94vw);
+      background: color-mix(in srgb, var(--bg) 92%, #000 8%);
+      border:1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+      border-radius:22px;
+      padding:18px 18px 16px;
+      box-shadow: var(--shadow);
+      text-align:center;
+    }
+    .splash h4{ margin:0 0 8px 0; }
+    .splash p{ margin:0; color:var(--muted); font-size:13px; }
+    .splash .actions{
+      margin-top:12px;
+      display:flex;
+      gap:10px;
+      justify-content:center;
+      flex-wrap:wrap;
+    }
+
+    /* Drag hint */
+    .drop{
+      position:fixed; inset:0;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      z-index:10001;
+      background:rgba(0,0,0,.35);
+      backdrop-filter: blur(6px);
+    }
+    .drop.show{ display:flex; }
+    .drop .box{
+      width:min(560px, 92vw);
+      background: color-mix(in srgb, var(--bg) 92%, #000 8%);
+      border:1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+      border-radius:20px;
+      padding:20px;
+      box-shadow: var(--shadow);
+      text-align:center;
+    }
+
+    .toast{
+      position:fixed;
+      left:50%;
+      bottom:18px;
+      transform:translateX(-50%);
+      background: color-mix(in srgb, var(--bg) 92%, #000 8%);
+      border:1px solid var(--border);
+      border-radius:999px;
+      padding:8px 12px;
+      font-size:12px;
+      color:var(--muted);
+      box-shadow: var(--shadow);
+      display:none;
+      z-index:10002;
+      max-width:min(92vw, 860px);
+      text-align:center;
+    }
+    .toast.show{ display:block; }
+    @media (max-width:520px){
+      input[type="range"]{ width:180px; }
+      .page{ padding:22px; }
+    }
+  </style>
+</head>
+<body data-theme="light">
+  <!-- invisible edge hotzones for paging -->
+  <div class="edge left" id="edgePrev" title="上一章（点击左边缘）"></div>
+  <div class="edge right" id="edgeNext" title="下一章（点击右边缘）"></div>
+
+  <main class="page indent" id="page">
+    <h2 id="chapterTitle">未导入TXT</h2>
+    <div id="chapterBody" class="hint">请导入小说 TXT。导入后将按章节分页显示。</div>
+  </main>
+
+  <div class="overlay" id="overlay"></div>
+
+  <section class="modal" id="modal" role="dialog" aria-modal="true" aria-label="阅读器面板">
+    <header>
+      <div class="title">阅读器面板</div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button class="btn" id="closeBtn">关闭 (Esc)</button>
+      </div>
+    </header>
+    <div class="tabs">
+      <button class="tab" id="tabToc">目录</button>
+      <button class="tab active" id="tabSet">设置</button>
+      <button class="tab" id="tabKeys">快捷键</button>
+    </div>
+
+    <div class="panel" id="panelToc" style="display:none;">
+      <div class="group">
+        <h3>章节目录</h3>
+        <div class="toc" id="tocList"></div>
+        <div class="hint" id="tocHint" style="margin-top:10px;"></div>
+      </div>
+    </div>
+
+    <div class="panel" id="panelSet">
+      <div class="group">
+        <h3>导入小说</h3>
+        <div class="row" style="align-items:flex-start;">
+          <div>
+            <div>导入 .txt（本地文件，不上传网络）</div>
+            <div class="hint">也支持拖拽 TXT 到页面任意位置</div>
+          </div>
+          <div>
+            <button class="btn primary" id="pickBtn">选择TXT</button>
+            <input id="fileInput" type="file" accept=".txt,text/plain" style="display:none;" />
+          </div>
+        </div>
+        <div class="row">
+          <div class="hint">当前书籍ID：<span class="k" id="bookId">-</span></div>
+          <button class="btn" id="resetProgressBtn">清除本书进度</button>
+        </div>
+      </div>
+
+      <div class="group">
+        <h3>阅读显示</h3>
+        <div class="row">
+          <label>字号：<span class="k" id="fontVal"></span>px</label>
+          <input id="fontRange" type="range" min="14" max="30" value="20" />
+        </div>
+        <div class="row">
+          <label>行距：<span class="k" id="lhVal"></span></label>
+          <input id="lhRange" type="range" min="1.4" max="2.5" step="0.05" value="1.9" />
+        </div>
+        <div class="row">
+          <label>阅读宽度：<span class="k" id="wVal"></span></label>
+          <button class="btn" id="widthBtn">切换</button>
+        </div>
+        <div class="row">
+          <label>首行缩进</label>
+          <input id="indentChk" type="checkbox" checked />
+        </div>
+        <div class="row">
+          <label>主题</label>
+          <button class="btn" id="themeBtn">浅色</button>
+        </div>
+        <div class="row">
+          <label>背景颜色</label>
+          <input id="bgColor" type="color" value="#ffffff" />
+        </div>
+        <div class="row">
+          <label>文字颜色</label>
+          <input id="textColor" type="color" value="#111827" />
+        </div>
+        <div class="hint">提示：本页无可见按钮。翻页方式：快捷键 / 鼠标侧键 / 点击左右边缘。</div>
+      </div>
+
+      <div class="group">
+        <h3>广告/水印屏蔽</h3>
+        <div class="row">
+          <label>启用屏蔽</label>
+          <input id="adChk" type="checkbox" checked />
+        </div>
+        <div class="hint">每行一条规则：包含该文本的“整行”会被删除。正则以 <span class="k">regex:</span> 开头。</div>
+        <textarea id="adRules"></textarea>
+        <div class="row" style="justify-content:flex-end; gap:8px;">
+          <button class="btn" id="restoreAdBtn">恢复默认</button>
+          <button class="btn primary" id="applyAdBtn">应用（重新分页）</button>
+        </div>
+      </div>
+
+      <div class="group">
+        <h3>自动保存</h3>
+        <div class="row">
+          <div>
+            <div>保存章节与滚动位置</div>
+            <div class="hint">关闭页面后再打开：重新导入同一个TXT，会自动回到上次章节与位置。</div>
+          </div>
+          <input id="saveChk" type="checkbox" checked />
+        </div>
+        <div class="row" style="justify-content:space-between;">
+          <button class="btn" id="jumpLastBtn">跳到上次位置</button>
+          <div class="hint">生成于 2026-01-23 02:27</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="panelKeys" style="display:none;">
+      <div class="group">
+        <h3>快捷键设置</h3>
+        <div class="hint">点击“录制”后按键即可保存；也支持鼠标侧键（后退/前进）。</div>
+
+        <div class="row">
+          <div>
+            <div>下一章</div>
+            <div class="hint"><span class="k" id="nextKeyTxt"></span></div>
+          </div>
+          <button class="btn primary" id="recNextBtn">录制</button>
+        </div>
+
+        <div class="row">
+          <div>
+            <div>上一章</div>
+            <div class="hint"><span class="k" id="prevKeyTxt"></span></div>
+          </div>
+          <button class="btn primary" id="recPrevBtn">录制</button>
+        </div>
+
+        <div class="row">
+          <div>
+            <div>打开面板（目录/设置）</div>
+            <div class="hint"><span class="k" id="panelKeyTxt"></span></div>
+          </div>
+          <button class="btn primary" id="recPanelBtn">录制</button>
+        </div>
+
+        <div class="row">
+          <div>
+            <div>选择TXT</div>
+            <div class="hint"><span class="k" id="openKeyTxt"></span></div>
+          </div>
+          <button class="btn primary" id="recOpenBtn">录制</button>
+        </div>
+
+        <div class="row" style="justify-content:flex-end;">
+          <button class="btn" id="resetKeysBtn">恢复默认快捷键</button>
+        </div>
+      </div>
+
+      <div class="group">
+        <h3>建议</h3>
+        <div class="hint">
+          默认：<span class="k">下一章=鼠标前进键 / →</span>，<span class="k">上一章=鼠标后退键 / ←</span>。<br>
+          如果你的侧键会触发浏览器历史：请先点一下页面空白处，再用侧键；必要时可用键盘快捷键替代。
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="splash" id="splash">
+    <div class="box">
+      <h4>沉浸式小说阅读器（分页·TXT导入）</h4>
+      <p>导入 TXT 后按章节分页阅读。没有可见按钮，沉浸阅读。</p>
+      <div class="actions">
+        <button class="btn primary" id="splashPick">选择TXT</button>
+        <button class="btn" id="splashClose">稍后</button>
+      </div>
+      <p class="hint" style="margin-top:10px;">默认快捷键：<span class="k">Ctrl/Cmd+O</span> 选择TXT；<span class="k">Ctrl/Cmd+,</span> 打开面板；<span class="k">←/→</span> 翻章；<span class="k">Esc</span> 关闭面板。</p>
+    </div>
+  </div>
+
+  <div class="drop" id="drop">
+    <div class="box">
+      <h4>拖拽导入 TXT</h4>
+      <p>松开鼠标即可加载并开始阅读（本地解析，不上传）。</p>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+  (function(){
+    const SETTINGS_KEY = 'mini_reader_settings_paged_v1';
+    const PROGRESS_PREFIX = 'mini_reader_progress_paged_v1:'; // + bookId
+    const KEYS_KEY = 'mini_reader_keys_paged_v1';
+
+    const page = document.getElementById('page');
+    const chapterTitle = document.getElementById('chapterTitle');
+    const chapterBody = document.getElementById('chapterBody');
+
+    const overlay = document.getElementById('overlay');
+    const modal = document.getElementById('modal');
+    const closeBtn = document.getElementById('closeBtn');
+
+    const tabToc = document.getElementById('tabToc');
+    const tabSet = document.getElementById('tabSet');
+    const tabKeys = document.getElementById('tabKeys');
+    const panelToc = document.getElementById('panelToc');
+    const panelSet = document.getElementById('panelSet');
+    const panelKeys = document.getElementById('panelKeys');
+
+    const tocList = document.getElementById('tocList');
+    const tocHint = document.getElementById('tocHint');
+
+    const pickBtn = document.getElementById('pickBtn');
+    const fileInput = document.getElementById('fileInput');
+    const splash = document.getElementById('splash');
+    const splashPick = document.getElementById('splashPick');
+    const splashClose = document.getElementById('splashClose');
+
+    const bookIdEl = document.getElementById('bookId');
+    const resetProgressBtn = document.getElementById('resetProgressBtn');
+
+    const fontRange = document.getElementById('fontRange');
+    const fontVal = document.getElementById('fontVal');
+    const lhRange = document.getElementById('lhRange');
+    const lhVal = document.getElementById('lhVal');
+    const widthBtn = document.getElementById('widthBtn');
+    const wVal = document.getElementById('wVal');
+    const indentChk = document.getElementById('indentChk');
+    const themeBtn = document.getElementById('themeBtn');
+    const bgColor = document.getElementById('bgColor');
+    const textColor = document.getElementById('textColor');
+
+    const adChk = document.getElementById('adChk');
+    const adRules = document.getElementById('adRules');
+    const restoreAdBtn = document.getElementById('restoreAdBtn');
+    const applyAdBtn = document.getElementById('applyAdBtn');
+
+    const saveChk = document.getElementById('saveChk');
+    const jumpLastBtn = document.getElementById('jumpLastBtn');
+
+    const edgePrev = document.getElementById('edgePrev');
+    const edgeNext = document.getElementById('edgeNext');
+
+    const toast = document.getElementById('toast');
+    function showToast(msg, ms=1400){
+      toast.textContent = msg;
+      toast.classList.add('show');
+      clearTimeout(showToast._t);
+      showToast._t = setTimeout(()=>toast.classList.remove('show'), ms);
+    }
+
+    const DEFAULT_AD_RULES = [
+      '最⊥新⊥小⊥说⊥在⊥⊥⊥首⊥发！',
+      '【记住全网最快小说站'
+    ];
+    const DEFAULT_SETTINGS = {
+      font: 20,
+      lh: 1.9,
+      wide: false,
+      indent: true,
+      theme: 'light',
+      bg: '#ffffff',
+      text: '#111827',
+      adEnabled: true,
+      adRules: DEFAULT_AD_RULES,
+      saveProgress: true
+    };
+    const WIDTH_PRESETS = [
+      { label:'舒适', maxw:'760px' },
+      { label:'更宽', maxw:'980px' }
+    ];
+
+    // Shortcuts
+    const DEFAULT_KEYS = {
+      next: { type:'key', key:'ArrowRight', ctrl:false, alt:false, shift:false, meta:false },
+      prev: { type:'key', key:'ArrowLeft',  ctrl:false, alt:false, shift:false, meta:false },
+      panel:{ type:'key', key:',', ctrl:true, alt:false, shift:false, meta:false }, // Ctrl+,
+      open: { type:'key', key:'o', ctrl:true, alt:false, shift:false, meta:false }, // Ctrl+O
+      // mouse side keys supported as type:'mouse', button:3/4
+      mouseNext: { type:'mouse', button:4 },
+      mousePrev: { type:'mouse', button:3 }
+    };
+
+    function loadJSON(key, fallback){
+      try{
+        const v = JSON.parse(localStorage.getItem(key) || 'null');
+        return v ? { ...fallback, ...v } : { ...fallback };
+      }catch(e){
+        return { ...fallback };
+      }
+    }
+    let settings = loadJSON(SETTINGS_KEY, DEFAULT_SETTINGS);
+
+    // Keys stored separately
+    function loadKeys(){
+      try{
+        const k = JSON.parse(localStorage.getItem(KEYS_KEY) || 'null');
+        return k ? { ...DEFAULT_KEYS, ...k } : { ...DEFAULT_KEYS };
+      }catch(e){
+        return { ...DEFAULT_KEYS };
+      }
+    }
+    let keys = loadKeys();
+
+    function saveSettings(){ localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
+    function saveKeys(){ localStorage.setItem(KEYS_KEY, JSON.stringify(keys)); }
+
+    function progressKey(bookId){ return PROGRESS_PREFIX + bookId; }
+    function loadProgress(bookId){
+      try{ return JSON.parse(localStorage.getItem(progressKey(bookId)) || 'null') || null; }catch(e){ return null; }
+    }
+    function saveProgress(bookId, data){
+      localStorage.setItem(progressKey(bookId), JSON.stringify(data));
+    }
+    function clearProgress(bookId){
+      localStorage.removeItem(progressKey(bookId));
+    }
+
+    // ===== State (paged) =====
+    let current = {
+      bookId: 'none',
+      title: '',
+      rawText: '',
+      chapters: [], // [{name, blocks:[{t:'p', v:string}]}]
+      index: 0,
+      scrollY: 0
+    };
+
+    // ===== Modal logic =====
+    function openPanel(which){
+      overlay.classList.add('show');
+      modal.classList.add('show');
+      setTab(which || 'set');
+    }
+    function closePanel(){
+      overlay.classList.remove('show');
+      modal.classList.remove('show');
+      stopRecording();
+    }
+    function setTab(which){
+      const toc = which==='toc';
+      const set = which==='set';
+      const k = which==='keys';
+      tabToc.classList.toggle('active', toc);
+      tabSet.classList.toggle('active', set);
+      tabKeys.classList.toggle('active', k);
+      panelToc.style.display = toc ? 'block' : 'none';
+      panelSet.style.display = set ? 'block' : 'none';
+      panelKeys.style.display = k ? 'block' : 'none';
+    }
+    overlay.addEventListener('click', closePanel);
+    closeBtn.addEventListener('click', closePanel);
+    tabToc.addEventListener('click', ()=>setTab('toc'));
+    tabSet.addEventListener('click', ()=>setTab('set'));
+    tabKeys.addEventListener('click', ()=>setTab('keys'));
+
+    // ===== Parsing =====
+    function normalizeLine(s){
+      return (s||'').replace(/\ufeff/g,'').replace(/\r/g,'').trim();
+    }
+    function isChapterHeading(line){
+      const s = normalizeLine(line).replace(/　/g,'');
+      return /^第\s*([0-9]+|[零一二三四五六七八九十百千万两]+)\s*章/.test(s) || /^Chapter\s*\d+/i.test(s);
+    }
+    function shouldDropLine(line){
+      if(!settings.adEnabled) return false;
+      const s = normalizeLine(line);
+      if(!s) return false;
+      const rules = settings.adRules || [];
+      for(const r0 of rules){
+        const r = (r0||'').trim();
+        if(!r) continue;
+        if(r.toLowerCase().startsWith('regex:')){
+          const pat = r.slice(6);
+          try{ if(new RegExp(pat).test(s)) return true; }catch(e){}
+        }else{
+          if(s.includes(r)) return true;
+        }
+      }
+      return false;
+    }
+    function extractTitle(text, fallbackName){
+      const lines = (text||'').split('\n');
+      for(const ln of lines){
+        if(shouldDropLine(ln)) continue;
+        const s = normalizeLine(ln);
+        if(s) return s;
+      }
+      return (fallbackName||'小说阅读').replace(/\.txt$/i,'');
+    }
+    function computeBookIdFromFile(file){
+      return 'file:' + [file.name, file.size, file.lastModified].join('|');
+    }
+
+    function parseChapters(text){
+      const lines = (text||'').split('\n');
+      let chapters = [];
+      let cur = null;
+      let lastHeading = null;
+
+      function pushCur(){
+        if(cur && cur.blocks.length){
+          chapters.push(cur);
+        }
+      }
+
+      for(const ln0 of lines){
+        const ln = ln0.replace(/\r/g,'');
+        if(shouldDropLine(ln)) continue;
+        const s = normalizeLine(ln);
+        if(!s) continue;
+
+        if(isChapterHeading(s)){
+          const h = s.replace(/　/g,'').trim();
+          if(h === lastHeading) continue;
+          lastHeading = h;
+          pushCur();
+          cur = { name: h, blocks: [] };
+          continue;
+        }
+
+        if(!cur){
+          // no heading yet -> put into a default chapter
+          cur = { name: '正文', blocks: [] };
+        }
+
+        if(s === '(本章完)' || s === '（本章完）'){
+          cur.blocks.push({ t:'end', v:s });
+          continue;
+        }
+
+        cur.blocks.push({ t:'p', v: s.replace(/^　+/, '').trim() });
+      }
+      pushCur();
+
+      if(!chapters.length){
+        chapters = [{ name:'正文', blocks: [] }];
+      }
+      return chapters;
+    }
+
+    // ===== Render (paged chapter) =====
+    function renderChapter(idx, opt){
+      if(!current.chapters.length){
+        chapterTitle.textContent = '未导入TXT';
+        chapterBody.innerHTML = '<div class="hint">请导入小说 TXT。导入后将按章节分页显示。</div>';
+        return;
+      }
+
+      idx = Math.max(0, Math.min(idx, current.chapters.length - 1));
+      current.index = idx;
+
+      const ch = current.chapters[idx];
+      document.title = (current.title ? current.title + ' - ' : '') + ch.name;
+      chapterTitle.textContent = ch.name;
+
+      // build html
+      let html = '';
+      for(const b of ch.blocks){
+        if(b.t === 'end'){
+          html += '<div class="end">' + escapeHtml(b.v) + '</div>';
+        }else{
+          html += '<p>' + escapeHtml(b.v) + '</p>';
+        }
+      }
+      chapterBody.innerHTML = html || '<div class="hint">（本章无正文）</div>';
+
+      buildTOC();
+      // restore scroll
+      const preserve = opt && opt.scrollY != null ? opt.scrollY : 0;
+      setTimeout(()=>window.scrollTo({ top: preserve, behavior:'auto' }), 0);
+
+      // save chapter progress immediately
+      saveProgressNow();
+      showToast(`第 ${idx+1}/${current.chapters.length} 章`);
+    }
+
+    function escapeHtml(s){
+      return String(s)
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;')
+        .replaceAll("'","&#039;");
+    }
+
+    function buildTOC(){
+      tocList.innerHTML = '';
+      if(!current.chapters.length){
+        tocHint.textContent = '未导入。';
+        return;
+      }
+      tocHint.textContent = `共 ${current.chapters.length} 章。点击跳转。`;
+      const frag = document.createDocumentFragment();
+      current.chapters.forEach((ch, i)=>{
+        const a = document.createElement('a');
+        a.href = '#';
+        a.textContent = ch.name;
+        if(i === current.index) a.classList.add('active');
+        a.addEventListener('click', (e)=>{
+          e.preventDefault();
+          renderChapter(i, { scrollY: 0 });
+          closePanel();
+        });
+        frag.appendChild(a);
+      });
+      tocList.appendChild(frag);
+    }
+
+    function goNext(){
+      if(!current.chapters.length) return;
+      if(current.index >= current.chapters.length - 1){
+        showToast('已经是最后一章');
+        return;
+      }
+      renderChapter(current.index + 1, { scrollY: 0 });
+    }
+    function goPrev(){
+      if(!current.chapters.length) return;
+      if(current.index <= 0){
+        showToast('已经是第一章');
+        return;
+      }
+      renderChapter(current.index - 1, { scrollY: 0 });
+    }
+
+    // Edge click paging (optional, invisible)
+    edgePrev.addEventListener('click', ()=>goPrev());
+    edgeNext.addEventListener('click', ()=>goNext());
+
+    // ===== Settings apply =====
+    function applySettingsToUI(){
+      const r = document.documentElement;
+      r.style.setProperty('--font', (settings.font||20) + 'px');
+      r.style.setProperty('--lh', (settings.lh||1.9));
+      r.style.setProperty('--maxw', settings.wide ? WIDTH_PRESETS[1].maxw : WIDTH_PRESETS[0].maxw);
+
+      document.body.setAttribute('data-theme', settings.theme === 'dark' ? 'dark' : 'light');
+      if(settings.bg) r.style.setProperty('--bg', settings.bg);
+      if(settings.text) r.style.setProperty('--text', settings.text);
+
+      page.classList.toggle('indent', !!settings.indent);
+
+      // controls
+      fontRange.value = settings.font;
+      fontVal.textContent = settings.font;
+      lhRange.value = settings.lh;
+      lhVal.textContent = Number(settings.lh).toFixed(2);
+      wVal.textContent = settings.wide ? WIDTH_PRESETS[1].label : WIDTH_PRESETS[0].label;
+      indentChk.checked = !!settings.indent;
+      themeBtn.textContent = (settings.theme === 'dark') ? '深色' : '浅色';
+      bgColor.value = settings.bg || '#ffffff';
+      textColor.value = settings.text || '#111827';
+
+      adChk.checked = !!settings.adEnabled;
+      adRules.value = (settings.adRules || []).join('\n');
+
+      saveChk.checked = !!settings.saveProgress;
+
+      saveSettings();
+    }
+
+    fontRange.addEventListener('input', ()=>{
+      settings.font = Number(fontRange.value);
+      fontVal.textContent = settings.font;
+      document.documentElement.style.setProperty('--font', settings.font + 'px');
+      saveSettings();
+    });
+
+    lhRange.addEventListener('input', ()=>{
+      settings.lh = Number(lhRange.value);
+      lhVal.textContent = settings.lh.toFixed(2);
+      document.documentElement.style.setProperty('--lh', settings.lh);
+      saveSettings();
+    });
+
+    widthBtn.addEventListener('click', ()=>{
+      settings.wide = !settings.wide;
+      wVal.textContent = settings.wide ? WIDTH_PRESETS[1].label : WIDTH_PRESETS[0].label;
+      document.documentElement.style.setProperty('--maxw', settings.wide ? WIDTH_PRESETS[1].maxw : WIDTH_PRESETS[0].maxw);
+      saveSettings();
+    });
+
+    indentChk.addEventListener('change', ()=>{
+      settings.indent = indentChk.checked;
+      page.classList.toggle('indent', !!settings.indent);
+      saveSettings();
+    });
+
+    themeBtn.addEventListener('click', ()=>{
+      settings.theme = (settings.theme === 'dark') ? 'light' : 'dark';
+      document.body.setAttribute('data-theme', settings.theme);
+      themeBtn.textContent = (settings.theme === 'dark') ? '深色' : '浅色';
+      saveSettings();
+    });
+
+    bgColor.addEventListener('input', ()=>{
+      settings.bg = bgColor.value;
+      document.documentElement.style.setProperty('--bg', settings.bg);
+      saveSettings();
+    });
+    textColor.addEventListener('input', ()=>{
+      settings.text = textColor.value;
+      document.documentElement.style.setProperty('--text', settings.text);
+      saveSettings();
+    });
+
+    adChk.addEventListener('change', ()=>{
+      settings.adEnabled = adChk.checked;
+      saveSettings();
+    });
+
+    restoreAdBtn.addEventListener('click', ()=>{
+      settings.adRules = [...DEFAULT_AD_RULES];
+      adRules.value = settings.adRules.join('\n');
+      saveSettings();
+    });
+
+    applyAdBtn.addEventListener('click', ()=>{
+      const rules = (adRules.value||'').split('\n').map(x=>x.trim()).filter(Boolean);
+      settings.adRules = rules;
+      saveSettings();
+      // re-parse and keep current index if possible
+      if(current.rawText){
+        const prog = loadProgress(current.bookId);
+        current.chapters = parseChapters(current.rawText);
+        const idx = Math.min(current.index, current.chapters.length-1);
+        renderChapter(idx, { scrollY: (prog && prog.scrollY) ? prog.scrollY : 0 });
+      }
+      showToast('已应用屏蔽规则');
+    });
+
+    saveChk.addEventListener('change', ()=>{
+      settings.saveProgress = saveChk.checked;
+      saveSettings();
+    });
+
+    // ===== Import file =====
+    pickBtn.addEventListener('click', ()=>fileInput.click());
+    splashPick.addEventListener('click', ()=>fileInput.click());
+    splashClose.addEventListener('click', ()=>{ splash.style.display='none'; });
+
+    fileInput.addEventListener('change', async (e)=>{
+      const file = e.target.files && e.target.files[0];
+      if(!file) return;
+      try{
+        const text = await file.text();
+        const bid = computeBookIdFromFile(file);
+        current.bookId = bid;
+        current.rawText = text;
+        current.title = extractTitle(text, file.name);
+        current.chapters = parseChapters(text);
+
+        bookIdEl.textContent = current.bookId;
+
+        // restore progress if exists
+        const prog = loadProgress(current.bookId);
+        const idx = prog && typeof prog.index === 'number' ? prog.index : 0;
+        const sy  = prog && typeof prog.scrollY === 'number' ? prog.scrollY : 0;
+
+        renderChapter(idx, { scrollY: sy });
+
+        splash.style.display='none';
+        closePanel();
+      }catch(err){
+        console.error(err);
+        showToast('导入失败：' + (err && err.message ? err.message : '未知错误'), 2200);
+      }finally{
+        fileInput.value = '';
+      }
+    });
+
+    resetProgressBtn.addEventListener('click', ()=>{
+      if(!current.bookId || current.bookId==='none'){
+        showToast('还没有导入书籍');
+        return;
+      }
+      clearProgress(current.bookId);
+      showToast('已清除本书进度');
+    });
+
+    jumpLastBtn.addEventListener('click', ()=>{
+      if(!current.bookId || current.bookId==='none'){
+        showToast('还没有导入书籍');
+        return;
+      }
+      const prog = loadProgress(current.bookId);
+      if(prog){
+        renderChapter(Math.min(prog.index||0, current.chapters.length-1), { scrollY: prog.scrollY||0 });
+        closePanel();
+      }else{
+        showToast('没有找到历史进度');
+      }
+    });
+
+    // Drag & drop
+    const drop = document.getElementById('drop');
+    function isTxtFile(f){
+      const name = (f && f.name || '').toLowerCase();
+      return name.endsWith('.txt') || (f && f.type === 'text/plain');
+    }
+    window.addEventListener('dragenter', (e)=>{ e.preventDefault(); drop.classList.add('show'); });
+    window.addEventListener('dragover', (e)=>{ e.preventDefault(); });
+    window.addEventListener('dragleave', (e)=>{ if(e.relatedTarget===null) drop.classList.remove('show'); });
+    window.addEventListener('drop', async (e)=>{
+      e.preventDefault();
+      drop.classList.remove('show');
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if(f && isTxtFile(f)){
+        // emulate file input
+        try{
+          const text = await f.text();
+          current.bookId = computeBookIdFromFile(f);
+          current.rawText = text;
+          current.title = extractTitle(text, f.name);
+          current.chapters = parseChapters(text);
+          bookIdEl.textContent = current.bookId;
+
+          const prog = loadProgress(current.bookId);
+          const idx = prog && typeof prog.index === 'number' ? prog.index : 0;
+          const sy  = prog && typeof prog.scrollY === 'number' ? prog.scrollY : 0;
+          renderChapter(idx, { scrollY: sy });
+          splash.style.display='none';
+          closePanel();
+        }catch(err){
+          console.error(err);
+          showToast('拖拽导入失败', 1800);
+        }
+      }
+    });
+
+    // ===== Auto save progress =====
+    let scrollTimer = null;
+    function getSnapshot(){
+      return { t: Date.now(), index: current.index, scrollY: window.scrollY || 0 };
+    }
+    function saveProgressNow(){
+      if(!settings.saveProgress) return;
+      if(!current.bookId || current.bookId==='none') return;
+      saveProgress(current.bookId, getSnapshot());
+    }
+    function saveProgressThrottled(){
+      if(!settings.saveProgress) return;
+      if(!current.bookId || current.bookId==='none') return;
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(()=>saveProgressNow(), 500);
+    }
+    window.addEventListener('scroll', saveProgressThrottled, { passive:true });
+    window.addEventListener('beforeunload', ()=>{ try{ saveProgressNow(); }catch(e){} });
+
+    // ===== Shortcut matching =====
+    function normKey(k){
+      if(!k) return '';
+      // For printable keys we store lower-case
+      if(k.length===1) return k.toLowerCase();
+      return k;
+    }
+    function matchKey(evt, sc){
+      if(!sc || sc.type!=='key') return false;
+      const k = normKey(sc.key);
+      const ek = normKey(evt.key);
+      return k===ek &&
+        !!sc.ctrl === !!evt.ctrlKey &&
+        !!sc.alt === !!evt.altKey &&
+        !!sc.shift === !!evt.shiftKey &&
+        !!sc.meta === !!evt.metaKey;
+    }
+    function keyText(sc){
+      if(!sc) return '';
+      if(sc.type==='mouse'){
+        return sc.button===3 ? 'MouseBack(侧键后退)' : (sc.button===4 ? 'MouseForward(侧键前进)' : 'MouseButton'+sc.button);
+      }
+      const parts=[];
+      if(sc.ctrl) parts.push('Ctrl');
+      if(sc.meta) parts.push('Cmd');
+      if(sc.alt) parts.push('Alt');
+      if(sc.shift) parts.push('Shift');
+      parts.push(sc.key.length===1 ? sc.key.toUpperCase() : sc.key);
+      return parts.join('+');
+    }
+
+    // ===== Recording shortcuts =====
+    const nextKeyTxt = document.getElementById('nextKeyTxt');
+    const prevKeyTxt = document.getElementById('prevKeyTxt');
+    const panelKeyTxt = document.getElementById('panelKeyTxt');
+    const openKeyTxt = document.getElementById('openKeyTxt');
+
+    const recNextBtn = document.getElementById('recNextBtn');
+    const recPrevBtn = document.getElementById('recPrevBtn');
+    const recPanelBtn = document.getElementById('recPanelBtn');
+    const recOpenBtn = document.getElementById('recOpenBtn');
+    const resetKeysBtn = document.getElementById('resetKeysBtn');
+
+    let recording = null; // 'next' | 'prev' | 'panel' | 'open'
+
+    function refreshKeyUI(){
+      nextKeyTxt.textContent  = keyText(keys.next) + ' / ' + keyText(keys.mouseNext);
+      prevKeyTxt.textContent  = keyText(keys.prev) + ' / ' + keyText(keys.mousePrev);
+      panelKeyTxt.textContent = keyText(keys.panel) + '（打开面板）';
+      openKeyTxt.textContent  = keyText(keys.open)  + '（选择TXT）';
+    }
+    function startRecording(which){
+      recording = which;
+      showToast('录制中：请按键（或按鼠标侧键）…', 2000);
+    }
+    function stopRecording(){
+      recording = null;
+    }
+
+    recNextBtn.addEventListener('click', ()=>startRecording('next'));
+    recPrevBtn.addEventListener('click', ()=>startRecording('prev'));
+    recPanelBtn.addEventListener('click', ()=>startRecording('panel'));
+    recOpenBtn.addEventListener('click', ()=>startRecording('open'));
+    resetKeysBtn.addEventListener('click', ()=>{
+      keys = { ...DEFAULT_KEYS };
+      saveKeys();
+      refreshKeyUI();
+      showToast('已恢复默认快捷键');
+    });
+
+    window.addEventListener('keydown', (e)=>{
+      // Recording first
+      if(recording){
+        // avoid capturing modifier-only
+        if(['Control','Shift','Alt','Meta'].includes(e.key)) return;
+        const sc = { type:'key', key: normKey(e.key), ctrl:e.ctrlKey, alt:e.altKey, shift:e.shiftKey, meta:e.metaKey };
+        keys[recording] = sc;
+        saveKeys();
+        refreshKeyUI();
+        stopRecording();
+        showToast('已保存：' + keyText(sc));
+        e.preventDefault();
+        return;
+      }
+
+      // Normal shortcuts
+      if(matchKey(e, keys.panel)){
+        openPanel('set');
+        e.preventDefault();
+        return;
+      }
+      if(matchKey(e, keys.open)){
+        openPanel('set');
+        fileInput.click();
+        e.preventDefault();
+        return;
+      }
+      if(matchKey(e, keys.next)){
+        goNext();
+        e.preventDefault();
+        return;
+      }
+      if(matchKey(e, keys.prev)){
+        goPrev();
+        e.preventDefault();
+        return;
+      }
+      if(e.key === 'Escape'){
+        closePanel();
+        return;
+      }
+    });
+
+    // Mouse side keys: attempt to intercept (may not always override browser history)
+    function handleMouseSide(e){
+      if(recording){
+        if(e.button===3 || e.button===4){
+          const sc = { type:'mouse', button:e.button };
+          if(recording==='next') keys.mouseNext = sc;
+          else if(recording==='prev') keys.mousePrev = sc;
+          else if(recording==='panel'){ /* ignore for panel */ }
+          else if(recording==='open'){ /* ignore */ }
+          saveKeys();
+          refreshKeyUI();
+          stopRecording();
+          showToast('已保存：' + keyText(sc));
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        return;
+      }
+
+      if(e.button===3){
+        goPrev();
+        e.preventDefault();
+        e.stopPropagation();
+      }else if(e.button===4){
+        goNext();
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }
+    window.addEventListener('mousedown', (e)=>{ if(e.button===3||e.button===4) handleMouseSide(e); }, { capture:true });
+    window.addEventListener('mouseup', (e)=>{ if(e.button===3||e.button===4) handleMouseSide(e); }, { capture:true });
+
+    // ===== Boot =====
+    function boot(){
+      applySettingsToUI();
+      refreshKeyUI();
+      // preload UI texts
+      fontVal.textContent = settings.font;
+      lhVal.textContent = Number(settings.lh).toFixed(2);
+      wVal.textContent = settings.wide ? WIDTH_PRESETS[1].label : WIDTH_PRESETS[0].label;
+
+      // open panel once to guide
+      openPanel('set');
+    }
+    boot();
+  })();
+  </script>
+</body>
+</html>
