@@ -1,0 +1,1398 @@
+// ==UserScript==
+// @name         SN 列表搜索与导入自动助手 v3.0.2
+// @namespace    https://chat.openai.com/sn-tools
+// @version      3.0.2
+// @description  Snov.io 左侧列表搜索定位并点击；页面自动检测并执行验证邮箱、从文件导入、上传文件、下一步、导入、返回后验证。
+// @match        https://app.snov.io/prospects*
+// @grant        GM_setClipboard
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /**********************************************************************
+   * SN 列表搜索与导入自动助手 v3.0.2
+   *
+   * 版本说明：
+   * 1. 面板只保留搜索控件：搜索框 + 搜索按钮。
+   * 2. 搜索逻辑：输入关键词后按 Enter 或点击搜索按钮；
+   *    匹配最后一个列表项，滚动到视觉中心，高亮，并自动点击一次列表项。
+   * 3. 自动点击逻辑无按钮：
+   *    - 脚本加载后自动等待页面稳定。
+   *    - 如果检测到主列表页，先检查“验证邮箱地址”是否可点击；
+   *      可点击则点击，并点击弹窗“验证”。
+   *    - 如果检测到正在验证，则等待验证状态结束。
+   *    - 然后自动点击“添加潜在客户” → “从文件导入”。
+   *    - 文件选择由人工完成。
+   *    - 脚本检测到弹窗从“选择文件”状态变为“上传文件”状态后，自动点击“上传文件”。
+   *    - 进入导入页面后，自动点击“下一步”，再点击“导入”。
+   *    - 返回主列表页后，再次检测“验证邮箱地址”，可点击则自动验证。
+   * 4. 为避免同一列表无限重复导入，每次“搜索并点击列表”会开启一轮新自动流程；
+   *    脚本首次加载也会对当前列表开启一轮自动流程。
+   * 5. 日志只显示在面板内，不依赖控制台。
+   *
+   * 注意：
+   * - 浏览器安全机制不允许脚本直接选择本地文件，所以选择文件必须人工完成。
+   * - 本脚本不会删除、重命名、移动列表。
+   **********************************************************************/
+
+  const APP = {
+    version: '3.0.2',
+    panelId: 'sn-auto-import-panel',
+    highlightClass: 'sn-auto-import-highlight',
+    storageKey: 'SN_AUTO_IMPORT_STATE_V3',
+    tickMs: 1200,
+    state: {
+      locked: false,
+      closed: false,
+      lastActionAt: 0,
+      lastAutoOpenAt: 0,
+      lastUploadClickAt: 0,
+      lastNextClickAt: 0,
+      lastImportClickAt: 0,
+      lastVerifyClickAt: 0,
+    },
+  };
+
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+  function nowTime() {
+    const d = new Date();
+    return [
+      String(d.getHours()).padStart(2, '0'),
+      String(d.getMinutes()).padStart(2, '0'),
+      String(d.getSeconds()).padStart(2, '0'),
+    ].join(':');
+  }
+
+  function qs(selector, root = document) {
+    try { return root.querySelector(selector); } catch { return null; }
+  }
+
+  function qsa(selector, root = document) {
+    try { return Array.from(root.querySelectorAll(selector)); } catch { return []; }
+  }
+
+  function textOf(el) {
+    if (!el) return '';
+    return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function valueOfInput(el) {
+    if (!el) return '';
+    if ('value' in el && typeof el.value === 'string') return el.value.trim();
+    return '';
+  }
+
+  function normalize(s) {
+    return String(s || '')
+      .toLowerCase()
+      .replace(/\s+/g, '')
+      .replace(/[._\-—–·•，,。/\\|()[\]{}【】"'“”‘’:：;；]/g, '');
+  }
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      style.opacity !== '0';
+  }
+
+  function isDisabledLike(el) {
+    if (!el) return true;
+    const cls = String(el.className || '');
+    const ariaDisabled = el.getAttribute('aria-disabled');
+    return Boolean(
+      el.disabled ||
+      ariaDisabled === 'true' ||
+      cls.includes('disabled') ||
+      cls.includes('snv-btn--disabled') ||
+      cls.includes('n-button--disabled') ||
+      el.getAttribute('disabled') !== null
+    );
+  }
+
+  function isClickable(el) {
+    if (!isVisible(el) || isDisabledLike(el)) return false;
+    const rect = el.getBoundingClientRect();
+    const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    const topEl = document.elementFromPoint(x, y);
+    return Boolean(topEl && (topEl === el || el.contains(topEl) || topEl.contains(el)));
+  }
+
+  function cssPath(el) {
+    if (!el || !el.nodeType || el.nodeType !== 1) return '';
+    const parts = [];
+    let cur = el;
+
+    while (cur && cur.nodeType === 1 && cur !== document.body && cur !== document.documentElement) {
+      let part = cur.tagName.toLowerCase();
+
+      if (cur.id) {
+        part += '#' + CSS.escape(cur.id);
+        parts.unshift(part);
+        break;
+      }
+
+      const cls = Array.from(cur.classList || [])
+        .filter(Boolean)
+        .slice(0, 3)
+        .map(c => '.' + CSS.escape(c))
+        .join('');
+
+      if (cls) part += cls;
+
+      const parent = cur.parentElement;
+      if (parent) {
+        const sameTag = Array.from(parent.children).filter(x => x.tagName === cur.tagName);
+        if (sameTag.length > 1) part += `:nth-of-type(${sameTag.indexOf(cur) + 1})`;
+      }
+
+      parts.unshift(part);
+      cur = cur.parentElement;
+      if (parts.length > 7) break;
+    }
+
+    return parts.join(' > ');
+  }
+
+  function fireMouse(el, type) {
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+
+    /*
+     * v3.0.2 修复：
+     * Tampermonkey 沙盒环境里，MouseEventInit.view 传 window 可能会被浏览器判定
+     * 不是页面真实 Window，从而报错：
+     * Failed to construct 'MouseEvent': Failed to read the 'view' property...
+     *
+     * 这里不再传 view 字段，让浏览器使用默认上下文。
+     */
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    });
+    el.dispatchEvent(event);
+  }
+
+  async function safeClick(el, label = '元素') {
+    if (!el) throw new Error(`未找到${label}`);
+    if (!isVisible(el)) throw new Error(`${label}不可见`);
+    if (isDisabledLike(el)) throw new Error(`${label}处于禁用状态`);
+
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    await sleep(150);
+
+    fireMouse(el, 'mouseover');
+    fireMouse(el, 'mouseenter');
+    fireMouse(el, 'mousemove');
+    fireMouse(el, 'mousedown');
+    fireMouse(el, 'mouseup');
+    el.click();
+
+    await sleep(300);
+  }
+
+  function log(message, type = 'info') {
+    const box = qs('#snai-log');
+    if (!box) return;
+
+    const line = document.createElement('div');
+    line.className = `snai-log-line snai-log-${type}`;
+    line.textContent = `[${nowTime()}] ${message}`;
+    box.appendChild(line);
+
+    const maxLines = 280;
+    while (box.children.length > maxLines) {
+      box.removeChild(box.firstChild);
+    }
+
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function setStatus(message) {
+    const el = qs('#snai-status');
+    if (el) el.textContent = message;
+  }
+
+  function readCycle() {
+    try {
+      const raw = sessionStorage.getItem(APP.storageKey);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  function writeCycle(cycle) {
+    sessionStorage.setItem(APP.storageKey, JSON.stringify(cycle));
+  }
+
+  function createCycle(reason, listName = '') {
+    const title = getCurrentListTitle();
+    const key = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const cycle = {
+      key,
+      reason,
+      listName: listName || title || '',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      verifyBeforeImportDone: false,
+      importDialogOpened: false,
+      uploadClicked: false,
+      nextClicked: false,
+      importClicked: false,
+      verifyAfterImportDone: false,
+      completed: false,
+      waitingFileSince: 0,
+    };
+    writeCycle(cycle);
+    log(`已开启自动流程：${cycle.listName || reason}`, 'ok');
+    return cycle;
+  }
+
+  function patchCycle(patch) {
+    const cycle = readCycle() || createCycle('auto_bootstrap');
+    const next = {
+      ...cycle,
+      ...patch,
+      updatedAt: Date.now(),
+    };
+    writeCycle(next);
+    return next;
+  }
+
+  function ensureCycle() {
+    let cycle = readCycle();
+    if (!cycle || cycle.completed) {
+      cycle = createCycle('page_load');
+    }
+    return cycle;
+  }
+
+  function markCycleDone(reason) {
+    const cycle = patchCycle({
+      completed: true,
+      completedAt: Date.now(),
+      doneReason: reason || '',
+    });
+    log(`本轮自动流程结束：${cycle.listName || cycle.reason}`, 'ok');
+  }
+
+  function getCurrentListTitle() {
+    const candidates = [
+      'h1',
+      '[data-test*="title"]',
+      '.prospects-list-title',
+      '.page-title',
+      '.title',
+    ];
+
+    for (const sel of candidates) {
+      const nodes = qsa(sel).filter(isVisible);
+      for (const el of nodes) {
+        const t = textOf(el);
+        if (t && t.length <= 80 && !/SN|Snov|导入潜在客户/.test(t)) {
+          return t;
+        }
+      }
+    }
+
+    const bodyText = textOf(document.body);
+    const lines = bodyText.split(/\s{2,}|\n/).map(x => x.trim()).filter(Boolean);
+    const likely = lines.find(x => x.length > 2 && x.length < 60 && /岗位|采购|高管|包装|珠宝|美妆|鞋服|酒水|设计/.test(x));
+    return likely || document.title || '';
+  }
+
+  function looksLikeImportWizardPage() {
+    const text = textOf(document.body);
+    return /导入潜在客户|字段映射|数据设置|拖放 字段|跳过第一行|重复设置|选择 要添加潜在客户的列表/.test(text) ||
+      /import/i.test(location.href) && /prospect|lead/i.test(location.href);
+  }
+
+  function looksLikeMainProspectsPage() {
+    const text = textOf(document.body);
+    if (looksLikeImportWizardPage()) return false;
+    return Boolean(
+      findVerifyEmailButton() ||
+      findAddProspectButton() ||
+      /添加潜在客户|验证邮箱地址|发送 营销邮件|潜在客户\(\d+\)|导入 状态/.test(text)
+    );
+  }
+
+  function getAllCandidateListItems() {
+    const selectors = [
+      '.item.item--editable.item--folder',
+      '.item.item--folder',
+      '.item--folder',
+      '.item',
+    ];
+
+    const seen = new Set();
+    const items = [];
+
+    for (const sel of selectors) {
+      for (const el of qsa(sel)) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+
+        const nameNode = qs('.item__name', el);
+        const visibleName = textOf(nameNode);
+        const inputValue = valueOfInput(qs('input', el));
+        const name = visibleName || inputValue || textOf(el);
+
+        if (!name) continue;
+
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) continue;
+
+        items.push({
+          el,
+          nameNode,
+          name,
+          visibleName,
+          inputValue,
+          selector: cssPath(el),
+        });
+      }
+    }
+
+    return items;
+  }
+
+  function findScrollableAncestors(el) {
+    const arr = [];
+    let cur = el ? el.parentElement : null;
+
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      const st = getComputedStyle(cur);
+      const overflowY = st.overflowY;
+      const canScroll = cur.scrollHeight > cur.clientHeight + 5;
+
+      if (canScroll || ['auto', 'scroll', 'overlay'].includes(overflowY)) {
+        arr.push({
+          el: cur,
+          scrollHeight: cur.scrollHeight,
+          clientHeight: cur.clientHeight,
+          scrollTop: cur.scrollTop,
+          overflowY,
+          rect: cur.getBoundingClientRect(),
+          selector: cssPath(cur),
+        });
+      }
+
+      cur = cur.parentElement;
+    }
+
+    return arr;
+  }
+
+  function findLeftListScrollContainer(itemEl = null) {
+    const items = getAllCandidateListItems().filter(x => isVisible(x.el));
+    const target = itemEl || (items[0] && items[0].el);
+
+    if (target) {
+      const ancestors = findScrollableAncestors(target)
+        .filter(x => x.rect.left < window.innerWidth * 0.45)
+        .sort((a, b) => {
+          const aw = Math.abs(a.rect.width - 320);
+          const bw = Math.abs(b.rect.width - 320);
+          const ah = b.scrollHeight - b.clientHeight;
+          const bh = a.scrollHeight - a.clientHeight;
+          return aw - bw || ah - bh;
+        });
+
+      if (ancestors[0]) return ancestors[0].el;
+    }
+
+    const all = Array.from(document.querySelectorAll('div, aside, nav, section'));
+    const candidates = all.map(el => {
+      const rect = el.getBoundingClientRect();
+      const itemCount = qsa('.item__name, .item--folder, .item', el).length;
+
+      return {
+        el,
+        rect,
+        canScroll: el.scrollHeight > el.clientHeight + 5,
+        itemCount,
+        score:
+          (rect.left < window.innerWidth * 0.35 ? 20 : 0) +
+          (el.scrollHeight > el.clientHeight + 5 ? 30 : 0) +
+          Math.min(itemCount, 40) +
+          (rect.height > 300 ? 10 : 0) -
+          Math.abs(rect.width - 320) / 20,
+      };
+    }).filter(c =>
+      c.rect.width > 120 &&
+      c.rect.width < 540 &&
+      c.rect.height > 200 &&
+      c.itemCount > 2 &&
+      c.rect.left < window.innerWidth * 0.45
+    ).sort((a, b) => b.score - a.score);
+
+    return candidates[0] ? candidates[0].el : null;
+  }
+
+  function highlight(el) {
+    qsa('.' + APP.highlightClass).forEach(x => x.classList.remove(APP.highlightClass));
+    if (el) el.classList.add(APP.highlightClass);
+  }
+
+  function searchLastMatch(keywordRaw) {
+    const keyword = normalize(keywordRaw);
+    if (!keyword) return { keyword, matches: [], last: null };
+
+    const items = getAllCandidateListItems();
+    const matches = items.filter(item => {
+      const visibleText = normalize(item.visibleName);
+      const inputText = normalize(item.inputValue);
+      const fullText = normalize(item.name);
+
+      return visibleText.includes(keyword) || inputText.includes(keyword) || fullText.includes(keyword);
+    });
+
+    return {
+      keyword,
+      matches,
+      last: matches.length ? matches[matches.length - 1] : null,
+    };
+  }
+
+  async function centerItemInLeftContainer(item) {
+    if (!item || !item.el) throw new Error('没有匹配项可定位');
+
+    const container = findLeftListScrollContainer(item.el);
+
+    if (!container) {
+      item.el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+      await sleep(500);
+      return {
+        container: null,
+        centered: true,
+      };
+    }
+
+    const beforeTop = container.scrollTop;
+    const itemRect = item.el.getBoundingClientRect();
+    const conRect = container.getBoundingClientRect();
+    const targetTop = container.scrollTop + (itemRect.top - conRect.top) - (conRect.height / 2) + (itemRect.height / 2);
+
+    container.scrollTo({
+      top: Math.max(0, targetTop),
+      behavior: 'smooth',
+    });
+
+    await sleep(650);
+
+    const afterTop = container.scrollTop;
+    const newItemRect = item.el.getBoundingClientRect();
+    const newConRect = container.getBoundingClientRect();
+    const itemCenter = newItemRect.top + newItemRect.height / 2;
+    const conCenter = newConRect.top + newConRect.height / 2;
+    const centered = Math.abs(itemCenter - conCenter) < Math.max(40, newConRect.height * 0.2);
+
+    return {
+      container,
+      beforeTop,
+      afterTop,
+      centered,
+      itemCenter,
+      conCenter,
+      containerSelector: cssPath(container),
+    };
+  }
+
+  function getListClickTarget(item) {
+    if (!item || !item.el) return null;
+
+    const actionArea = qs('.item__actions, .app-dropdown, .add-list__btn', item.el);
+    const nameNode = item.nameNode || qs('.item__name', item.el);
+
+    if (nameNode && isVisible(nameNode)) return nameNode;
+
+    const arrowOrIcon = qs('.item__icon, .item__arrow', item.el);
+    if (arrowOrIcon && isVisible(arrowOrIcon)) return arrowOrIcon;
+
+    if (actionArea && actionArea.contains(item.el)) return item.el;
+
+    return item.el;
+  }
+
+  async function doSearchCenterAndClick() {
+    const input = qs('#snai-keyword');
+    const keyword = input ? input.value.trim() : '';
+
+    if (!keyword) {
+      log('请输入搜索关键词。', 'warn');
+      setStatus('缺少关键词');
+      return;
+    }
+
+    setStatus('搜索中...');
+    const result = searchLastMatch(keyword);
+
+    log(`搜索关键词：${keyword}`);
+    log(`匹配数量：${result.matches.length}`);
+
+    if (!result.last) {
+      log(`未找到匹配项：${keyword}`, 'warn');
+      setStatus('无匹配');
+      return;
+    }
+
+    log(`取最后一个匹配项：${result.last.name}`, 'ok');
+    log(`全部匹配项：${result.matches.map(x => x.name).join(' ｜ ')}`);
+
+    const info = await centerItemInLeftContainer(result.last);
+    highlight(result.last.el);
+
+    if (info.container) {
+      log(`已滚动到视觉中心；容器=${info.containerSelector}；是否居中=${info.centered ? '是' : '否'}`);
+    } else {
+      log('未识别内部滚动容器，已使用 scrollIntoView 定位。', 'warn');
+    }
+
+    await sleep(250);
+
+    const clickTarget = getListClickTarget(result.last);
+    log(`自动点击列表项：${result.last.name}`);
+    await safeClick(clickTarget, `列表项 ${result.last.name}`);
+
+    createCycle('search_click', result.last.name);
+    setStatus(`已点击：${result.last.name}`);
+
+    await waitForPageStable({ timeout: 20000, stableMs: 900, label: '列表切换后页面' });
+  }
+
+  function getVisibleButtonByTexts(texts, root = document) {
+    const arr = qsa('button, [role="button"], a, .snv-btn, .n-button, .btn', root);
+
+    return arr.find(el => {
+      const t = textOf(el);
+      return isVisible(el) && texts.some(x => t.includes(x));
+    }) || null;
+  }
+
+  function findVerifyEmailButton() {
+    const byData = qs('[data-test="prospects-verify-current-list"]');
+    if (byData) return byData;
+
+    return getVisibleButtonByTexts(['验证邮箱地址', 'Verify email', 'Verify emails']);
+  }
+
+  function findModalRoot() {
+    const roots = qsa('[role="dialog"], .modal, .app-modal, .snv-modal, .n-modal, .vfm__content, .v-overlay, .popup, .dialog')
+      .filter(isVisible);
+
+    if (roots.length) {
+      return roots.sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (br.width * br.height) - (ar.width * ar.height);
+      })[0];
+    }
+
+    const visibleButtons = qsa('button').filter(b => isVisible(b) && /验证|上传文件|选择文件/.test(textOf(b)));
+    if (visibleButtons.length) {
+      let cur = visibleButtons[0].parentElement;
+      for (let i = 0; cur && i < 8; i++, cur = cur.parentElement) {
+        const r = cur.getBoundingClientRect();
+        if (r.width > 250 && r.height > 160) return cur;
+      }
+    }
+
+    return document;
+  }
+
+  function findConfirmVerifyButton() {
+    const root = findModalRoot();
+    const buttons = qsa('button, [role="button"], .snv-btn, .n-button', root)
+      .filter(isVisible)
+      .filter(el => !isDisabledLike(el));
+
+    const exact = buttons.find(b => ['验证', 'Verify'].includes(textOf(b)));
+    if (exact) return exact;
+
+    return buttons.find(b => /验证|Verify/i.test(textOf(b))) || null;
+  }
+
+  function detectVerificationRunning() {
+    /*
+     * 只识别真正的“正在验证”状态。
+     * v3.0.0 的范围过宽，会把整个页面里的“验证邮箱地址”按钮、
+     * 空列表提示、通知弹窗等误判成“邮箱验证中”。
+     */
+    const blocks = qsa('.check-verification-block')
+      .filter(isVisible)
+      .filter(el => /正在验证|正在搜索|verifying|searching/i.test(textOf(el)));
+
+    const loadingUseBlocks = qsa('svg use[xlink\\:href*="loading_icon__animated"], svg use[href*="loading_icon__animated"]')
+      .map(use => use.closest('.check-verification-block') || use.closest('[class*="verification"]') || use.closest('[class*="check"]') || use.closest('div'))
+      .filter(Boolean)
+      .filter(isVisible)
+      .filter(el => /正在验证|正在搜索|verifying|searching/i.test(textOf(el)));
+
+    const texts = [...new Set([...blocks, ...loadingUseBlocks].map(textOf).filter(Boolean))].slice(0, 5);
+
+    return {
+      running: texts.length > 0,
+      count: texts.length,
+      texts,
+    };
+  }
+
+  async function waitForPageStable(options = {}) {
+    const {
+      timeout = 20000,
+      stableMs = 900,
+      label = '页面',
+    } = options;
+
+    const start = Date.now();
+    let lastSig = '';
+    let lastChange = Date.now();
+
+    while (Date.now() - start < timeout) {
+      const bodyText = document.body ? document.body.innerText : '';
+      const sig = [
+        document.readyState,
+        location.href,
+        bodyText.length,
+        qsa('button').length,
+        qsa('.refresh-img, [class*="loading"], [class*="spinner"], [class*="skeleton"], svg use[href*="loading"], svg use[xlink\\:href*="loading"]').length,
+      ].join('|');
+
+      if (sig !== lastSig) {
+        lastSig = sig;
+        lastChange = Date.now();
+      }
+
+      if (document.readyState === 'complete' && Date.now() - lastChange >= stableMs) {
+        log(`${label}已稳定。`);
+        return true;
+      }
+
+      await sleep(250);
+    }
+
+    log(`${label}等待稳定超时，继续尝试。`, 'warn');
+    return false;
+  }
+
+  function hasBlockingModal() {
+    const roots = qsa('[role="dialog"], .modal, .app-modal, .snv-modal, .n-modal, .vfm__content, .v-overlay, .popup, .dialog')
+      .filter(isVisible);
+
+    return roots.some(root => {
+      const t = textOf(root);
+      if (/从文件导入|拖放 文件即可上传|选择文件|上传文件|准备验证|准备验证 .*邮箱地址|验证$/.test(t)) return false;
+      if (/确定|取消|无法访问|不属于您帐户|错误|失败/.test(t)) return true;
+      return false;
+    });
+  }
+
+  async function waitForMainPageReady(timeout = 30000) {
+    /*
+     * 等“基础页面可操作”，不是只看 document.readyState。
+     * 判断标准：
+     * - 不在导入向导页；
+     * - 找到“添加潜在客户”或“验证邮箱地址”其中之一；
+     * - 如果正在验证，则由后续验证等待逻辑接管；
+     * - 如果有错误/无法访问弹窗，先不误点。
+     */
+    const start = Date.now();
+    let lastLogAt = 0;
+
+    while (Date.now() - start < timeout) {
+      await waitForPageStable({ timeout: 5000, stableMs: 700, label: '主页面' });
+
+      if (hasBlockingModal()) {
+        if (Date.now() - lastLogAt > 5000) {
+          log('检测到可能阻挡操作的弹窗，请人工关闭后脚本会继续。', 'warn');
+          lastLogAt = Date.now();
+        }
+        await sleep(1000);
+        continue;
+      }
+
+      if (!looksLikeImportWizardPage() && (findAddProspectButton() || findVerifyEmailButton() || detectVerificationRunning().running)) {
+        return true;
+      }
+
+      if (Date.now() - lastLogAt > 5000) {
+        log('等待主页面关键按钮出现：添加潜在客户 / 验证邮箱地址。', 'warn');
+        lastLogAt = Date.now();
+      }
+
+      await sleep(800);
+    }
+
+    log('等待主页面可操作超时，继续按当前页面尝试。', 'warn');
+    return false;
+  }
+
+  async function clickVerifyIfClickable(stage) {
+    const running = detectVerificationRunning();
+
+    if (running.running) {
+      log(`检测到邮箱正在验证：${running.texts.join(' ｜ ') || '验证中'}`, 'warn');
+      setStatus('等待验证完成');
+      return 'running';
+    }
+
+    const btn = findVerifyEmailButton();
+
+    if (!btn) {
+      return 'not_found';
+    }
+
+    const disabled = isDisabledLike(btn);
+    const visible = isVisible(btn);
+    const clickable = isClickable(btn);
+
+    log(`检测验证按钮：可见=${visible ? '是' : '否'}；禁用=${disabled ? '是' : '否'}；可点击=${clickable ? '是' : '否'}；阶段=${stage}`);
+
+    if (!visible || disabled) {
+      return 'disabled';
+    }
+
+    await safeClick(btn, '验证邮箱地址按钮');
+    log('已点击“验证邮箱地址”。', 'ok');
+
+    await sleep(600);
+    await waitForPageStable({ timeout: 8000, stableMs: 500, label: '验证弹窗' });
+
+    const confirmBtn = findConfirmVerifyButton();
+
+    if (!confirmBtn) {
+      log('未找到弹窗里的“验证”按钮。', 'err');
+      return 'confirm_not_found';
+    }
+
+    await safeClick(confirmBtn, '弹窗验证按钮');
+    log('已点击弹窗“验证”。', 'ok');
+
+    APP.state.lastVerifyClickAt = Date.now();
+    await sleep(900);
+
+    return 'clicked';
+  }
+
+  async function waitVerificationFinish(maxMs = 5 * 60 * 1000) {
+    const start = Date.now();
+    let logged = false;
+
+    while (Date.now() - start < maxMs) {
+      const running = detectVerificationRunning();
+
+      if (!running.running) {
+        if (logged) log('验证状态已结束。', 'ok');
+        return true;
+      }
+
+      if (!logged) {
+        log(`等待邮箱验证完成：${running.texts.join(' ｜ ') || '验证中'}`, 'warn');
+        logged = true;
+      }
+
+      setStatus('邮箱验证中...');
+      await sleep(3000);
+    }
+
+    log('等待邮箱验证完成超时，本轮停止，避免误操作。', 'err');
+    return false;
+  }
+
+  function findAddProspectButton() {
+    const btns = qsa('button, [role="button"], .snv-btn, .n-button, a').filter(isVisible);
+
+    return btns.find(el => /添加潜在客户|Add prospects|Add prospect/i.test(textOf(el))) || null;
+  }
+
+  function findFileImportOption() {
+    const candidates = qsa('button, [role="button"], a, li, div, span')
+      .filter(isVisible)
+      .filter(el => {
+        const t = textOf(el);
+        return /从文件导入|文件导入|Import from file|From file/i.test(t);
+      });
+
+    candidates.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      return (ar.width * ar.height) - (br.width * br.height);
+    });
+
+    return candidates[0] || null;
+  }
+
+  function isFileImportModalOpen() {
+    const root = findModalRoot();
+    const t = textOf(root);
+
+    return /从文件导入|拖放 文件即可上传|选择文件|上传文件|Excel、CSV 或 TXT|Excel, CSV|TXT 文件/.test(t);
+  }
+
+  function findUploadFileButton() {
+    const root = findModalRoot();
+
+    const btns = qsa('button, [role="button"], .snv-btn, .n-button', root)
+      .filter(isVisible)
+      .filter(el => /上传文件|Upload file|Upload/i.test(textOf(el)));
+
+    const enabled = btns.find(el => !isDisabledLike(el));
+    return enabled || btns[0] || null;
+  }
+
+  function modalHasSelectedFile() {
+    const root = findModalRoot();
+    const t = textOf(root);
+
+    return Boolean(
+      /上传文件|删除/.test(t) &&
+      /\.(xlsx|xls|csv|txt)\b/i.test(t)
+    );
+  }
+
+  async function openImportDialogIfNeeded() {
+    if (isFileImportModalOpen()) {
+      log('文件导入弹窗已打开，等待人工选择文件。');
+      return true;
+    }
+
+    if (Date.now() - APP.state.lastAutoOpenAt < 4500) {
+      return false;
+    }
+
+    const addBtn = findAddProspectButton();
+
+    if (!addBtn || !isVisible(addBtn) || isDisabledLike(addBtn)) {
+      log('未找到可点击的“添加潜在客户”按钮，暂不打开导入。', 'warn');
+      return false;
+    }
+
+    APP.state.lastAutoOpenAt = Date.now();
+
+    await safeClick(addBtn, '添加潜在客户按钮');
+    log('已点击“添加潜在客户”。', 'ok');
+
+    await sleep(500);
+
+    const option = findFileImportOption();
+
+    if (!option) {
+      log('未找到“从文件导入”选项。', 'err');
+      return false;
+    }
+
+    await safeClick(option, '从文件导入选项');
+    log('已点击“从文件导入”。请人工选择文件。', 'ok');
+
+    patchCycle({
+      importDialogOpened: true,
+      waitingFileSince: Date.now(),
+    });
+
+    return true;
+  }
+
+  async function handleFileImportModal(cycle) {
+    if (!isFileImportModalOpen()) return false;
+
+    const selected = modalHasSelectedFile();
+    const upload = findUploadFileButton();
+
+    if (!selected) {
+      if (!cycle.waitingFileSince) {
+        patchCycle({ waitingFileSince: Date.now() });
+      }
+
+      setStatus('等待人工选择文件');
+      return true;
+    }
+
+    log('检测到文件已选择，准备上传。', 'ok');
+
+    if (!upload) {
+      log('已检测到文件名，但未找到“上传文件”按钮。', 'err');
+      setStatus('未找到上传文件');
+      return true;
+    }
+
+    if (isDisabledLike(upload)) {
+      log('“上传文件”按钮仍不可点击，继续等待。', 'warn');
+      setStatus('等待上传按钮可点');
+      return true;
+    }
+
+    if (cycle.uploadClicked || Date.now() - APP.state.lastUploadClickAt < 4000) {
+      return true;
+    }
+
+    APP.state.lastUploadClickAt = Date.now();
+
+    await safeClick(upload, '上传文件按钮');
+    log('已点击“上传文件”。', 'ok');
+
+    patchCycle({ uploadClicked: true });
+
+    await waitForPageStable({ timeout: 30000, stableMs: 900, label: '上传后页面' });
+
+    return true;
+  }
+
+  function findNextButton() {
+    const btns = qsa('button, [role="button"], .snv-btn, .n-button')
+      .filter(isVisible)
+      .filter(el => /下一步|Next/i.test(textOf(el)));
+
+    return btns.find(el => !isDisabledLike(el)) || btns[0] || null;
+  }
+
+  function findImportButton() {
+    const btns = qsa('button, [role="button"], .snv-btn, .n-button')
+      .filter(isVisible)
+      .filter(el => {
+        const t = textOf(el);
+        return /导入|Import/i.test(t) && !/取消导入|取消|Cancel/i.test(t);
+      });
+
+    return btns.find(el => !isDisabledLike(el)) || btns[0] || null;
+  }
+
+  function currentWizardStep() {
+    const text = textOf(document.body);
+
+    if (/字段映射|拖放 字段|跳过第一行|添加自定义字段/.test(text)) return 'mapping';
+    if (/数据设置|重复设置|选择 要添加潜在客户的列表|合并数据|创建多个记录|不上传/.test(text)) return 'settings';
+
+    const next = findNextButton();
+    const imp = findImportButton();
+
+    if (next && !imp) return 'mapping';
+    if (imp) return 'settings';
+
+    return 'unknown';
+  }
+
+  async function handleImportWizard(cycle) {
+    if (!looksLikeImportWizardPage()) return false;
+
+    const step = currentWizardStep();
+    setStatus(`导入页：${step}`);
+
+    if (step === 'mapping') {
+      const nextBtn = findNextButton();
+
+      if (!nextBtn) {
+        log('字段映射页：未找到“下一步”按钮。', 'err');
+        return true;
+      }
+
+      if (isDisabledLike(nextBtn)) {
+        log('字段映射页：“下一步”不可点击，等待字段映射完成。', 'warn');
+        return true;
+      }
+
+      if (cycle.nextClicked || Date.now() - APP.state.lastNextClickAt < 4000) {
+        return true;
+      }
+
+      APP.state.lastNextClickAt = Date.now();
+
+      await safeClick(nextBtn, '下一步按钮');
+      log('已点击“下一步”。', 'ok');
+
+      patchCycle({ nextClicked: true });
+      await waitForPageStable({ timeout: 20000, stableMs: 900, label: '数据设置页面' });
+
+      return true;
+    }
+
+    if (step === 'settings') {
+      const importBtn = findImportButton();
+
+      if (!importBtn) {
+        log('数据设置页：未找到“导入”按钮。', 'err');
+        return true;
+      }
+
+      if (isDisabledLike(importBtn)) {
+        log('数据设置页：“导入”按钮不可点击，等待页面设置完成。', 'warn');
+        return true;
+      }
+
+      if (cycle.importClicked || Date.now() - APP.state.lastImportClickAt < 4000) {
+        return true;
+      }
+
+      APP.state.lastImportClickAt = Date.now();
+
+      await safeClick(importBtn, '导入按钮');
+      log('已点击“导入”，等待返回主列表页。', 'ok');
+
+      patchCycle({ importClicked: true });
+      await waitForPageStable({ timeout: 45000, stableMs: 1200, label: '导入后页面' });
+
+      return true;
+    }
+
+    log('导入页面步骤未知，等待页面稳定或人工确认。', 'warn');
+    return true;
+  }
+
+  async function handleMainPage(cycle) {
+    if (!looksLikeMainProspectsPage()) return false;
+
+    await waitForMainPageReady();
+
+    const running = detectVerificationRunning();
+
+    if (running.running) {
+      await waitVerificationFinish();
+      return true;
+    }
+
+    if (!cycle.verifyBeforeImportDone && !cycle.importClicked) {
+      const res = await clickVerifyIfClickable('导入前检测');
+
+      if (res === 'clicked') {
+        patchCycle({ verifyBeforeImportDone: true });
+        await waitVerificationFinish();
+        return true;
+      }
+
+      if (res === 'running') {
+        await waitVerificationFinish();
+        return true;
+      }
+
+      /*
+       * 这里是本次修复重点：
+       * 没有可点击的“验证邮箱地址”时，不等待、不停住，
+       * 直接进入“添加潜在客户 → 从文件导入”。
+       */
+      log(`导入前无需验证或验证按钮不可点击：${res}，继续打开文件导入。`);
+      patchCycle({ verifyBeforeImportDone: true });
+    }
+
+    if (!cycle.importClicked) {
+      setStatus('准备从文件导入');
+      await openImportDialogIfNeeded();
+      return true;
+    }
+
+    if (cycle.importClicked && !cycle.verifyAfterImportDone) {
+      const res = await clickVerifyIfClickable('导入后检测');
+
+      if (res === 'clicked') {
+        patchCycle({ verifyAfterImportDone: true });
+        await waitVerificationFinish();
+        markCycleDone('导入后验证已执行');
+        setStatus('本轮完成');
+        return true;
+      }
+
+      if (res === 'running') {
+        await waitVerificationFinish();
+        patchCycle({ verifyAfterImportDone: true });
+        markCycleDone('验证状态已结束');
+        setStatus('本轮完成');
+        return true;
+      }
+
+      if (res === 'disabled' || res === 'not_found') {
+        patchCycle({ verifyAfterImportDone: true });
+        markCycleDone('导入后无需验证或按钮不可用');
+        setStatus('本轮完成');
+        return true;
+      }
+
+      return true;
+    }
+
+    return true;
+  }
+
+  async function autoTick() {
+    if (APP.state.closed || APP.state.locked) return;
+
+    APP.state.locked = true;
+
+    try {
+      const cycle = ensureCycle();
+
+      if (cycle.completed) {
+        setStatus('待命');
+        return;
+      }
+
+      if (Date.now() - APP.state.lastActionAt < 500) {
+        return;
+      }
+
+      const modalHandled = await handleFileImportModal(cycle);
+      if (modalHandled) return;
+
+      const wizardHandled = await handleImportWizard(cycle);
+      if (wizardHandled) return;
+
+      const mainHandled = await handleMainPage(cycle);
+      if (mainHandled) return;
+
+      setStatus('未识别页面，等待');
+    } catch (err) {
+      log(`自动流程异常：${err.message || err}`, 'err');
+      setStatus('自动流程异常');
+    } finally {
+      APP.state.lastActionAt = Date.now();
+      APP.state.locked = false;
+    }
+  }
+
+  function createPanel() {
+    if (qs('#' + APP.panelId)) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #${APP.panelId} {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        width: 360px;
+        max-height: 68vh;
+        z-index: 2147483647;
+        background: #fff;
+        color: #1f2937;
+        border: 1px solid #d8dde8;
+        box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+        font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      #${APP.panelId}.snai-mini {
+        width: 236px;
+      }
+      #${APP.panelId}.snai-mini .snai-body {
+        display: none;
+      }
+      #${APP.panelId} .snai-head {
+        height: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 0 10px;
+        background: #f7f4ff;
+        border-bottom: 1px solid #e8e0ff;
+        cursor: move;
+        user-select: none;
+      }
+      #${APP.panelId} .snai-title {
+        font-weight: 700;
+        color: #4c1d95;
+        white-space: nowrap;
+      }
+      #${APP.panelId} .snai-head-actions {
+        display: flex;
+        gap: 6px;
+      }
+      #${APP.panelId} .snai-icon-btn {
+        width: 22px;
+        height: 22px;
+        border: 1px solid #d6c9ff;
+        background: #fff;
+        color: #5b21b6;
+        cursor: pointer;
+        border-radius: 5px;
+        line-height: 20px;
+        padding: 0;
+      }
+      #${APP.panelId} .snai-body {
+        padding: 10px;
+      }
+      #${APP.panelId} .snai-row {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+      #${APP.panelId} input {
+        flex: 1;
+        height: 30px;
+        border: 1px solid #cfd6e4;
+        border-radius: 6px;
+        padding: 0 8px;
+        outline: none;
+        min-width: 0;
+      }
+      #${APP.panelId} input:focus {
+        border-color: #7c5cff;
+        box-shadow: 0 0 0 2px rgba(124, 92, 255, .12);
+      }
+      #${APP.panelId} button.snai-btn {
+        height: 30px;
+        border: 1px solid #7c5cff;
+        background: #7c5cff;
+        color: #fff;
+        border-radius: 6px;
+        cursor: pointer;
+        padding: 0 10px;
+        white-space: nowrap;
+      }
+      #${APP.panelId} button.snai-btn:hover {
+        background: #6d4df0;
+      }
+      #${APP.panelId} .snai-status {
+        margin-bottom: 8px;
+        padding: 6px 8px;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        color: #475569;
+      }
+      #${APP.panelId} #snai-log {
+        height: 190px;
+        overflow: auto;
+        border: 1px solid #e2e8f0;
+        background: #0f172a;
+        color: #dbeafe;
+        border-radius: 6px;
+        padding: 8px;
+        white-space: pre-wrap;
+        user-select: text;
+      }
+      #${APP.panelId} .snai-log-line {
+        margin-bottom: 3px;
+      }
+      #${APP.panelId} .snai-log-ok { color: #86efac; }
+      #${APP.panelId} .snai-log-warn { color: #fde68a; }
+      #${APP.panelId} .snai-log-err { color: #fca5a5; }
+      .${APP.highlightClass} {
+        outline: 3px solid #ff4d4f !important;
+        outline-offset: -2px !important;
+        background: rgba(255, 77, 79, 0.13) !important;
+      }
+    `;
+
+    document.documentElement.appendChild(style);
+
+    const panel = document.createElement('div');
+    panel.id = APP.panelId;
+    panel.innerHTML = `
+      <div class="snai-head" id="snai-drag">
+        <div class="snai-title">SN 搜索/自动导入 v${APP.version}</div>
+        <div class="snai-head-actions">
+          <button class="snai-icon-btn" id="snai-mini" title="最小化/展开">—</button>
+          <button class="snai-icon-btn" id="snai-close" title="关闭">×</button>
+        </div>
+      </div>
+      <div class="snai-body">
+        <div class="snai-row">
+          <input id="snai-keyword" placeholder="搜索左侧列表，如：珠宝" />
+          <button class="snai-btn" id="snai-search">搜索</button>
+        </div>
+        <div class="snai-status">状态：<span id="snai-status">待命</span></div>
+        <div id="snai-log"></div>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+
+    bindPanelEvents(panel);
+    bindDrag(panel);
+
+    log(`已加载 SN 搜索/自动导入 v${APP.version}`, 'ok');
+    setStatus('自动检测中');
+  }
+
+  function bindPanelEvents(panel) {
+    qs('#snai-close').addEventListener('click', () => {
+      APP.state.closed = true;
+      panel.remove();
+    });
+
+    qs('#snai-mini').addEventListener('click', () => {
+      panel.classList.toggle('snai-mini');
+    });
+
+    qs('#snai-search').addEventListener('click', () => {
+      doSearchCenterAndClick().catch(err => {
+        log(`搜索点击失败：${err.message || err}`, 'err');
+        setStatus('搜索失败');
+      });
+    });
+
+    qs('#snai-keyword').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        doSearchCenterAndClick().catch(err => {
+          log(`搜索点击失败：${err.message || err}`, 'err');
+          setStatus('搜索失败');
+        });
+      }
+    });
+  }
+
+  function bindDrag(panel) {
+    const head = qs('#snai-drag', panel);
+    if (!head) return;
+
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let startRight = 0;
+    let startBottom = 0;
+
+    head.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+
+      startX = e.clientX;
+      startY = e.clientY;
+      startRight = window.innerWidth - rect.right;
+      startBottom = window.innerHeight - rect.bottom;
+
+      e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+
+      panel.style.right = Math.max(0, startRight - dx) + 'px';
+      panel.style.bottom = Math.max(0, startBottom - dy) + 'px';
+    });
+
+    window.addEventListener('mouseup', () => {
+      dragging = false;
+    });
+  }
+
+  createPanel();
+
+  waitForPageStable({ timeout: 12000, stableMs: 900, label: '初始页面' })
+    .then(() => {
+      ensureCycle();
+      setInterval(autoTick, APP.tickMs);
+      autoTick();
+    })
+    .catch(() => {
+      ensureCycle();
+      setInterval(autoTick, APP.tickMs);
+      autoTick();
+    });
+
+})();
