@@ -1,0 +1,2788 @@
+// ==UserScript==
+// @name         SN 导入导出助手 v4.0.3
+// @namespace    https://chat.openai.com/sn-tools
+// @version      4.0.3
+// @description  合并 Snov.io 自动导入与自动导出；默认导入，双击状态文本切换导入/导出；导入支持搜索、暂停/继续、自动验证与文件导入；导出保留成熟自动导出流程。
+// @match        https://app.snov.io/prospects*
+// @match        https://app.snov.io/import/prospects*
+// @grant        GM_setClipboard
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /**********************************************************************
+   * SN 导入导出助手 v4.0.3
+   *
+   * 更新说明：
+   * 1. 合并【SN 搜索自动导入 v3.0.11】与【SN 导出 v1.4.0】为一个面板。
+   * 2. UI 统一使用导入脚本的浅色紫色风格。
+   * 3. 默认进入【导入】模块。
+   * 4. 状态行改为纯文本标签，不使用卡片/面板包裹。
+   * 5. 双击状态文本切换【导入 / 导出】。
+   * 6. 切换时导入日志和导出日志都会写入“已切换至导入/导出”。
+   * 7. 导入模块：
+   *    - 搜索框有关键词：匹配左侧最后一个结果，滚动居中并点击。
+   *    - 搜索框为空：点击【搜索】全局切换导入自动流程暂停/继续，不再限制主页状态。
+   *    - 暂停检查下沉到关键点击动作前后，尽量避免暂停后继续点下一步。
+   * 8. 导出模块：
+   *    - 可见区域只保留【开始自动导出 / 停止导出】。
+   *    - 【重新定位导出按钮】放入隐藏工具区，点击【操作日志】展开。
+   *    - 移除“检测搜索状态（侦察）”“导出侦察信息”按钮。
+   * 9. 输出日志仍在面板内，不依赖控制台。
+   **********************************************************************/
+
+  const APP = {
+    version: '4.0.3',
+    panelId: 'sn-import-export-helper-panel',
+    highlightClass: 'sn-import-export-highlight',
+    activeModule: 'import',
+    toolsVisible: false,
+    tickMs: 1200,
+    importStorageKey: 'SN_AUTO_IMPORT_STATE_V4',
+    logs: {
+      import: [],
+      export: [],
+    },
+    status: {
+      import: '自动检测中',
+      export: '就绪',
+    },
+    importState: {
+      locked: false,
+      closed: false,
+      lastActionAt: 0,
+      lastAutoOpenAt: 0,
+      lastUploadClickAt: 0,
+      lastNextClickAt: 0,
+      lastImportClickAt: 0,
+      lastVerifyClickAt: 0,
+      lastSearchPauseLogAt: 0,
+      uploadRetryCount: 0,
+      uploadRetryLimit: 3,
+      paused: false,
+    },
+    exportState: {
+      running: false,
+      exportButtonLocator: {
+        selector: null,
+        lastText: '导出潜在客户',
+      },
+    },
+  };
+
+  const EXPORT = {
+    EXPORT_SUCCESS_TIMEOUT_MS: 2 * 60 * 1000,
+    EMAIL_SEARCH_WAIT_TIMEOUT_MS: 10 * 60 * 1000,
+    EMAIL_SEARCH_STABLE_BUFFER_MS: 3000,
+    PROSPECTS_PAGE_READY_TIMEOUT_MS: 20000,
+    PROSPECTS_PAGE_STABLE_BUFFER_MS: 1500,
+  };
+
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+  function nowTime() {
+    const d = new Date();
+    return [
+      String(d.getHours()).padStart(2, '0'),
+      String(d.getMinutes()).padStart(2, '0'),
+      String(d.getSeconds()).padStart(2, '0'),
+    ].join(':');
+  }
+
+  function qs(selector, root = document) {
+    try { return root.querySelector(selector); } catch { return null; }
+  }
+
+  function qsa(selector, root = document) {
+    try { return Array.from(root.querySelectorAll(selector)); } catch { return []; }
+  }
+
+  function textOf(el) {
+    if (!el) return '';
+    return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function getElementText(el) {
+    return textOf(el);
+  }
+
+  function valueOfInput(el) {
+    if (!el) return '';
+    if ('value' in el && typeof el.value === 'string') return el.value.trim();
+    return '';
+  }
+
+  function normalize(s) {
+    return String(s || '')
+      .toLowerCase()
+      .replace(/\s+/g, '')
+      .replace(/[._\-—–·•，,。/\\|()[\]{}【】"'“”‘’:：;；]/g, '');
+  }
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      style.opacity !== '0';
+  }
+
+  function isEnabled(el) {
+    if (!el) return false;
+    return !el.disabled && !el.hasAttribute('disabled') && el.getAttribute('aria-disabled') !== 'true';
+  }
+
+  function isDisabledLike(el) {
+    if (!el) return true;
+    const cls = String(el.className || '');
+    const ariaDisabled = el.getAttribute('aria-disabled');
+    return Boolean(
+      el.disabled ||
+      ariaDisabled === 'true' ||
+      cls.includes('disabled') ||
+      cls.includes('snv-btn--disabled') ||
+      cls.includes('n-button--disabled') ||
+      el.getAttribute('disabled') !== null
+    );
+  }
+
+  function isClickable(el) {
+    if (!isVisible(el) || isDisabledLike(el)) return false;
+    const rect = el.getBoundingClientRect();
+    const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    const topEl = document.elementFromPoint(x, y);
+    return Boolean(topEl && (topEl === el || el.contains(topEl) || topEl.contains(el)));
+  }
+
+  function cssPath(el) {
+    if (!el || !el.nodeType || el.nodeType !== 1) return '';
+    const parts = [];
+    let cur = el;
+
+    while (cur && cur.nodeType === 1 && cur !== document.body && cur !== document.documentElement) {
+      let part = cur.tagName.toLowerCase();
+
+      if (cur.id) {
+        part += '#' + CSS.escape(cur.id);
+        parts.unshift(part);
+        break;
+      }
+
+      const cls = Array.from(cur.classList || [])
+        .filter(Boolean)
+        .slice(0, 3)
+        .map(c => '.' + CSS.escape(c))
+        .join('');
+
+      if (cls) part += cls;
+
+      const parent = cur.parentElement;
+      if (parent) {
+        const sameTag = Array.from(parent.children).filter(x => x.tagName === cur.tagName);
+        if (sameTag.length > 1) part += `:nth-of-type(${sameTag.indexOf(cur) + 1})`;
+      }
+
+      parts.unshift(part);
+      cur = cur.parentElement;
+      if (parts.length > 7) break;
+    }
+
+    return parts.join(' > ');
+  }
+
+  function buildStableSelector(el) {
+    if (!el) return null;
+
+    if (el.id) {
+      return `#${CSS.escape(el.id)}`;
+    }
+
+    const dataTest = el.getAttribute('data-test');
+    if (dataTest) {
+      return `[data-test="${CSS.escape(dataTest)}"]`;
+    }
+
+    const trackingId = el.getAttribute('plerdy-tracking-id');
+    if (trackingId) {
+      return `[plerdy-tracking-id="${trackingId}"]`;
+    }
+
+    const classes = [...el.classList].filter(Boolean).slice(0, 4);
+    if (classes.length) {
+      return `${el.tagName.toLowerCase()}.${classes.map(c => CSS.escape(c)).join('.')}`;
+    }
+
+    return el.tagName.toLowerCase();
+  }
+
+  function getCssPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.body) {
+      let part = node.tagName.toLowerCase();
+      if (node.id) {
+        part += `#${node.id}`;
+        parts.unshift(part);
+        break;
+      }
+      const cls = [...node.classList].filter(Boolean).slice(0, 2);
+      if (cls.length) {
+        part += '.' + cls.join('.');
+      }
+      const parent = node.parentElement;
+      if (parent) {
+        const sameTagSiblings = [...parent.children].filter(child => child.tagName === node.tagName);
+        if (sameTagSiblings.length > 1) {
+          part += `:nth-of-type(${sameTagSiblings.indexOf(node) + 1})`;
+        }
+      }
+      parts.unshift(part);
+      node = node.parentElement;
+    }
+    return parts.join(' > ');
+  }
+
+  function limitText(text, maxLen = 260) {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    if (s.length <= maxLen) return s;
+    return s.slice(0, maxLen) + '...';
+  }
+
+  function fireMouse(el, type) {
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    });
+    el.dispatchEvent(event);
+  }
+
+  async function safeClickAsync(el, label = '元素') {
+    if (!el) throw new Error(`未找到${label}`);
+    if (!isVisible(el)) throw new Error(`${label}不可见`);
+    if (isDisabledLike(el)) throw new Error(`${label}处于禁用状态`);
+
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    await sleep(150);
+
+    fireMouse(el, 'mouseover');
+    fireMouse(el, 'mouseenter');
+    fireMouse(el, 'mousemove');
+    fireMouse(el, 'mousedown');
+    fireMouse(el, 'mouseup');
+    el.click();
+
+    await sleep(300);
+  }
+
+  function safeClickSync(element) {
+    if (!element) return false;
+
+    try {
+      element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+    } catch (e) {}
+
+    try {
+      element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+      element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+      element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return true;
+    } catch (e) {
+      try {
+        element.click();
+        return true;
+      } catch (e2) {
+        return false;
+      }
+    }
+  }
+
+  /**********************************************************************
+   * UI
+   **********************************************************************/
+
+  function addLog(module, message, type = 'info') {
+    const logs = APP.logs[module] || APP.logs.import;
+    logs.push({
+      time: nowTime(),
+      message,
+      type,
+    });
+
+    const maxLines = 320;
+    while (logs.length > maxLines) logs.shift();
+
+    if (APP.activeModule === module) renderLog();
+  }
+
+  function setModuleStatus(module, message) {
+    APP.status[module] = message;
+    if (APP.activeModule === module) renderStatus();
+  }
+
+  function renderStatus() {
+    const el = qs('#snu-status-label');
+    if (!el) return;
+    const name = APP.activeModule === 'import' ? '导入' : '导出';
+    const status = APP.status[APP.activeModule] || '就绪';
+
+    /*
+     * v4.0.2：
+     * 只有“状态：导入/导出”这段可点击切换模块。
+     * 后面的状态文本与空白区域都不能触发切换。
+     */
+    el.innerHTML = `
+      <span id="snu-status-module-toggle" class="snu-status-module" title="单击切换导入/导出">状态：${name}</span><span class="snu-status-sep">｜</span><span class="snu-status-text">${status}</span>
+    `;
+  }
+
+  function applyPanelModuleSize() {
+    const panel = qs('#' + APP.panelId);
+    if (!panel) return;
+
+    panel.classList.toggle('snu-module-import', APP.activeModule === 'import');
+    panel.classList.toggle('snu-module-export', APP.activeModule === 'export');
+
+    if (panel.classList.contains('snu-mini')) return;
+
+    panel.style.width = APP.activeModule === 'export' ? '260px' : '360px';
+  }
+
+  function renderLog() {
+    const box = qs('#snu-log');
+    if (!box) return;
+
+    const logs = APP.logs[APP.activeModule] || [];
+    box.innerHTML = '';
+
+    for (const item of logs) {
+      const line = document.createElement('div');
+      line.className = `snu-log-line snu-log-${item.type || 'info'}`;
+      line.textContent = `[${item.time}] ${item.message}`;
+      box.appendChild(line);
+    }
+
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function renderControls() {
+    const root = qs('#snu-controls');
+    if (!root) return;
+
+    if (APP.activeModule === 'import') {
+      root.innerHTML = `
+        <div class="snu-row">
+          <input id="snu-import-keyword" placeholder="搜索左侧列表，如：珠宝" />
+          <button class="snu-btn snu-primary" id="snu-import-search">搜索</button>
+        </div>
+      `;
+
+      const input = qs('#snu-import-keyword');
+      const btn = qs('#snu-import-search');
+
+      btn.addEventListener('mousedown', () => {
+        if (input) input.blur();
+      });
+
+      btn.addEventListener('click', () => {
+        doImportSearchCenterAndClick().catch(err => {
+          addLog('import', `搜索点击失败：${err.message || err}`, 'err');
+          setModuleStatus('import', '搜索失败');
+        });
+      });
+
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          doImportSearchCenterAndClick().catch(err => {
+            addLog('import', `搜索点击失败：${err.message || err}`, 'err');
+            setModuleStatus('import', '搜索失败');
+          });
+        }
+      });
+    } else {
+      root.innerHTML = `
+        <div class="snu-row snu-export-row">
+          <button class="snu-btn snu-primary snu-full-btn" id="snu-export-run">${APP.exportState.running ? '停止导出' : '开始自动导出'}</button>
+        </div>
+      `;
+
+      qs('#snu-export-run').addEventListener('click', () => {
+        toggleExportAutomation();
+      });
+    }
+
+    renderTools();
+  }
+
+  function renderTools() {
+    const tools = qs('#snu-tools');
+    if (!tools) return;
+
+    if (APP.activeModule === 'export' && APP.toolsVisible) {
+      tools.classList.remove('is-hidden');
+      tools.innerHTML = `
+        <button class="snu-btn" id="snu-relocate-export">重新定位导出按钮</button>
+      `;
+      qs('#snu-relocate-export').addEventListener('click', relocateExportButton);
+    } else {
+      tools.classList.add('is-hidden');
+      tools.innerHTML = '';
+    }
+  }
+
+  function switchModule(target) {
+    if (!['import', 'export'].includes(target)) return;
+    if (APP.activeModule === target) return;
+
+    APP.activeModule = target;
+    APP.toolsVisible = false;
+
+    const msg = target === 'import' ? '已切换至导入' : '已切换至导出';
+    addLog('import', msg, 'ok');
+    addLog('export', msg, 'ok');
+
+    renderControls();
+    renderStatus();
+    renderLog();
+    applyPanelModuleSize();
+  }
+
+  function toggleModule() {
+    switchModule(APP.activeModule === 'import' ? 'export' : 'import');
+  }
+
+  function createPanel() {
+    const oldIds = [
+      APP.panelId,
+      'sn-auto-import-panel',
+      'snov-auto-export-panel',
+    ];
+
+    oldIds.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.remove();
+    });
+
+    addStyles();
+
+    const panel = document.createElement('div');
+    panel.id = APP.panelId;
+    panel.innerHTML = `
+      <div class="snu-head" id="snu-drag">
+        <div class="snu-title">SN 导入/导出助手 v${APP.version}</div>
+        <div class="snu-head-actions">
+          <button class="snu-icon-btn" id="snu-mini" title="最小化/展开">—</button>
+          <button class="snu-icon-btn" id="snu-close" title="关闭">×</button>
+        </div>
+      </div>
+      <div class="snu-body">
+        <div id="snu-controls"></div>
+        <div id="snu-status-label" class="snu-status-label"><span id="snu-status-module-toggle" class="snu-status-module" title="单击切换导入/导出">状态：导入</span><span class="snu-status-sep">｜</span><span class="snu-status-text">自动检测中</span></div>
+        <div class="snu-log-label" id="snu-log-label" title="导出模式下单击可展开隐藏工具">操作日志</div>
+        <div id="snu-tools" class="snu-tools is-hidden"></div>
+        <div id="snu-log" class="snu-log"></div>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+
+    bindPanelEvents(panel);
+    bindDrag(panel);
+
+    renderControls();
+    renderStatus();
+    renderLog();
+    applyPanelModuleSize();
+
+    addLog('import', `已加载 SN 导入/导出助手 v${APP.version}`, 'ok');
+    addLog('export', `已加载 SN 导入/导出助手 v${APP.version}`, 'ok');
+    setModuleStatus('import', '自动检测中');
+    setModuleStatus('export', '就绪');
+  }
+
+  function bindPanelEvents(panel) {
+    qs('#snu-close').addEventListener('click', () => {
+      APP.importState.closed = true;
+      panel.remove();
+    });
+
+    qs('#snu-mini').addEventListener('click', () => {
+      panel.classList.toggle('snu-mini');
+      if (!panel.classList.contains('snu-mini')) {
+        applyPanelModuleSize();
+      }
+    });
+
+    qs('#snu-status-label').addEventListener('click', (e) => {
+      const trigger = e.target.closest('#snu-status-module-toggle');
+      if (!trigger) return;
+
+      e.preventDefault();
+      toggleModule();
+    });
+
+    qs('#snu-log-label').addEventListener('click', () => {
+      if (APP.activeModule !== 'export') return;
+      APP.toolsVisible = !APP.toolsVisible;
+      renderTools();
+    });
+  }
+
+  function bindDrag(panel) {
+    const head = qs('#snu-drag', panel);
+    if (!head) return;
+
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let startRight = 0;
+    let startBottom = 0;
+
+    head.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+
+      startX = e.clientX;
+      startY = e.clientY;
+      startRight = window.innerWidth - rect.right;
+      startBottom = window.innerHeight - rect.bottom;
+
+      e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+
+      panel.style.right = Math.max(0, startRight - dx) + 'px';
+      panel.style.bottom = Math.max(0, startBottom - dy) + 'px';
+    });
+
+    window.addEventListener('mouseup', () => {
+      dragging = false;
+    });
+  }
+
+  function addStyles() {
+    const old = document.getElementById('sn-import-export-helper-style');
+    if (old) old.remove();
+
+    const style = document.createElement('style');
+    style.id = 'sn-import-export-helper-style';
+    style.textContent = `
+      #${APP.panelId} {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        width: 360px;
+        max-height: 68vh;
+        z-index: 2147483647;
+        background: #fff;
+        color: #1f2937;
+        border: 1px solid #d8dde8;
+        box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+        font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      #${APP.panelId} * {
+        box-sizing: border-box;
+      }
+      #${APP.panelId}.snu-mini {
+        width: 246px;
+      }
+      #${APP.panelId}.snu-mini .snu-body {
+        display: none;
+      }
+      #${APP.panelId} .snu-head {
+        height: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 0 10px;
+        background: #f6f4fb;
+        border-bottom: 1px solid #e5e1ef;
+        cursor: move;
+        user-select: none;
+      }
+      #${APP.panelId} .snu-title {
+        font-weight: 700;
+        color: #4f466b;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
+      }
+      #${APP.panelId} .snu-head-actions {
+        display: flex;
+        gap: 6px;
+        flex: 0 0 auto;
+      }
+      #${APP.panelId} .snu-icon-btn {
+        width: 22px;
+        height: 22px;
+        border: 1px solid #d9d4e6;
+        background: #fbfafc;
+        color: #5f5678;
+        cursor: pointer;
+        border-radius: 5px;
+        line-height: 20px;
+        padding: 0;
+      }
+      #${APP.panelId} .snu-icon-btn:hover {
+        background: #f1eef7;
+        border-color: #cbc3dd;
+      }
+      #${APP.panelId} .snu-body {
+        padding: 10px;
+      }
+      #${APP.panelId} .snu-row {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 7px;
+      }
+      #${APP.panelId} .snu-export-row {
+        display: block;
+      }
+      #${APP.panelId} .snu-full-btn {
+        width: 100%;
+      }
+      #${APP.panelId} input {
+        flex: 1;
+        height: 30px;
+        border: 1px solid #cfd6e4;
+        border-radius: 6px;
+        padding: 0 8px;
+        outline: none;
+        min-width: 0;
+      }
+      #${APP.panelId} input:focus {
+        border-color: #b8add6;
+        box-shadow: 0 0 0 2px rgba(126, 105, 170, .10);
+      }
+      #${APP.panelId} button.snu-btn {
+        height: 30px;
+        border: 1px solid #d6dce5;
+        background: #f8fafc;
+        color: #475569;
+        border-radius: 6px;
+        cursor: pointer;
+        padding: 0 10px;
+        white-space: nowrap;
+        font-weight: 600;
+      }
+      #${APP.panelId} button.snu-btn:hover {
+        background: #f1f5f9;
+        border-color: #cbd5e1;
+        color: #334155;
+      }
+      #${APP.panelId} button.snu-primary {
+        background: #ede9fe;
+        color: #5b4b8a;
+        border-color: #d8d0f0;
+      }
+      #${APP.panelId} button.snu-primary:hover {
+        background: #e4ddfb;
+        border-color: #cbc0ea;
+        color: #4f3f7a;
+      }
+      #${APP.panelId} button.snu-danger {
+        background: #fef2f2;
+        color: #991b1b;
+        border-color: #fecaca;
+      }
+      #${APP.panelId} button.snu-danger:hover {
+        background: #fee2e2;
+        color: #7f1d1d;
+      }
+      #${APP.panelId} .snu-status-label {
+        margin: 2px 0 6px;
+        color: #64748b;
+        line-height: 1.45;
+        user-select: none;
+        cursor: default;
+      }
+      #${APP.panelId} .snu-status-module {
+        cursor: pointer;
+        color: #5b4b8a;
+      }
+      #${APP.panelId} .snu-status-module:hover {
+        color: #4f3f7a;
+      }
+      #${APP.panelId} .snu-status-sep,
+      #${APP.panelId} .snu-status-text {
+        cursor: default;
+      }
+      #${APP.panelId} .snu-log-label {
+        color: #475569;
+        font-weight: 700;
+        margin: 2px 0 5px;
+        user-select: none;
+        cursor: default;
+      }
+      #${APP.panelId} .snu-tools {
+        display: grid;
+        gap: 6px;
+        margin: 0 0 7px;
+      }
+      #${APP.panelId} .snu-tools.is-hidden {
+        display: none;
+      }
+      #${APP.panelId} .snu-log {
+        height: 190px;
+        overflow: auto;
+        border: 1px solid #334155;
+        background: #1f2937;
+        color: #cbd5e1;
+        border-radius: 6px;
+        padding: 8px;
+        white-space: pre-wrap;
+        user-select: text;
+      }
+      #${APP.panelId} .snu-log-line {
+        margin-bottom: 3px;
+        word-break: break-word;
+      }
+      #${APP.panelId} .snu-log-ok { color: #9fd3b1; }
+      #${APP.panelId} .snu-log-warn { color: #e6cf8b; }
+      #${APP.panelId} .snu-log-err { color: #e6a0a0; font-weight: 700; }
+      .${APP.highlightClass} {
+        outline: 3px solid #d98b8b !important;
+        outline-offset: -2px !important;
+        background: rgba(217, 139, 139, 0.13) !important;
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
+  /**********************************************************************
+   * 导入模块
+   **********************************************************************/
+
+  function isSearchBoxFocused() {
+    const input = qs('#snu-import-keyword');
+    return Boolean(input && document.activeElement === input);
+  }
+
+  function toggleImportManualPause() {
+    APP.importState.paused = !APP.importState.paused;
+
+    if (APP.importState.paused) {
+      setModuleStatus('import', '已暂停');
+      addLog('import', '已暂停自动流程。搜索框为空时，再次点击【搜索】继续。', 'warn');
+    } else {
+      setModuleStatus('import', '自动检测中');
+      addLog('import', '已继续自动流程。', 'ok');
+      setTimeout(() => {
+        importAutoTick();
+      }, 80);
+    }
+  }
+
+  function importPauseCheckpoint(label = '') {
+    if (APP.importState.closed) return false;
+
+    if (APP.importState.paused) {
+      setModuleStatus('import', '已暂停');
+      if (label) {
+        addLog('import', `已暂停，停止后续动作：${label}`, 'warn');
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  function readImportCycle() {
+    try {
+      const raw = sessionStorage.getItem(APP.importStorageKey);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  function writeImportCycle(cycle) {
+    sessionStorage.setItem(APP.importStorageKey, JSON.stringify(cycle));
+  }
+
+  function createImportCycle(reason, listName = '') {
+    const title = getCurrentListTitle();
+    const key = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    APP.importState.uploadRetryCount = 0;
+
+    const cycle = {
+      key,
+      reason,
+      listName: listName || title || '',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      verifyBeforeImportDone: false,
+      importDialogOpened: false,
+      uploadClicked: false,
+      nextClicked: false,
+      importClicked: false,
+      verifyAfterImportDone: false,
+      completed: false,
+      waitingFileSince: 0,
+    };
+
+    writeImportCycle(cycle);
+    addLog('import', `已开启自动流程：${cycle.listName || reason}`, 'ok');
+    return cycle;
+  }
+
+  function patchImportCycle(patch) {
+    const cycle = readImportCycle() || createImportCycle('auto_bootstrap');
+    const next = {
+      ...cycle,
+      ...patch,
+      updatedAt: Date.now(),
+    };
+    writeImportCycle(next);
+    return next;
+  }
+
+  function ensureImportCycle() {
+    let cycle = readImportCycle();
+    if (!cycle || cycle.completed) {
+      cycle = createImportCycle('page_load');
+    }
+    return cycle;
+  }
+
+  function markImportCycleDone(reason) {
+    const cycle = patchImportCycle({
+      completed: true,
+      completedAt: Date.now(),
+      doneReason: reason || '',
+    });
+    addLog('import', `本轮自动流程结束：${cycle.listName || cycle.reason}`, 'ok');
+  }
+
+  function getCurrentListTitle() {
+    const candidates = [
+      'h1',
+      '[data-test*="title"]',
+      '.prospects-list-title',
+      '.page-title',
+      '.title',
+    ];
+
+    for (const sel of candidates) {
+      const nodes = qsa(sel).filter(isVisible);
+      for (const el of nodes) {
+        const t = textOf(el);
+        if (t && t.length <= 80 && !/SN|Snov|导入潜在客户/.test(t)) {
+          return t;
+        }
+      }
+    }
+
+    const bodyText = textOf(document.body);
+    const lines = bodyText.split(/\s{2,}|\n/).map(x => x.trim()).filter(Boolean);
+    const likely = lines.find(x => x.length > 2 && x.length < 60 && /岗位|采购|高管|包装|珠宝|美妆|鞋服|酒水|设计/.test(x));
+    return likely || document.title || '';
+  }
+
+  function looksLikeImportWizardPage() {
+    const text = textOf(document.body);
+    return /导入潜在客户|字段映射|数据设置|拖放 字段|跳过第一行|重复设置|选择 要添加潜在客户的列表/.test(text) ||
+      /import/i.test(location.href) && /prospect|lead/i.test(location.href);
+  }
+
+  function looksLikeMainProspectsPage() {
+    const text = textOf(document.body);
+    if (looksLikeImportWizardPage()) return false;
+    return Boolean(
+      findVerifyEmailButton() ||
+      findAddProspectButton() ||
+      /添加潜在客户|验证邮箱地址|发送 营销邮件|潜在客户\(\d+\)|导入 状态/.test(text)
+    );
+  }
+
+  function getAllCandidateListItems() {
+    const selectors = [
+      '.item.item--editable.item--folder',
+      '.item.item--folder',
+      '.item--folder',
+      '.item',
+    ];
+
+    const seen = new Set();
+    const items = [];
+
+    for (const sel of selectors) {
+      for (const el of qsa(sel)) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+
+        const nameNode = qs('.item__name', el);
+        const visibleName = textOf(nameNode);
+        const inputValue = valueOfInput(qs('input', el));
+        const name = visibleName || inputValue || textOf(el);
+
+        if (!name) continue;
+
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) continue;
+
+        items.push({
+          el,
+          nameNode,
+          name,
+          visibleName,
+          inputValue,
+          selector: cssPath(el),
+        });
+      }
+    }
+
+    return items;
+  }
+
+  function findScrollableAncestors(el) {
+    const arr = [];
+    let cur = el ? el.parentElement : null;
+
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      const st = getComputedStyle(cur);
+      const overflowY = st.overflowY;
+      const canScroll = cur.scrollHeight > cur.clientHeight + 5;
+
+      if (canScroll || ['auto', 'scroll', 'overlay'].includes(overflowY)) {
+        arr.push({
+          el: cur,
+          scrollHeight: cur.scrollHeight,
+          clientHeight: cur.clientHeight,
+          scrollTop: cur.scrollTop,
+          overflowY,
+          rect: cur.getBoundingClientRect(),
+          selector: cssPath(cur),
+        });
+      }
+
+      cur = cur.parentElement;
+    }
+
+    return arr;
+  }
+
+  function findLeftListScrollContainer(itemEl = null) {
+    const items = getAllCandidateListItems().filter(x => isVisible(x.el));
+    const target = itemEl || (items[0] && items[0].el);
+
+    if (target) {
+      const ancestors = findScrollableAncestors(target)
+        .filter(x => x.rect.left < window.innerWidth * 0.45)
+        .sort((a, b) => {
+          const aw = Math.abs(a.rect.width - 320);
+          const bw = Math.abs(b.rect.width - 320);
+          const ah = b.scrollHeight - b.clientHeight;
+          const bh = a.scrollHeight - a.clientHeight;
+          return aw - bw || ah - bh;
+        });
+
+      if (ancestors[0]) return ancestors[0].el;
+    }
+
+    const all = Array.from(document.querySelectorAll('div, aside, nav, section'));
+    const candidates = all.map(el => {
+      const rect = el.getBoundingClientRect();
+      const itemCount = qsa('.item__name, .item--folder, .item', el).length;
+
+      return {
+        el,
+        rect,
+        canScroll: el.scrollHeight > el.clientHeight + 5,
+        itemCount,
+        score:
+          (rect.left < window.innerWidth * 0.35 ? 20 : 0) +
+          (el.scrollHeight > el.clientHeight + 5 ? 30 : 0) +
+          Math.min(itemCount, 40) +
+          (rect.height > 300 ? 10 : 0) -
+          Math.abs(rect.width - 320) / 20,
+      };
+    }).filter(c =>
+      c.rect.width > 120 &&
+      c.rect.width < 540 &&
+      c.rect.height > 200 &&
+      c.itemCount > 2 &&
+      c.rect.left < window.innerWidth * 0.45
+    ).sort((a, b) => b.score - a.score);
+
+    return candidates[0] ? candidates[0].el : null;
+  }
+
+  function highlightListItem(el) {
+    qsa('.' + APP.highlightClass).forEach(x => x.classList.remove(APP.highlightClass));
+    if (el) el.classList.add(APP.highlightClass);
+  }
+
+  function searchLastMatch(keywordRaw) {
+    const keyword = normalize(keywordRaw);
+    if (!keyword) return { keyword, matches: [], last: null };
+
+    const items = getAllCandidateListItems();
+    const matches = items.filter(item => {
+      const visibleText = normalize(item.visibleName);
+      const inputText = normalize(item.inputValue);
+      const fullText = normalize(item.name);
+
+      return visibleText.includes(keyword) || inputText.includes(keyword) || fullText.includes(keyword);
+    });
+
+    return {
+      keyword,
+      matches,
+      last: matches.length ? matches[matches.length - 1] : null,
+    };
+  }
+
+  async function centerItemInLeftContainer(item) {
+    if (!item || !item.el) throw new Error('没有匹配项可定位');
+
+    const container = findLeftListScrollContainer(item.el);
+
+    if (!container) {
+      item.el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+      await sleep(500);
+      return {
+        container: null,
+        centered: true,
+      };
+    }
+
+    const beforeTop = container.scrollTop;
+    const itemRect = item.el.getBoundingClientRect();
+    const conRect = container.getBoundingClientRect();
+    const targetTop = container.scrollTop + (itemRect.top - conRect.top) - (conRect.height / 2) + (itemRect.height / 2);
+
+    container.scrollTo({
+      top: Math.max(0, targetTop),
+      behavior: 'smooth',
+    });
+
+    await sleep(650);
+
+    const afterTop = container.scrollTop;
+    const newItemRect = item.el.getBoundingClientRect();
+    const newConRect = container.getBoundingClientRect();
+    const itemCenter = newItemRect.top + newItemRect.height / 2;
+    const conCenter = newConRect.top + newConRect.height / 2;
+    const centered = Math.abs(itemCenter - conCenter) < Math.max(40, newConRect.height * 0.2);
+
+    return {
+      container,
+      beforeTop,
+      afterTop,
+      centered,
+      itemCenter,
+      conCenter,
+      containerSelector: cssPath(container),
+    };
+  }
+
+  function getListClickTarget(item) {
+    if (!item || !item.el) return null;
+
+    const nameNode = item.nameNode || qs('.item__name', item.el);
+    if (nameNode && isVisible(nameNode)) return nameNode;
+
+    const arrowOrIcon = qs('.item__icon, .item__arrow', item.el);
+    if (arrowOrIcon && isVisible(arrowOrIcon)) return arrowOrIcon;
+
+    return item.el;
+  }
+
+  async function doImportSearchCenterAndClick() {
+    const input = qs('#snu-import-keyword');
+    const keyword = input ? input.value.trim() : '';
+
+    if (input) input.blur();
+
+    if (!keyword) {
+      toggleImportManualPause();
+      return;
+    }
+
+    if (APP.importState.paused) {
+      APP.importState.paused = false;
+      setModuleStatus('import', '自动检测中');
+      addLog('import', '检测到关键词搜索，自动流程由暂停状态切换为继续。', 'ok');
+    }
+
+    setModuleStatus('import', '搜索中...');
+    const result = searchLastMatch(keyword);
+
+    addLog('import', `搜索关键词：${keyword}`);
+    addLog('import', `匹配数量：${result.matches.length}`);
+
+    if (!result.last) {
+      addLog('import', `未找到匹配项：${keyword}`, 'warn');
+      setModuleStatus('import', '无匹配');
+      return;
+    }
+
+    addLog('import', `取最后一个匹配项：${result.last.name}`, 'ok');
+    addLog('import', `全部匹配项：${result.matches.map(x => x.name).join(' ｜ ')}`);
+
+    const info = await centerItemInLeftContainer(result.last);
+    highlightListItem(result.last.el);
+
+    if (info.container) {
+      addLog('import', `已滚动到视觉中心；容器=${info.containerSelector}；是否居中=${info.centered ? '是' : '否'}`);
+    } else {
+      addLog('import', '未识别内部滚动容器，已使用 scrollIntoView 定位。', 'warn');
+    }
+
+    await sleep(250);
+
+    if (!importPauseCheckpoint('点击搜索匹配列表前')) return;
+
+    const clickTarget = getListClickTarget(result.last);
+    addLog('import', `自动点击列表项：${result.last.name}`);
+    await safeClickAsync(clickTarget, `列表项 ${result.last.name}`);
+
+    createImportCycle('search_click', result.last.name);
+    setModuleStatus('import', `已点击：${result.last.name}`);
+
+    await waitForPageStable({ timeout: 20000, stableMs: 900, label: '列表切换后页面' });
+  }
+
+  function getVisibleButtonByTexts(texts, root = document) {
+    const arr = qsa('button, [role="button"], a, .snv-btn, .n-button, .btn', root);
+
+    return arr.find(el => {
+      const t = textOf(el);
+      return isVisible(el) && texts.some(x => t.includes(x));
+    }) || null;
+  }
+
+  function findVerifyEmailButton() {
+    const byData = qs('[data-test="prospects-verify-current-list"]');
+    if (byData) return byData;
+
+    return getVisibleButtonByTexts(['验证邮箱地址', 'Verify email', 'Verify emails']);
+  }
+
+  function findModalRoot() {
+    const roots = qsa('[role="dialog"], .modal, .app-modal, .snv-modal, .n-modal, .vfm__content, .v-overlay, .popup, .dialog')
+      .filter(isVisible);
+
+    if (roots.length) {
+      return roots.sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (br.width * br.height) - (ar.width * ar.height);
+      })[0];
+    }
+
+    const visibleButtons = qsa('button').filter(b => isVisible(b) && /验证|上传文件|选择文件/.test(textOf(b)));
+    if (visibleButtons.length) {
+      let cur = visibleButtons[0].parentElement;
+      for (let i = 0; cur && i < 8; i++, cur = cur.parentElement) {
+        const r = cur.getBoundingClientRect();
+        if (r.width > 250 && r.height > 160) return cur;
+      }
+    }
+
+    return document;
+  }
+
+  function findConfirmVerifyButton() {
+    const root = findModalRoot();
+    const buttons = qsa('button, [role="button"], .snv-btn, .n-button', root)
+      .filter(isVisible)
+      .filter(el => !isDisabledLike(el));
+
+    const exact = buttons.find(b => ['验证', 'Verify'].includes(textOf(b)));
+    if (exact) return exact;
+
+    return buttons.find(b => /验证|Verify/i.test(textOf(b))) || null;
+  }
+
+  function detectVerificationRunning() {
+    const blocks = qsa('.check-verification-block')
+      .filter(isVisible)
+      .filter(el => /正在验证|正在搜索|verifying|searching/i.test(textOf(el)));
+
+    const loadingUseBlocks = qsa('svg use[xlink\\:href*="loading_icon__animated"], svg use[href*="loading_icon__animated"]')
+      .map(use => use.closest('.check-verification-block') || use.closest('[class*="verification"]') || use.closest('[class*="check"]') || use.closest('div'))
+      .filter(Boolean)
+      .filter(isVisible)
+      .filter(el => /正在验证|正在搜索|verifying|searching/i.test(textOf(el)));
+
+    const texts = [...new Set([...blocks, ...loadingUseBlocks].map(textOf).filter(Boolean))].slice(0, 5);
+
+    return {
+      running: texts.length > 0,
+      count: texts.length,
+      texts,
+    };
+  }
+
+  async function waitForPageStable(options = {}) {
+    const {
+      timeout = 20000,
+      stableMs = 900,
+      label = '页面',
+    } = options;
+
+    setModuleStatus('import', `等待${label}稳定...`);
+
+    const start = Date.now();
+    let lastSig = '';
+    let lastChange = Date.now();
+
+    while (Date.now() - start < timeout) {
+      const bodyText = document.body ? document.body.innerText : '';
+      const sig = [
+        document.readyState,
+        location.href,
+        bodyText.length,
+        qsa('button').length,
+        qsa('.refresh-img, [class*="loading"], [class*="spinner"], [class*="skeleton"], svg use[href*="loading"], svg use[xlink\\:href*="loading"]').length,
+      ].join('|');
+
+      if (sig !== lastSig) {
+        lastSig = sig;
+        lastChange = Date.now();
+      }
+
+      if (document.readyState === 'complete' && Date.now() - lastChange >= stableMs) {
+        addLog('import', `${label}已稳定。`);
+        setModuleStatus('import', `${label}已稳定`);
+        return true;
+      }
+
+      await sleep(250);
+    }
+
+    addLog('import', `${label}等待稳定超时，继续尝试。`, 'warn');
+    setModuleStatus('import', `${label}稳定超时`);
+    return false;
+  }
+
+  function hasBlockingModal() {
+    const roots = qsa('[role="dialog"], .modal, .app-modal, .snv-modal, .n-modal, .vfm__content, .v-overlay, .popup, .dialog')
+      .filter(isVisible);
+
+    return roots.some(root => {
+      const t = textOf(root);
+      if (/从文件导入|拖放 文件即可上传|选择文件|上传文件|准备验证|准备验证 .*邮箱地址|验证$/.test(t)) return false;
+      if (/确定|取消|无法访问|不属于您帐户|错误|失败/.test(t)) return true;
+      return false;
+    });
+  }
+
+  async function waitForMainPageReady(timeout = 30000) {
+    const start = Date.now();
+    let lastLogAt = 0;
+
+    while (Date.now() - start < timeout) {
+      if (!importPauseCheckpoint('等待主页可操作')) return false;
+
+      await waitForPageStable({ timeout: 5000, stableMs: 700, label: '主页面' });
+
+      if (hasBlockingModal()) {
+        if (Date.now() - lastLogAt > 5000) {
+          addLog('import', '检测到可能阻挡操作的弹窗，请人工关闭后脚本会继续。', 'warn');
+          lastLogAt = Date.now();
+        }
+        await sleep(1000);
+        continue;
+      }
+
+      if (!looksLikeImportWizardPage() && (findAddProspectButton() || findVerifyEmailButton() || detectVerificationRunning().running)) {
+        return true;
+      }
+
+      if (Date.now() - lastLogAt > 5000) {
+        addLog('import', '等待主页面关键按钮出现：添加潜在客户 / 验证邮箱地址。', 'warn');
+        lastLogAt = Date.now();
+      }
+
+      await sleep(800);
+    }
+
+    addLog('import', '等待主页面可操作超时，继续按当前页面尝试。', 'warn');
+    return false;
+  }
+
+  async function clickVerifyIfClickable(stage) {
+    if (!importPauseCheckpoint('点击验证邮箱前')) return 'paused';
+
+    const running = detectVerificationRunning();
+
+    if (running.running) {
+      addLog('import', `检测到邮箱正在验证：${running.texts.join(' ｜ ') || '验证中'}`, 'warn');
+      setModuleStatus('import', '等待验证完成');
+      return 'running';
+    }
+
+    const btn = findVerifyEmailButton();
+
+    if (!btn) {
+      return 'not_found';
+    }
+
+    const disabled = isDisabledLike(btn);
+    const visible = isVisible(btn);
+    const clickable = isClickable(btn);
+
+    addLog('import', `检测验证按钮：可见=${visible ? '是' : '否'}；禁用=${disabled ? '是' : '否'}；可点击=${clickable ? '是' : '否'}；阶段=${stage}`);
+
+    if (!visible || disabled) {
+      return 'disabled';
+    }
+
+    if (!importPauseCheckpoint('点击验证邮箱地址按钮前')) return 'paused';
+    await safeClickAsync(btn, '验证邮箱地址按钮');
+    addLog('import', '已点击“验证邮箱地址”。', 'ok');
+
+    await sleep(600);
+    if (!importPauseCheckpoint('点击弹窗验证按钮前')) return 'paused';
+    await waitForPageStable({ timeout: 8000, stableMs: 500, label: '验证弹窗' });
+
+    const confirmBtn = findConfirmVerifyButton();
+
+    if (!confirmBtn) {
+      addLog('import', '未找到弹窗里的“验证”按钮。', 'err');
+      return 'confirm_not_found';
+    }
+
+    if (!importPauseCheckpoint('点击弹窗验证按钮前')) return 'paused';
+    await safeClickAsync(confirmBtn, '弹窗验证按钮');
+    addLog('import', '已点击弹窗“验证”。', 'ok');
+
+    APP.importState.lastVerifyClickAt = Date.now();
+    await sleep(900);
+
+    return 'clicked';
+  }
+
+  async function waitVerificationFinish(maxMs = 5 * 60 * 1000) {
+    const start = Date.now();
+    let logged = false;
+
+    while (Date.now() - start < maxMs) {
+      if (!importPauseCheckpoint('等待邮箱验证完成')) return false;
+
+      const running = detectVerificationRunning();
+
+      if (!running.running) {
+        if (logged) addLog('import', '验证状态已结束。', 'ok');
+        return true;
+      }
+
+      if (!logged) {
+        addLog('import', `等待邮箱验证完成：${running.texts.join(' ｜ ') || '验证中'}`, 'warn');
+        logged = true;
+      }
+
+      setModuleStatus('import', '邮箱验证中...');
+      await sleep(3000);
+    }
+
+    addLog('import', '等待邮箱验证完成超时，本轮停止，避免误操作。', 'err');
+    return false;
+  }
+
+  function findAddProspectButton() {
+    const btns = qsa('button, [role="button"], .snv-btn, .n-button, a').filter(isVisible);
+
+    return btns.find(el => /添加潜在客户|Add prospects|Add prospect/i.test(textOf(el))) || null;
+  }
+
+  function findFileImportOption() {
+    const candidates = qsa('button, [role="button"], a, li, div, span')
+      .filter(isVisible)
+      .filter(el => {
+        const t = textOf(el);
+        return /从文件导入|文件导入|Import from file|From file/i.test(t);
+      });
+
+    candidates.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      return (ar.width * ar.height) - (br.width * br.height);
+    });
+
+    return candidates[0] || null;
+  }
+
+  function findFileImportDialogRoot() {
+    const candidates = qsa('div, section, article, [role="dialog"], .modal, .app-modal, .snv-modal, .n-modal, .vfm__content, .popup, .dialog')
+      .filter(isVisible)
+      .map(el => {
+        const r = el.getBoundingClientRect();
+        const t = textOf(el);
+        const area = r.width * r.height;
+        const centered =
+          r.left > 80 &&
+          r.top > 40 &&
+          r.right < window.innerWidth - 40 &&
+          r.bottom < window.innerHeight - 20;
+
+        const titleHit = /从\s*文件\s*导入/i.test(t);
+        const uploadHit = /拖放\s*文件.*上传|选择\s*文件|上传\s*文件|Excel、?\s*CSV\s*或\s*TXT|Excel,\s*CSV|TXT\s*文件/i.test(t);
+
+        return { el, r, t, area, centered, titleHit, uploadHit };
+      })
+      .filter(x =>
+        x.titleHit &&
+        x.uploadHit &&
+        x.centered &&
+        x.r.width >= 280 &&
+        x.r.width <= 900 &&
+        x.r.height >= 180 &&
+        x.r.height <= 760
+      )
+      .sort((a, b) => a.area - b.area);
+
+    return candidates[0] ? candidates[0].el : null;
+  }
+
+  function isFileImportModalOpen() {
+    if (looksLikeImportWizardPage() && /字段映射|数据设置|下一步|导入/.test(textOf(document.body))) {
+      return false;
+    }
+
+    return Boolean(findFileImportDialogRoot());
+  }
+
+  function findUploadFileButton() {
+    const root = findFileImportDialogRoot();
+    if (!root) return null;
+
+    const btns = qsa('button, [role="button"], .snv-btn, .n-button', root)
+      .filter(isVisible)
+      .filter(el => /上传\s*文件|Upload\s*file|Upload/i.test(textOf(el)));
+
+    const enabled = btns.find(el => !isDisabledLike(el));
+    return enabled || btns[0] || null;
+  }
+
+  function modalHasSelectedFile() {
+    const root = findFileImportDialogRoot();
+    if (!root) return false;
+
+    const t = textOf(root);
+    const upload = findUploadFileButton();
+
+    if (upload && isVisible(upload) && !isDisabledLike(upload)) return true;
+
+    return Boolean(
+      /上传\s*文件|删除/.test(t) &&
+      /\.(xlsx|xls|csv|txt)\b/i.test(t)
+    );
+  }
+
+  async function openImportDialogIfNeeded() {
+    if (!importPauseCheckpoint('打开文件导入弹窗前')) return true;
+
+    if (isFileImportModalOpen()) {
+      addLog('import', '文件导入弹窗已打开，等待人工选择文件。');
+      return true;
+    }
+
+    if (Date.now() - APP.importState.lastAutoOpenAt < 4500) {
+      return false;
+    }
+
+    const addBtn = findAddProspectButton();
+
+    if (!addBtn || !isVisible(addBtn) || isDisabledLike(addBtn)) {
+      addLog('import', '未找到可点击的“添加潜在客户”按钮，暂不打开导入。', 'warn');
+      return false;
+    }
+
+    APP.importState.lastAutoOpenAt = Date.now();
+
+    if (!importPauseCheckpoint('点击添加潜在客户前')) return true;
+    await safeClickAsync(addBtn, '添加潜在客户按钮');
+    addLog('import', '已点击“添加潜在客户”。', 'ok');
+
+    await sleep(500);
+
+    if (!importPauseCheckpoint('点击从文件导入前')) return true;
+    const option = findFileImportOption();
+
+    if (!option) {
+      addLog('import', '未找到“从文件导入”选项。', 'err');
+      return false;
+    }
+
+    await safeClickAsync(option, '从文件导入选项');
+    addLog('import', '已点击“从文件导入”。请人工选择文件。', 'ok');
+
+    patchImportCycle({
+      importDialogOpened: true,
+      waitingFileSince: Date.now(),
+    });
+
+    return true;
+  }
+
+  async function handleFileImportModal(cycle) {
+    if (looksLikeImportWizardPage() && /字段映射|数据设置|下一步|导入/.test(textOf(document.body))) {
+      return false;
+    }
+
+    if (!isFileImportModalOpen()) return false;
+
+    if (!importPauseCheckpoint('文件导入弹窗处理中')) return true;
+
+    const upload = findUploadFileButton();
+    const selected = modalHasSelectedFile();
+
+    if (upload && isVisible(upload) && !isDisabledLike(upload)) {
+      const elapsed = Date.now() - APP.importState.lastUploadClickAt;
+
+      if (cycle.uploadClicked && elapsed < 12000) {
+        setModuleStatus('import', '上传已点击，等待跳转');
+        return true;
+      }
+
+      if (cycle.uploadClicked && elapsed >= 12000) {
+        if (APP.importState.uploadRetryCount >= APP.importState.uploadRetryLimit) {
+          addLog('import', '上传后仍停留在文件导入弹窗，已达到重试上限。请手动点击“上传文件”或重新选择文件。', 'err');
+          setModuleStatus('import', '上传未跳转，需人工处理');
+          return true;
+        }
+
+        APP.importState.uploadRetryCount += 1;
+        addLog('import', `上传后仍停留在弹窗，准备重试上传：${APP.importState.uploadRetryCount}/${APP.importState.uploadRetryLimit}`, 'warn');
+        patchImportCycle({ uploadClicked: false });
+      }
+
+      if (!cycle.uploadClicked || elapsed >= 12000) {
+        if (!importPauseCheckpoint('点击上传文件前')) return true;
+        APP.importState.lastUploadClickAt = Date.now();
+
+        addLog('import', '检测到“上传文件”按钮可点击，自动上传。', 'ok');
+        await safeClickAsync(upload, '上传文件按钮');
+        addLog('import', '已点击“上传文件”。', 'ok');
+
+        patchImportCycle({ uploadClicked: true });
+
+        await sleep(1200);
+        if (!importPauseCheckpoint('上传文件后等待跳转前')) return true;
+        await waitForPageStable({ timeout: 15000, stableMs: 900, label: '上传后页面' });
+
+        return true;
+      }
+    }
+
+    if (upload && isDisabledLike(upload)) {
+      setModuleStatus('import', '等待上传按钮可点');
+      addLog('import', '“上传文件”按钮存在但不可点击，继续等待。', 'warn');
+      return true;
+    }
+
+    if (!selected) {
+      if (!cycle.waitingFileSince) {
+        patchImportCycle({ waitingFileSince: Date.now() });
+      }
+
+      setModuleStatus('import', '等待人工选择文件');
+      return true;
+    }
+
+    addLog('import', '检测到文件已选择，但暂未找到可点击的“上传文件”按钮，继续等待。', 'warn');
+    setModuleStatus('import', '等待上传文件按钮');
+    return true;
+  }
+
+  function findNextButton() {
+    const btns = qsa('button, [role="button"], .snv-btn, .n-button')
+      .filter(isVisible)
+      .filter(el => {
+        const t = textOf(el).trim();
+        return /^(下一步|Next)$/i.test(t) && !/上一步|Previous|取消|Cancel/i.test(t);
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (br.right + br.bottom) - (ar.right + ar.bottom);
+      });
+
+    return btns.find(el => !isDisabledLike(el)) || btns[0] || null;
+  }
+
+  function findImportButton() {
+    const btns = qsa('button, [role="button"], .snv-btn, .n-button')
+      .filter(isVisible)
+      .filter(el => {
+        const t = textOf(el).trim();
+        return /^(导入|Import)$/i.test(t) && !/取消导入|取消|Cancel/i.test(t);
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (br.right + br.bottom) - (ar.right + ar.bottom);
+      });
+
+    return btns.find(el => !isDisabledLike(el)) || btns[0] || null;
+  }
+
+  function currentWizardStep() {
+    const text = textOf(document.body);
+    const next = findNextButton();
+    const imp = findImportButton();
+
+    if (next && !imp) return 'mapping';
+    if (imp && !next) return 'settings';
+
+    if (next && imp) {
+      const nr = next.getBoundingClientRect();
+      const ir = imp.getBoundingClientRect();
+      return (ir.right + ir.bottom) > (nr.right + nr.bottom) ? 'settings' : 'mapping';
+    }
+
+    if (/重复设置|选择\s*要添加潜在客户的列表|导入位置|合并数据|创建多个记录|不上传/.test(text)) {
+      return 'settings';
+    }
+
+    if (/拖放\s*字段|跳过第一行|添加自定义字段/.test(text)) {
+      return 'mapping';
+    }
+
+    return 'unknown';
+  }
+
+  async function handleImportWizard(cycle) {
+    if (!looksLikeImportWizardPage()) return false;
+
+    if (!importPauseCheckpoint('导入向导页处理中')) return true;
+
+    APP.importState.uploadRetryCount = 0;
+
+    const step = currentWizardStep();
+    setModuleStatus('import', `导入页：${step}`);
+    addLog('import', `导入向导当前步骤判定：${step}`);
+
+    if (step === 'mapping') {
+      const nextBtn = findNextButton();
+
+      if (!nextBtn) {
+        addLog('import', '字段映射页：未找到“下一步”按钮。', 'err');
+        return true;
+      }
+
+      addLog('import', `字段映射页：检测到下一步按钮；文本=${textOf(nextBtn)}；禁用=${isDisabledLike(nextBtn) ? '是' : '否'}；可见=${isVisible(nextBtn) ? '是' : '否'}`);
+
+      if (isDisabledLike(nextBtn)) {
+        addLog('import', '字段映射页：“下一步”不可点击，等待字段映射完成。', 'warn');
+        return true;
+      }
+
+      if (Date.now() - APP.importState.lastNextClickAt < 5000) {
+        return true;
+      }
+
+      if (cycle.nextClicked) {
+        addLog('import', '字段映射页仍停留，但本轮记录已点过“下一步”，执行重试点击。', 'warn');
+      }
+
+      if (!importPauseCheckpoint('点击下一步前')) return true;
+      APP.importState.lastNextClickAt = Date.now();
+
+      await safeClickAsync(nextBtn, '下一步按钮');
+      addLog('import', '已点击“下一步”。', 'ok');
+
+      patchImportCycle({ nextClicked: true });
+      await sleep(1200);
+      if (!importPauseCheckpoint('点击下一步后等待数据设置页前')) return true;
+      await waitForPageStable({ timeout: 20000, stableMs: 900, label: '数据设置页面' });
+
+      return true;
+    }
+
+    if (step === 'settings') {
+      const importBtn = findImportButton();
+
+      if (!importBtn) {
+        addLog('import', '数据设置页：未找到“导入”按钮。', 'err');
+        return true;
+      }
+
+      addLog('import', `数据设置页：检测到导入按钮；文本=${textOf(importBtn)}；禁用=${isDisabledLike(importBtn) ? '是' : '否'}；可见=${isVisible(importBtn) ? '是' : '否'}`);
+
+      if (isDisabledLike(importBtn)) {
+        addLog('import', '数据设置页：“导入”按钮不可点击，等待页面设置完成。', 'warn');
+        return true;
+      }
+
+      if (Date.now() - APP.importState.lastImportClickAt < 5000) {
+        return true;
+      }
+
+      if (cycle.importClicked) {
+        addLog('import', '数据设置页仍停留，但本轮记录已点过“导入”，执行重试点击。', 'warn');
+      }
+
+      if (!importPauseCheckpoint('点击导入前')) return true;
+      APP.importState.lastImportClickAt = Date.now();
+
+      await safeClickAsync(importBtn, '导入按钮');
+      addLog('import', '已点击“导入”，等待返回主列表页。', 'ok');
+
+      patchImportCycle({ importClicked: true });
+      await sleep(1200);
+      if (!importPauseCheckpoint('点击导入后等待主列表页前')) return true;
+      await waitForPageStable({ timeout: 45000, stableMs: 1200, label: '导入后页面' });
+
+      return true;
+    }
+
+    addLog('import', '导入页面步骤未知，等待页面稳定或人工确认。', 'warn');
+    return true;
+  }
+
+  async function handleMainPage(cycle) {
+    if (!looksLikeMainProspectsPage()) return false;
+
+    if (!importPauseCheckpoint('主页处理中')) return true;
+
+    await waitForMainPageReady();
+
+    if (!importPauseCheckpoint('主页准备完成后')) return true;
+
+    const running = detectVerificationRunning();
+
+    if (running.running) {
+      await waitVerificationFinish();
+      return true;
+    }
+
+    const verifyBtn = findVerifyEmailButton();
+    const verifyClickable = Boolean(
+      verifyBtn &&
+      isVisible(verifyBtn) &&
+      !isDisabledLike(verifyBtn) &&
+      Date.now() - APP.importState.lastVerifyClickAt > 6000
+    );
+
+    if (verifyClickable) {
+      const res = await clickVerifyIfClickable(cycle.importClicked ? '导入后检测' : '导入前检测');
+
+      if (res === 'clicked') {
+        if (cycle.importClicked) {
+          patchImportCycle({ verifyAfterImportDone: true });
+        } else {
+          patchImportCycle({ verifyBeforeImportDone: true });
+        }
+
+        await waitVerificationFinish();
+
+        if (cycle.importClicked) {
+          markImportCycleDone('导入后验证已执行');
+          setModuleStatus('import', '本轮完成');
+        }
+
+        return true;
+      }
+
+      if (res === 'running') {
+        await waitVerificationFinish();
+        return true;
+      }
+
+      if (res === 'paused') return true;
+    }
+
+    if (!cycle.verifyBeforeImportDone && !cycle.importClicked) {
+      addLog('import', '导入前没有可点击的验证按钮，继续打开文件导入。');
+      patchImportCycle({ verifyBeforeImportDone: true });
+    }
+
+    if (!cycle.importClicked) {
+      setModuleStatus('import', '准备从文件导入');
+      await openImportDialogIfNeeded();
+      return true;
+    }
+
+    if (cycle.importClicked && !cycle.verifyAfterImportDone) {
+      patchImportCycle({ verifyAfterImportDone: true });
+      markImportCycleDone('导入后无需验证或按钮不可用');
+      setModuleStatus('import', '本轮完成');
+      return true;
+    }
+
+    return true;
+  }
+
+  async function importAutoTick() {
+    if (APP.importState.closed || APP.importState.locked) return;
+
+    /*
+     * 合并后，只有当前模块是“导入”时才运行导入自动流程。
+     * 避免切到导出模块后，导入逻辑继续自动弹出文件导入窗口。
+     */
+    if (APP.activeModule !== 'import') return;
+
+    if (APP.importState.paused) {
+      setModuleStatus('import', '已暂停');
+      return;
+    }
+
+    if (isSearchBoxFocused()) {
+      setModuleStatus('import', '搜索框输入中，自动暂停');
+      if (Date.now() - APP.importState.lastSearchPauseLogAt > 6000) {
+        addLog('import', '搜索框获得焦点，自动流程临时暂停；输入关键词后按 Enter / 点搜索会执行搜索。', 'warn');
+        APP.importState.lastSearchPauseLogAt = Date.now();
+      }
+      return;
+    }
+
+    APP.importState.locked = true;
+
+    try {
+      const cycle = ensureImportCycle();
+
+      if (cycle.completed) {
+        setModuleStatus('import', '待命');
+        return;
+      }
+
+      if (Date.now() - APP.importState.lastActionAt < 500) {
+        return;
+      }
+
+      const wizardHandled = await handleImportWizard(cycle);
+      if (wizardHandled) return;
+
+      const modalHandled = await handleFileImportModal(cycle);
+      if (modalHandled) return;
+
+      const mainHandled = await handleMainPage(cycle);
+      if (mainHandled) return;
+
+      setModuleStatus('import', '未识别页面，等待');
+    } catch (err) {
+      addLog('import', `自动流程异常：${err.message || err}`, 'err');
+      setModuleStatus('import', '自动流程异常');
+    } finally {
+      APP.importState.lastActionAt = Date.now();
+      APP.importState.locked = false;
+    }
+  }
+
+  /**********************************************************************
+   * 导出模块
+   **********************************************************************/
+
+  function exportLog(message, type = 'info') {
+    addLog('export', message, type);
+  }
+
+  function updateExportStatus(status, isRunning = false) {
+    setModuleStatus('export', status);
+    APP.exportState.running = isRunning;
+    if (APP.activeModule === 'export') renderControls();
+  }
+
+  function toggleExportAutomation() {
+    if (APP.exportState.running) {
+      stopExportAutomation();
+      return;
+    }
+    runExportAutomation();
+  }
+
+  function ensureExportRunning() {
+    if (!APP.exportState.running) {
+      throw new Error('任务已停止');
+    }
+  }
+
+  function waitForExportCondition(fn, timeout = 10000, interval = 250) {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+
+      const check = () => {
+        if (!APP.exportState.running) {
+          reject(new Error('任务已停止'));
+          return;
+        }
+
+        try {
+          const result = fn();
+          if (result) {
+            resolve(result);
+            return;
+          }
+        } catch (e) {}
+
+        if (Date.now() - start > timeout) {
+          reject(new Error('等待超时'));
+          return;
+        }
+
+        setTimeout(check, interval);
+      };
+
+      check();
+    });
+  }
+
+  function getEmailSearchingBlock() {
+    const blocks = document.querySelectorAll('.check-verification-block');
+
+    for (const block of blocks) {
+      if (!isVisible(block)) continue;
+
+      const text = (block.textContent || '').trim();
+      const hasAnimatedLoadingIcon = !!block.querySelector('use[xlink\\:href="#loading_icon__animated"]');
+      const hasSearchingText = text.includes('正在搜索邮箱地址');
+
+      if (hasAnimatedLoadingIcon && hasSearchingText) {
+        return block;
+      }
+    }
+
+    return null;
+  }
+
+  function collectActiveEmailSearchingElements() {
+    const matches = [];
+    const seen = new Set();
+
+    function pushMatch(el, source) {
+      if (!el || seen.has(el) || !isVisible(el)) return;
+      const text = getElementText(el);
+      if (!text.includes('正在搜索邮箱地址')) return;
+      seen.add(el);
+      matches.push({
+        element: el,
+        source,
+        text,
+        selector: buildStableSelectorSafe(el),
+        cssPath: getCssPath(el),
+      });
+    }
+
+    document.querySelectorAll('.check-verification-block').forEach(block => {
+      const text = getElementText(block);
+      const hasAnimatedLoadingIcon = !!block.querySelector('use[xlink\\:href="#loading_icon__animated"]');
+      if (hasAnimatedLoadingIcon && text.includes('正在搜索邮箱地址')) {
+        pushMatch(block, 'top-block');
+      }
+    });
+
+    document.querySelectorAll('.generic__searching, .stop-drag, .row-info, td.row__cell--relative').forEach(el => {
+      const text = getElementText(el);
+      if (!text.includes('正在搜索邮箱地址')) return;
+
+      const searchingNode = el.classList.contains('generic__searching')
+        ? el
+        : (el.querySelector('.generic__searching') || el);
+
+      pushMatch(searchingNode, 'row-inline');
+    });
+
+    document.querySelectorAll('div, span').forEach(el => {
+      if (seen.has(el) || !isVisible(el)) return;
+      const text = getElementText(el);
+      if (!text.includes('正在搜索邮箱地址')) return;
+      if (text.length > 80) return;
+      pushMatch(el, 'text-fallback');
+    });
+
+    return matches;
+  }
+
+  function getExportingBlock() {
+    const blocks = document.querySelectorAll('.check-verification-block');
+
+    for (const block of blocks) {
+      const text = (block.textContent || '').trim();
+      const hasAnimatedLoadingIcon = !!block.querySelector('use[xlink\\:href="#loading_icon__animated"]');
+      const hasExportingText = text.includes('正在导出');
+
+      if (hasAnimatedLoadingIcon && hasExportingText) {
+        return block;
+      }
+    }
+
+    return null;
+  }
+
+  function getExportSuccessAlert() {
+    const candidates = [
+      ...document.querySelectorAll('[data-test="prospects-export-info-alert"]'),
+      ...document.querySelectorAll('.snovio-alert.snovio-alert--success.alert--margin'),
+      ...document.querySelectorAll('.snovio-alert.snovio-alert--success'),
+    ];
+
+    for (const el of candidates) {
+      const text = getElementText(el);
+      if (!text) continue;
+      if (text.includes('导出成功') || text.includes('下载您的列表')) {
+        return el;
+      }
+    }
+
+    return null;
+  }
+
+  async function waitForEmailSearchComplete(maxWait = EXPORT.EMAIL_SEARCH_WAIT_TIMEOUT_MS) {
+    const initialMatches = collectActiveEmailSearchingElements();
+
+    if (!initialMatches.length) {
+      exportLog('未检测到邮箱搜索状态，直接继续');
+      return true;
+    }
+
+    exportLog(`检测到邮箱仍在搜索，当前命中 ${initialMatches.length} 处状态，等待完成...`);
+
+    const start = Date.now();
+    let lastLogAt = 0;
+    let stableStartAt = null;
+
+    while (Date.now() - start < maxWait) {
+      ensureExportRunning();
+
+      const matches = collectActiveEmailSearchingElements();
+      if (!matches.length) {
+        if (!stableStartAt) {
+          stableStartAt = Date.now();
+          exportLog(`搜索状态已全部消失，开始 ${EXPORT.EMAIL_SEARCH_STABLE_BUFFER_MS / 1000} 秒缓冲确认...`, 'ok');
+        }
+
+        const stableElapsed = Date.now() - stableStartAt;
+        if (stableElapsed >= EXPORT.EMAIL_SEARCH_STABLE_BUFFER_MS) {
+          exportLog('邮箱搜索已完成，继续导出流程', 'ok');
+          return true;
+        }
+
+        await sleep(300);
+        continue;
+      }
+
+      stableStartAt = null;
+
+      const now = Date.now();
+      if (now - lastLogAt > 15000) {
+        const elapsedSec = Math.floor((now - start) / 1000);
+        const topCount = matches.filter(item => item.source === 'top-block').length;
+        const rowCount = matches.filter(item => item.source === 'row-inline').length;
+        exportLog(`邮箱仍在搜索，已等待 ${elapsedSec} 秒；顶部 ${topCount} 处，列表 ${rowCount} 处，总计 ${matches.length} 处...`);
+        lastLogAt = now;
+      }
+
+      await sleep(1000);
+    }
+
+    throw new Error('等待邮箱搜索完成超时（已超过 10 分钟）');
+  }
+
+  function buildStableSelectorSafe(el) {
+    if (!el) return null;
+
+    if (el.id) {
+      return `#${CSS.escape(el.id)}`;
+    }
+
+    const dataTest = el.getAttribute('data-test');
+    if (dataTest) {
+      return `[data-test="${CSS.escape(dataTest)}"]`;
+    }
+
+    const trackingId = el.getAttribute('plerdy-tracking-id');
+    if (trackingId) {
+      return `[plerdy-tracking-id="${trackingId}"]`;
+    }
+
+    const classes = [...el.classList].filter(Boolean).slice(0, 4);
+    if (classes.length) {
+      return `${el.tagName.toLowerCase()}.${classes.map(c => CSS.escape(c)).join('.')}`;
+    }
+
+    return el.tagName.toLowerCase();
+  }
+
+  function getOpenedDropdown() {
+    const dropdowns = document.querySelectorAll('.app-dropdown__drop.style-scroll');
+
+    for (const dropdown of dropdowns) {
+      const text = (dropdown.textContent || '').trim();
+      if (text.includes('导出潜在客户')) {
+        return dropdown;
+      }
+    }
+
+    return null;
+  }
+
+  function getClickableParent(el, root) {
+    let current = el;
+    while (current && current !== root && current !== document.body) {
+      if (
+        current.tagName === 'BUTTON' ||
+        current.tagName === 'A' ||
+        current.getAttribute('role') === 'button' ||
+        current.classList.contains('app-dropdown__drop-item') ||
+        typeof current.onclick === 'function'
+      ) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+    return el;
+  }
+
+  function findExportButtonInDropdown(dropdown) {
+    if (!dropdown) return null;
+
+    const candidates = [...dropdown.querySelectorAll('div, span, button, a, svg, use')];
+
+    for (const el of candidates) {
+      const text = getElementText(el);
+      const localContainer = el.closest('div, button, a, span') || el;
+      const hasExportIcon =
+        !!localContainer.querySelector?.('use[xlink\\:href="#export_icon"]') ||
+        !!el.querySelector?.('use[xlink\\:href="#export_icon"]') ||
+        (el.tagName === 'USE' && el.getAttribute('xlink:href') === '#export_icon');
+
+      if (text.includes('导出潜在客户') && hasExportIcon) {
+        return getClickableParent(localContainer, dropdown);
+      }
+    }
+
+    for (const el of candidates) {
+      const text = getElementText(el);
+      if (text.includes('导出潜在客户')) {
+        const base = el.closest('div, button, a, span') || el;
+        return getClickableParent(base, dropdown);
+      }
+    }
+
+    const iconUse = dropdown.querySelector('use[xlink\\:href="#export_icon"]');
+    if (iconUse) {
+      const base = iconUse.closest('div, button, a, span') || iconUse;
+      return getClickableParent(base, dropdown);
+    }
+
+    return null;
+  }
+
+  function refreshExportButtonLocator() {
+    const dropdown = getOpenedDropdown();
+    if (!dropdown) {
+      throw new Error('未检测到已展开菜单，请先手动或自动展开 ... 菜单');
+    }
+
+    const exportBtn = findExportButtonInDropdown(dropdown);
+    if (!exportBtn) {
+      throw new Error('在当前菜单中未找到导出潜在客户按钮');
+    }
+
+    APP.exportState.exportButtonLocator.selector = buildStableSelectorSafe(exportBtn);
+    return exportBtn;
+  }
+
+  function relocateExportButton() {
+    try {
+      const btn = refreshExportButtonLocator();
+      exportLog(`已重新定位导出按钮：${buildStableSelectorSafe(btn)}`, 'ok');
+    } catch (error) {
+      exportLog(`重新定位失败：${error.message}`, 'err');
+    }
+  }
+
+  async function clickExportMenu() {
+    if (getOpenedDropdown()) {
+      exportLog('检测到菜单已展开，跳过点击菜单');
+      return true;
+    }
+
+    exportLog('步骤1: 点击导出菜单');
+
+    const preferred = getPreferredExportMenuButton();
+    if (preferred) {
+      if (safeClickSync(preferred)) {
+        exportLog(`已点击导出菜单按钮: ${buildStableSelectorSafe(preferred)}`);
+        await waitForExportCondition(() => !!getOpenedDropdown(), 5000, 200);
+        return true;
+      }
+    }
+
+    const toolbar = getProspectsToolbarRoot();
+    const fallbackCandidates = getProspectsMenuButtonCandidates(toolbar || document);
+
+    for (const item of fallbackCandidates) {
+      const element = item.element;
+      if (!isVisible(element)) continue;
+
+      if (safeClickSync(element)) {
+        exportLog(`已点击导出菜单按钮: ${buildStableSelectorSafe(element)}`);
+        await waitForExportCondition(() => !!getOpenedDropdown(), 5000, 200);
+        return true;
+      }
+    }
+
+    throw new Error('未找到导出菜单按钮');
+  }
+
+  async function clickExportLeads() {
+    exportLog('步骤2: 点击导出潜在客户');
+
+    const dropdown = getOpenedDropdown();
+    if (!dropdown) {
+      throw new Error('未检测到已展开的菜单');
+    }
+
+    let element = null;
+    const locator = APP.exportState.exportButtonLocator;
+
+    if (locator.selector) {
+      try {
+        const cached =
+          dropdown.querySelector(locator.selector) ||
+          document.querySelector(locator.selector);
+
+        if (cached && isVisible(cached)) {
+          element = cached;
+          exportLog(`使用缓存定位找到导出按钮：${locator.selector}`);
+        }
+      } catch (e) {}
+    }
+
+    if (!element) {
+      element = findExportButtonInDropdown(dropdown);
+      if (element) {
+        locator.selector = buildStableSelectorSafe(element);
+        exportLog(`已动态重新定位导出按钮：${locator.selector}`);
+      }
+    }
+
+    if (!element) {
+      throw new Error('未找到导出潜在客户按钮');
+    }
+
+    if (!safeClickSync(element)) {
+      throw new Error('点击导出潜在客户失败');
+    }
+
+    exportLog('成功点击导出潜在客户，等待导出对话框打开...', 'ok');
+
+    await waitForExportCondition(() => {
+      return document.querySelector('.export__type-filters') ||
+        document.querySelector('button[data-test="export-prospects-confirm"]');
+    }, 8000, 250);
+
+    return true;
+  }
+
+  async function selectEmailStatusesInExportDialog() {
+    exportLog('步骤3: 选择邮箱状态');
+
+    const exportFilters = document.querySelector('.export__type-filters');
+    if (!exportFilters) {
+      throw new Error('未找到导出筛选器容器');
+    }
+
+    const emailSection = exportFilters.querySelector('.t-filters__section--email');
+    if (!emailSection) {
+      throw new Error('未找到导出对话框中的邮箱状态区域');
+    }
+
+    const emailItems = emailSection.querySelectorAll('.t-filters__item');
+    exportLog(`找到 ${emailItems.length} 个邮箱状态选项`);
+
+    if (emailItems.length === 0) {
+      throw new Error('未找到邮箱状态选项');
+    }
+
+    let selectedCount = 0;
+    for (const item of emailItems) {
+      ensureExportRunning();
+
+      if (!item.classList.contains('t-filters__item--active')) {
+        if (safeClickSync(item)) {
+          selectedCount++;
+          await sleep(250);
+        }
+      } else {
+        selectedCount++;
+      }
+    }
+
+    exportLog(`已选择 ${selectedCount}/${emailItems.length} 个邮箱状态`, 'ok');
+    return selectedCount > 0;
+  }
+
+  async function selectLinkedInProfilesInExportDialog() {
+    exportLog('步骤4: 选择领英资料');
+
+    const exportFilters = document.querySelector('.export__type-filters');
+    if (!exportFilters) {
+      throw new Error('未找到导出筛选器容器');
+    }
+
+    const linkedinSection = exportFilters.querySelector('.t-filters__section--linkedin');
+    if (!linkedinSection) {
+      throw new Error('未找到导出对话框中的领英资料区域');
+    }
+
+    const linkedinItems = linkedinSection.querySelectorAll('.t-filters__item');
+    exportLog(`找到 ${linkedinItems.length} 个领英资料选项`);
+
+    if (linkedinItems.length === 0) {
+      throw new Error('未找到领英资料选项');
+    }
+
+    let selectedCount = 0;
+    for (const item of linkedinItems) {
+      ensureExportRunning();
+
+      if (!item.classList.contains('t-filters__item--active')) {
+        if (safeClickSync(item)) {
+          selectedCount++;
+          await sleep(250);
+        }
+      } else {
+        selectedCount++;
+      }
+    }
+
+    exportLog(`已选择 ${selectedCount}/${linkedinItems.length} 个领英资料`, 'ok');
+    return selectedCount > 0;
+  }
+
+  async function clickExportConfirm() {
+    exportLog('步骤5: 点击导出确认');
+
+    const selector = 'button[data-test="export-prospects-confirm"]';
+
+    const button = await waitForExportCondition(() => {
+      const el = document.querySelector(selector);
+      return el && isVisible(el) && isEnabled(el) ? el : null;
+    }, 10000, 250);
+
+    exportLog('已找到导出确认按钮，准备点击');
+
+    if (!safeClickSync(button)) {
+      throw new Error('点击导出确认按钮失败');
+    }
+
+    exportLog('已点击导出确认，开始等待导出结果...', 'ok');
+    await sleep(1200);
+    return true;
+  }
+
+  function getSubmenuRoot() {
+    return document.querySelector('#snov-submenu');
+  }
+
+  function getProspectsMenuLink() {
+    const root = getSubmenuRoot();
+    if (!root) return null;
+    return (
+      root.querySelector('a[data-route-name="prospectsRoot"]') ||
+      root.querySelector('a[href="/prospects"]') ||
+      [...root.querySelectorAll('a.snovAside__submenu-link')].find(el => getElementText(el).includes('潜在客户')) ||
+      null
+    );
+  }
+
+  function getCompaniesMenuLink() {
+    const root = getSubmenuRoot();
+    if (!root) return null;
+    return (
+      root.querySelector('a[data-route-name="companiesRoot"]') ||
+      root.querySelector('a[href="/companies"]') ||
+      [...root.querySelectorAll('a.snovAside__submenu-link')].find(el => getElementText(el).includes('公司')) ||
+      null
+    );
+  }
+
+  function findCommonAncestor(elements) {
+    const valid = (elements || []).filter(Boolean);
+    if (!valid.length) return null;
+    if (valid.length === 1) return valid[0].parentElement || valid[0];
+
+    const ancestorChains = valid.map(el => {
+      const chain = [];
+      let cur = el;
+      while (cur && cur !== document.body) {
+        chain.push(cur);
+        cur = cur.parentElement;
+      }
+      chain.push(document.body);
+      return chain;
+    });
+
+    for (const candidate of ancestorChains[0]) {
+      if (ancestorChains.every(chain => chain.includes(candidate))) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  function findVisibleElementByText(texts, root = document) {
+    const wanted = Array.isArray(texts) ? texts : [texts];
+    const selectors = 'button, a, div, span';
+    const nodes = root.querySelectorAll(selectors);
+
+    for (const node of nodes) {
+      if (!isVisible(node)) continue;
+      const text = getElementText(node);
+      if (!text) continue;
+      if (wanted.some(t => text.includes(t))) {
+        return node;
+      }
+    }
+    return null;
+  }
+
+  function getProspectsToolbarRoot() {
+    const addBtn = findVisibleElementByText('添加潜在客户');
+    const sendBtn = findVisibleElementByText('发送营销邮件');
+    const verifyBtn = findVisibleElementByText('验证邮箱地址');
+
+    const common = findCommonAncestor([addBtn, sendBtn, verifyBtn].filter(Boolean));
+    if (common && common !== document.body) {
+      return common;
+    }
+
+    return addBtn?.parentElement || sendBtn?.parentElement || verifyBtn?.parentElement || null;
+  }
+
+  function getProspectsMenuButtonCandidates(root = null) {
+    const scope = root || document;
+    const candidates = [];
+    const seen = new Set();
+
+    const push = (el, scoreBase = 0) => {
+      if (!el || seen.has(el) || !isVisible(el)) return;
+      seen.add(el);
+
+      const text = getElementText(el);
+      const rect = el.getBoundingClientRect();
+      let score = scoreBase;
+
+      if (el.matches('button.prospects-context-menu__btn')) score += 100;
+      if (el.matches('button.snv-btn--with-icon-only')) score += 80;
+      if (el.getAttribute('aria-label')) score += 10;
+      if (!text || text === '...' || text === '⋯') score += 20;
+      if (rect.width <= 64) score += 15;
+      if (rect.height <= 48) score += 10;
+      if (el.querySelector('svg, use')) score += 10;
+
+      candidates.push({ element: el, score, text, rect });
+    };
+
+    scope.querySelectorAll('button.prospects-context-menu__btn, button.snv-btn--with-icon-only').forEach(el => push(el, 0));
+    scope.querySelectorAll('button').forEach(el => {
+      const text = getElementText(el);
+      if (!text || text === '...' || text === '⋯' || (el.querySelector('svg, use') && el.getBoundingClientRect().width <= 64)) {
+        push(el, -10);
+      }
+    });
+
+    candidates.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.rect.x - b.rect.x;
+    });
+
+    return candidates;
+  }
+
+  function getPreferredExportMenuButton() {
+    const toolbar = getProspectsToolbarRoot();
+    const scoped = toolbar ? getProspectsMenuButtonCandidates(toolbar) : [];
+    if (scoped.length) return scoped[0].element;
+
+    const global = getProspectsMenuButtonCandidates(document);
+    return global.length ? global[0].element : null;
+  }
+
+  function getProspectsPageReadySnapshot() {
+    const prospectsLink = getProspectsMenuLink();
+    const pathOk = /\/prospects(?:\/|$)/.test(location.pathname);
+    const menuActive = !!(prospectsLink && prospectsLink.classList.contains('active'));
+    const toolbar = getProspectsToolbarRoot();
+    const menuButton = getPreferredExportMenuButton();
+
+    return {
+      pathOk,
+      menuActive,
+      toolbarReady: !!toolbar,
+      menuButtonReady: !!menuButton,
+      toolbar,
+      menuButton,
+    };
+  }
+
+  async function waitForProspectsPageReady(timeout = EXPORT.PROSPECTS_PAGE_READY_TIMEOUT_MS) {
+    exportLog('已切回潜在客户，等待页面刷新完成...');
+    setModuleStatus('export', '等待页面稳定...');
+
+    const start = Date.now();
+    let stableSince = 0;
+    let lastLogAt = 0;
+
+    while (Date.now() - start < timeout) {
+      ensureExportRunning();
+
+      const snapshot = getProspectsPageReadySnapshot();
+      const ready = snapshot.pathOk && snapshot.menuActive && snapshot.toolbarReady && snapshot.menuButtonReady;
+
+      if (ready) {
+        if (!stableSince) {
+          stableSince = Date.now();
+        }
+
+        if (Date.now() - stableSince >= EXPORT.PROSPECTS_PAGE_STABLE_BUFFER_MS) {
+          exportLog('潜在客户页面已稳定，可继续导出', 'ok');
+          setModuleStatus('export', '页面已稳定');
+          return true;
+        }
+      } else {
+        stableSince = 0;
+      }
+
+      const now = Date.now();
+      if (now - lastLogAt > 2000) {
+        exportLog(
+          `等待潜在客户页稳定：路径=${snapshot.pathOk ? '1' : '0'}，菜单=${snapshot.menuActive ? '1' : '0'}，工具栏=${snapshot.toolbarReady ? '1' : '0'}，导出菜单=${snapshot.menuButtonReady ? '1' : '0'}`
+        );
+        lastLogAt = now;
+      }
+
+      await sleep(250);
+    }
+
+    throw new Error('切回潜在客户后等待页面稳定超时');
+  }
+
+  async function switchToProspectsPageIfNeeded() {
+    const link = getProspectsMenuLink();
+    if (!link) {
+      exportLog('未找到左侧【潜在客户】菜单，继续按当前页面执行', 'warn');
+      return false;
+    }
+
+    const isActive = link.classList.contains('active') || /\/prospects(?:\/|$)/.test(location.pathname);
+    if (isActive) {
+      exportLog('当前已在潜在客户界面');
+      return true;
+    }
+
+    exportLog('开始前切回【潜在客户】界面...');
+    if (!safeClickSync(link)) {
+      throw new Error('点击左侧【潜在客户】菜单失败');
+    }
+
+    await waitForExportCondition(() => {
+      const nowLink = getProspectsMenuLink();
+      return !!(nowLink && nowLink.classList.contains('active')) || /\/prospects(?:\/|$)/.test(location.pathname);
+    }, 10000, 250);
+
+    await sleep(300);
+    exportLog('已切回【潜在客户】界面', 'ok');
+    return true;
+  }
+
+  async function switchToCompaniesPageAfterExport() {
+    const link = getCompaniesMenuLink();
+    if (!link) {
+      exportLog('未找到左侧【公司】菜单，跳转公司页已跳过', 'warn');
+      return false;
+    }
+
+    exportLog('导出成功，0.5 秒后切换到【公司】界面...');
+    await sleep(500);
+    ensureExportRunning();
+
+    if (!safeClickSync(link)) {
+      throw new Error('点击左侧【公司】菜单失败');
+    }
+
+    await waitForExportCondition(() => {
+      const nowLink = getCompaniesMenuLink();
+      return !!(nowLink && nowLink.classList.contains('active')) || /\/companies(?:\/|$)/.test(location.pathname);
+    }, 10000, 250);
+
+    exportLog('已切换到【公司】界面', 'ok');
+    return true;
+  }
+
+  async function waitForExportCompletion(maxWait = EXPORT.EXPORT_SUCCESS_TIMEOUT_MS) {
+    exportLog('等待导出成功提示，最长 2 分钟...');
+
+    const start = Date.now();
+    let lastLogAt = 0;
+    let sawExporting = false;
+
+    while (Date.now() - start < maxWait) {
+      ensureExportRunning();
+
+      const successAlert = getExportSuccessAlert();
+      if (successAlert) {
+        const downloadLink = successAlert.querySelector('a.btn-export, a[data-test="prospects-export-alert-no-google"]');
+        if (downloadLink) {
+          exportLog('🎉 导出完成，可下载列表', 'ok');
+        } else {
+          exportLog('🎉 导出完成', 'ok');
+        }
+        return true;
+      }
+
+      const exportingBlock = getExportingBlock();
+      if (exportingBlock && !sawExporting) {
+        sawExporting = true;
+        exportLog('已检测到“正在导出”状态，继续等待导出成功...', 'ok');
+      } else if (exportingBlock) {
+        sawExporting = true;
+      }
+
+      const now = Date.now();
+      if (now - lastLogAt > 10000) {
+        const elapsedSec = Math.floor((now - start) / 1000);
+        if (exportingBlock) {
+          exportLog(`正在导出，已等待 ${elapsedSec} 秒...`);
+        } else if (sawExporting) {
+          exportLog(`导出处理中，已等待 ${elapsedSec} 秒...`);
+        } else {
+          exportLog(`等待导出成功提示，已等待 ${elapsedSec} 秒...`);
+        }
+        lastLogAt = now;
+      }
+
+      await sleep(1000);
+    }
+
+    throw new Error('等待导出成功超时（已超过 2 分钟）');
+  }
+
+  async function runExportAutomation() {
+    if (APP.exportState.running) {
+      exportLog('导出已在运行中', 'warn');
+      return;
+    }
+
+    APP.exportState.running = true;
+    updateExportStatus('运行中', true);
+    exportLog('🚀 开始自动导出流程...');
+
+    try {
+      ensureExportRunning();
+      await switchToProspectsPageIfNeeded();
+
+      ensureExportRunning();
+      await waitForProspectsPageReady();
+
+      ensureExportRunning();
+      await waitForEmailSearchComplete();
+
+      ensureExportRunning();
+      await clickExportMenu();
+
+      ensureExportRunning();
+      await clickExportLeads();
+
+      ensureExportRunning();
+      const emailResult = await selectEmailStatusesInExportDialog();
+      if (!emailResult) {
+        exportLog('邮箱状态选择可能失败，继续执行...', 'err');
+      }
+
+      await sleep(300);
+
+      ensureExportRunning();
+      const linkedinResult = await selectLinkedInProfilesInExportDialog();
+      if (!linkedinResult) {
+        exportLog('领英资料选择可能失败，继续执行...', 'err');
+      }
+
+      await sleep(500);
+
+      ensureExportRunning();
+      await clickExportConfirm();
+
+      ensureExportRunning();
+      await waitForExportCompletion(EXPORT.EXPORT_SUCCESS_TIMEOUT_MS);
+
+      ensureExportRunning();
+      await switchToCompaniesPageAfterExport();
+    } catch (error) {
+      exportLog(`❌ 自动导出失败: ${error.message}`, 'err');
+    } finally {
+      APP.exportState.running = false;
+      updateExportStatus('就绪', false);
+    }
+  }
+
+  function stopExportAutomation() {
+    APP.exportState.running = false;
+    updateExportStatus('已停止', false);
+    exportLog('导出已停止', 'warn');
+  }
+
+  /**********************************************************************
+   * 启动
+   **********************************************************************/
+
+  function setupGlobals() {
+    window.snUnifiedHelper = {
+      version: APP.version,
+      switchModule,
+      importPause: () => {
+        if (!APP.importState.paused) toggleImportManualPause();
+      },
+      importResume: () => {
+        if (APP.importState.paused) toggleImportManualPause();
+      },
+      exportRun: runExportAutomation,
+      exportStop: stopExportAutomation,
+      relocateExportButton,
+    };
+  }
+
+  function start() {
+    createPanel();
+    setupGlobals();
+
+    waitForPageStable({ timeout: 12000, stableMs: 900, label: '初始页面' })
+      .then(() => {
+        ensureImportCycle();
+        setInterval(importAutoTick, APP.tickMs);
+        importAutoTick();
+      })
+      .catch(() => {
+        ensureImportCycle();
+        setInterval(importAutoTick, APP.tickMs);
+        importAutoTick();
+      });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => setTimeout(start, 800));
+  } else {
+    setTimeout(start, 800);
+  }
+})();
