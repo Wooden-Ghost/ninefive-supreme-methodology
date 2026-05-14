@@ -1,0 +1,1784 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>联系人AI分类拆分工具 v2.0.0 批量合并版</title>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --card: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --line: #d9dee7;
+      --line-strong: #c9d1dd;
+      --brand: #2563eb;
+      --brand-hover: #1d4ed8;
+      --danger: #dc2626;
+      --danger-hover: #b91c1c;
+      --soft: #eef2ff;
+      --shadow: 0 10px 30px rgba(31, 41, 55, .08);
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 14px;
+    }
+
+    .wrap {
+      width: min(920px, calc(100vw - 32px));
+      margin: 32px auto;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 18px;
+      letter-spacing: .2px;
+    }
+
+    .tip-wrap { position: relative; display: inline-flex; }
+
+    .tip-icon {
+      width: 22px;
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      color: var(--muted);
+      background: #fff;
+      cursor: help;
+      user-select: none;
+      transition: background .15s ease, border-color .15s ease, color .15s ease, transform .15s ease;
+    }
+
+    .tip-icon:hover {
+      background: var(--soft);
+      border-color: #a5b4fc;
+      color: #3730a3;
+      transform: translateY(-1px);
+    }
+
+    .tooltip {
+      display: none;
+      position: absolute;
+      top: 30px;
+      right: 0;
+      z-index: 20;
+      width: 360px;
+      padding: 12px 14px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: #111827;
+      color: #f9fafb;
+      line-height: 1.65;
+      box-shadow: 0 14px 32px rgba(0,0,0,.18);
+      font-size: 13px;
+    }
+
+    .tip-wrap:hover .tooltip { display: block; }
+
+    .sub {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .body { padding: 20px; }
+
+    .drop {
+      display: block;
+      width: 100%;
+      border: 1.5px dashed var(--line-strong);
+      border-radius: var(--radius);
+      background: #fbfcff;
+      padding: 28px 18px;
+      text-align: center;
+      transition: border-color .15s ease, background .15s ease, box-shadow .15s ease, transform .15s ease;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .drop:hover, .drop.dragover {
+      border-color: var(--brand);
+      background: #eff6ff;
+      box-shadow: 0 8px 22px rgba(37, 99, 235, .10);
+      transform: translateY(-1px);
+    }
+
+    .drop-main {
+      font-weight: 700;
+      font-size: 16px;
+      margin-bottom: 6px;
+    }
+
+    .drop-sub {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    input[type="file"] { display: none; }
+
+    .file-row {
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 28px;
+      color: var(--muted);
+    }
+
+    .file-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .industry-row {
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: 92px 1fr;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .industry-row label {
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .industry-input {
+      width: 100%;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      outline: none;
+      transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
+    }
+
+    .industry-input:hover {
+      border-color: #9ca3af;
+      background: #fbfcff;
+    }
+
+    .industry-input:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, .14);
+    }
+
+    .industry-help {
+      grid-column: 2;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: -4px;
+    }
+
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      margin-top: 16px;
+      align-items: center;
+    }
+
+    .spacer { min-width: 0; color: var(--muted); }
+
+    button {
+      border: 1px solid transparent;
+      border-radius: 10px;
+      padding: 10px 16px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background .15s ease, border-color .15s ease, color .15s ease, transform .15s ease, box-shadow .15s ease, opacity .15s ease;
+      outline: none;
+      white-space: nowrap;
+      font-family: inherit;
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 18px rgba(31, 41, 55, .14);
+    }
+
+    button:active:not(:disabled) {
+      transform: translateY(0);
+      box-shadow: none;
+    }
+
+    button:focus-visible {
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, .20);
+    }
+
+    button:disabled {
+      opacity: .48;
+      cursor: not-allowed;
+    }
+
+    .primary {
+      background: var(--brand);
+      color: #fff;
+    }
+
+    .primary:hover:not(:disabled) { background: var(--brand-hover); }
+
+    .secondary {
+      background: #fff;
+      border-color: var(--line-strong);
+      color: var(--text);
+    }
+
+    .secondary:hover:not(:disabled) {
+      background: #f9fafb;
+      border-color: #9ca3af;
+    }
+
+    .danger {
+      background: #fff;
+      border-color: #fecaca;
+      color: var(--danger);
+    }
+
+    .danger:hover:not(:disabled) {
+      background: #fef2f2;
+      border-color: #fca5a5;
+      color: var(--danger-hover);
+    }
+
+    .download-row {
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    .status {
+      margin-top: 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fafafa;
+      color: var(--muted);
+      line-height: 1.7;
+      white-space: pre-wrap;
+      min-height: 46px;
+    }
+
+    .log-box {
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .log-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 12px;
+      background: #f9fafb;
+      border-bottom: 1px solid var(--line);
+      font-weight: 700;
+    }
+
+    .log-list {
+      height: 150px;
+      overflow: auto;
+      padding: 10px 12px;
+      color: #374151;
+      font-size: 13px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      user-select: text;
+    }
+
+    .log-line { margin: 0 0 3px; }
+    .log-empty { color: var(--muted); }
+
+    .result-grid {
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+
+    .stat {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+      background: #fff;
+    }
+
+    .stat b { display: block; font-size: 18px; margin-top: 4px; }
+    .stat span { color: var(--muted); font-size: 13px; }
+
+    .rejects {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      display: none;
+    }
+
+    .rejects-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      background: #f9fafb;
+      border-bottom: 1px solid var(--line);
+      font-weight: 700;
+    }
+
+    .rejects-list {
+      max-height: 240px;
+      overflow: auto;
+      padding: 8px 12px;
+      background: #fff;
+      line-height: 1.7;
+      font-size: 13px;
+    }
+
+    .muted { color: var(--muted); }
+
+
+    .prompt-tools {
+      margin-top: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .prompt-buttons {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .prompt-panel {
+      display: none;
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .prompt-panel.open { display: block; }
+
+    .prompt-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #f9fafb;
+      font-weight: 700;
+    }
+
+    .prompt-textarea {
+      width: 100%;
+      min-height: 220px;
+      border: 0;
+      outline: none;
+      resize: vertical;
+      padding: 12px;
+      line-height: 1.65;
+      font-size: 13px;
+      font-family: "Microsoft YaHei", Arial, sans-serif;
+      color: var(--text);
+    }
+
+
+    .industry-combo {
+      position: relative;
+      display: grid;
+      grid-template-columns: 1fr 38px;
+      gap: 0;
+    }
+
+    .industry-combo .industry-input {
+      border-top-right-radius: 0;
+      border-bottom-right-radius: 0;
+    }
+
+    .industry-dd-btn {
+      border: 1px solid var(--line-strong);
+      border-left: 0;
+      border-radius: 0 10px 10px 0;
+      padding: 0;
+      background: #fff;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .industry-menu {
+      display: none;
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      right: 0;
+      z-index: 30;
+      max-height: 280px;
+      overflow: auto;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 14px 32px rgba(31, 41, 55, .14);
+      padding: 6px;
+    }
+
+    .industry-menu.open { display: block; }
+
+    .industry-option {
+      padding: 8px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--text);
+    }
+
+    .industry-option:hover,
+    .industry-option.active {
+      background: #eff6ff;
+      color: var(--brand);
+    }
+
+    .file-queue {
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: auto;
+      max-height: 150px;
+      background: #fff;
+      font-size: 12px;
+    }
+
+    .file-queue table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .file-queue th,
+    .file-queue td {
+      padding: 7px 9px;
+      border-bottom: 1px solid #eef2f7;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .file-queue th {
+      position: sticky;
+      top: 0;
+      background: #f9fafb;
+      z-index: 1;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .file-queue td:first-child {
+      max-width: 360px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .body { padding: 16px; }
+    .drop { padding: 20px 16px; }
+    .drop-main { font-size: 15px; margin-bottom: 4px; }
+    .file-row { margin-top: 10px; min-height: 24px; }
+    .industry-row { margin-top: 10px; grid-template-columns: 82px 1fr; }
+    .actions { margin-top: 12px; }
+    .prompt-tools { margin-top: 10px; }
+    .download-row { margin-top: 10px; }
+    .status { margin-top: 12px; padding: 10px 12px; min-height: 40px; line-height: 1.55; }
+    .log-list { height: 110px; line-height: 1.5; }
+    .result-grid { grid-template-columns: repeat(7, 1fr); gap: 8px; }
+    .stat { padding: 9px 10px; }
+    .stat b { font-size: 17px; }
+    .prompt-textarea { min-height: 180px; }
+
+    @media (max-width: 720px) {
+      .head { align-items: flex-start; flex-direction: column; }
+      .tooltip { left: 0; right: auto; width: min(360px, calc(100vw - 60px)); }
+      .industry-row { grid-template-columns: 1fr; }
+      .industry-help { grid-column: 1; }
+      .actions { grid-template-columns: 1fr; }
+      .download-row { justify-content: stretch; }
+      .download-row button { width: 100%; }
+      .result-grid { grid-template-columns: repeat(2, 1fr); }
+      .file-queue td:first-child { max-width: 180px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="head">
+        <div>
+          <div class="title">
+            联系人AI分类拆分工具 v2.0.0
+            <span class="tip-wrap">
+              <span class="tip-icon">?</span>
+              <span class="tooltip">
+                支持单个或多个 Excel；读取每个文件第一个工作表；根据 AI分类 合并拆分为高管、采购、包装；输出不按公司拆文件；文件名为“行业前缀 + 岗位”；删除邮箱标识列；多个邮箱转多行；整批邮箱全局去重；最终表头为 名字、职务、LinkedIn、公司名称、地点、邮箱地址。
+              </span>
+            </span>
+          </div>
+          <p class="sub">上传一个或多个带 AI分类 列的 Excel，填写行业前缀后，合并生成高管、采购、包装三个或以下文件。</p>
+        </div>
+      </div>
+
+      <div class="body">
+        <label id="drop" class="drop" for="fileInput">
+          <div class="drop-main">拖拽一个或多个 xlsx 到这里，或点击选择文件</div>
+          <div class="drop-sub">单个/批量共用同一行业前缀；最终不按公司拆文件</div>
+        </label>
+        <input id="fileInput" type="file" accept=".xlsx,.xlsm" multiple />
+
+        <div class="file-row">
+          <div id="fileName" class="file-name">尚未选择文件</div>
+          <div id="baseName" class="muted"></div>
+        </div>
+        <div id="fileQueue" class="file-queue" style="display:none;"></div>
+
+        <div class="industry-row">
+          <label for="industryInput">行业前缀</label>
+          <div class="industry-combo" id="industryCombo">
+            <input id="industryInput" class="industry-input" placeholder="输入或选择行业，例如：美妆个护香水 / 零售店" autocomplete="off" />
+            <button id="industryDropdownBtn" class="industry-dd-btn" type="button" aria-label="展开行业选项">▾</button>
+            <div id="industryMenu" class="industry-menu" role="listbox"></div>
+          </div>
+          <div class="industry-help">输出文件名 = 行业前缀 + 高管/采购/包装；会记住上一次使用的前缀。</div>
+        </div>
+
+        <div class="actions">
+          <div id="hint" class="spacer">确认表内已有 AI分类：高管 / 采购 / 包装 / 不匹配。</div>
+          <button id="processBtn" class="primary" disabled>开始处理</button>
+        </div>
+
+        <div class="prompt-tools">
+          <div class="muted">AI分类前复制提示词，必要时展开修改。</div>
+          <div class="prompt-buttons">
+            <button id="togglePromptBtn" class="secondary" type="button">AI提示词</button>
+            <button id="copyPromptBtn" class="secondary" type="button">复制提示词</button>
+          </div>
+        </div>
+
+        <div id="promptPanel" class="prompt-panel">
+          <div class="prompt-head">
+            <span>AI处理提示词，可直接修改后复制</span>
+            <span id="copyTip" class="muted">修改会自动保存</span>
+          </div>
+          <textarea id="promptText" class="prompt-textarea" spellcheck="false"></textarea>
+        </div>
+
+        <div class="download-row">
+          <button id="downloadBtn" class="primary" disabled>下载结果</button>
+          <button id="clearBtn" class="danger" disabled>清除文件</button>
+        </div>
+
+        <div id="status" class="status">等待上传文件。</div>
+
+        <div class="log-box">
+          <div class="log-head">
+            <span>运行日志</span>
+            <span class="muted">跨天后下一次打开/运行自动清除</span>
+          </div>
+          <div id="logList" class="log-list"><div class="log-empty">暂无日志。</div></div>
+        </div>
+
+        <div class="result-grid" id="stats" style="display:none;">
+          <div class="stat"><span>处理表格/公司</span><b id="statFiles">0</b></div>
+          <div class="stat"><span>处理人数</span><b id="statPeople">0</b></div>
+          <div class="stat"><span>输出邮箱行</span><b id="statOutput">0</b></div>
+          <div class="stat"><span>高管</span><b id="statExec">0</b></div>
+          <div class="stat"><span>采购</span><b id="statPurchase">0</b></div>
+          <div class="stat"><span>包装</span><b id="statPackaging">0</b></div>
+          <div class="stat"><span>剔除/失败</span><b id="statReject">0</b></div>
+        </div>
+
+        <div id="rejectsBox" class="rejects">
+          <div class="rejects-head">
+            <span>剔除/失败记录（页面查看）</span>
+            <span id="rejectSummary" class="muted"></span>
+          </div>
+          <div id="rejectsList" class="rejects-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    drop: $('drop'),
+    fileInput: $('fileInput'),
+    fileName: $('fileName'),
+    baseName: $('baseName'),
+    fileQueue: $('fileQueue'),
+    industryInput: $('industryInput'),
+    industryDropdownBtn: $('industryDropdownBtn'),
+    industryMenu: $('industryMenu'),
+    processBtn: $('processBtn'),
+    togglePromptBtn: $('togglePromptBtn'),
+    copyPromptBtn: $('copyPromptBtn'),
+    promptPanel: $('promptPanel'),
+    promptText: $('promptText'),
+    copyTip: $('copyTip'),
+    downloadBtn: $('downloadBtn'),
+    clearBtn: $('clearBtn'),
+    status: $('status'),
+    logList: $('logList'),
+    stats: $('stats'),
+    statFiles: $('statFiles'),
+    statPeople: $('statPeople'),
+    statOutput: $('statOutput'),
+    statExec: $('statExec'),
+    statPurchase: $('statPurchase'),
+    statPackaging: $('statPackaging'),
+    statReject: $('statReject'),
+    rejectsBox: $('rejectsBox'),
+    rejectsList: $('rejectsList'),
+    rejectSummary: $('rejectSummary')
+  };
+
+  let selectedFiles = [];
+  let fileItems = [];
+  let generatedFiles = [];
+  let rejectedRows = [];
+  let industryPrefix = '';
+  let isProcessing = false;
+
+  const INDUSTRY_KEY = 'contact_ai_splitter_last_industry_v2';
+  const LOG_KEY = 'contact_ai_splitter_logs_v4';
+  const LOG_DATE_KEY = 'contact_ai_splitter_log_date_v4';
+  const PROMPT_KEY = 'contact_ai_splitter_prompt_v8';
+
+  const INDUSTRY_OPTIONS = [
+    '珠宝', '酒水', '鞋服', '3C电子', '美妆个护香水', '奢侈品', '桌游', '礼品', '食品',
+    '零售店', '设计公司', '贸易公司', '同行（印刷公司）', '其他不符行业'
+  ];
+
+  const CATEGORIES = [
+    { key: '高管', stat: 'statExec' },
+    { key: '采购', stat: 'statPurchase' },
+    { key: '包装', stat: 'statPackaging' }
+  ];
+
+  const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig;
+
+  const DEFAULT_AI_PROMPT = `当前任务是：根据联系人职位/职务字段，对联系人进行岗位分类。
+默认公司为美妆行业品牌方/普通公司场景，除非我明确说明，否则不要按贸易公司、设计公司、同行等特殊公司类型处理。
+
+你的任务是在原表最后新增两列：
+
+1. AI分类
+2. AI判断理由
+
+不要删除、合并、拆分原表行。
+不要修改原有列名和原有内容。
+只在表格最后新增这两列。
+输出为 xlsx 文件，文件名使用：原文件名_AI分类.xlsx。
+
+## Excel文件结构要求
+
+必须基于我上传的原始 xlsx 文件追加 AI分类、AI判断理由 两列。
+不要重新生成一个极简 xlsx 包，不要重建 workbook、sheet、rels、Content_Types 等内部结构。
+保存时应保持标准 xlsx 结构，确保 Excel/WPS 能打开，且浏览器端 ExcelJS 也能正常读取 workbook.sheets。
+如果处理工具支持“保留原文件格式/原表样式/原 workbook 结构”，必须启用该方式。
+本要求用于避免出现 Excel/WPS 能打开，但程序读取时报 Cannot read properties of undefined (reading 'sheets') 的异常。
+
+## AI分类标准值
+
+AI分类只能填写以下四种之一：
+
+- 高管
+- 采购
+- 包装
+- 不匹配
+
+不要填写“疑似高管”“采购相关”“包装岗位”等自由文本。
+
+## 默认岗位分类规则：美妆品牌方 / 普通公司
+
+### 采购
+
+职位中包含或语义接近以下方向，归为采购：
+
+- Procurement
+- Sourcing
+- Buyer
+- Supply
+- vendor
+- purchasing
+
+### 包装
+
+职位中包含或语义接近以下方向，归为包装：
+
+- product manager
+- Packaging
+- Pack
+- Product Development
+
+### 高管
+
+职位中包含或语义接近以下方向，归为高管：
+
+- Founder
+- President
+- head
+- lead
+- CEO
+- Chief
+- VP
+
+### 不匹配
+
+如果职位与采购、包装、高管无关，归为不匹配。
+
+常见不匹配岗位包括但不限于：
+
+- Sales
+- Marketing
+- Social Media
+- PR
+- HR
+- Finance
+- Legal
+- Customer Service
+- Retail
+- Store
+- E-commerce
+- Influencer
+- Graphic Designer
+- Content
+- Community
+- Account Manager
+
+## 多重匹配优先级
+
+如果同一个职位同时符合多个分类，只保留一个最终分类，优先级为：
+
+高管 > 采购 > 包装
+
+示例：
+
+- Founder & Product Development → 高管
+- VP of Packaging → 高管
+- Head of Sourcing → 高管
+- Product Manager → 包装
+- Sourcing Manager → 采购
+
+## 特殊规则
+
+只有当我明确说明公司是贸易公司、包装设计公司、设计公司、同行或印刷公司时，才使用特殊规则。
+如果我没有特别说明，全部默认按美妆品牌方/普通公司规则判断。
+
+## AI判断理由要求
+
+AI判断理由要简短，说明为什么归入该分类。
+
+示例：
+
+- Founder，属于高管/决策层
+- Sourcing Manager，属于采购/供应链相关岗位
+- Product Development，属于产品/包装开发相关岗位
+- Social Media，与采购/包装/高管无关，归为不匹配`;
+
+  let promptSaveTimer = null;
+
+  function loadPrompt() {
+    try { return localStorage.getItem(PROMPT_KEY) || DEFAULT_AI_PROMPT; }
+    catch (_) { return DEFAULT_AI_PROMPT; }
+  }
+
+  function savePrompt(value) {
+    try {
+      localStorage.setItem(PROMPT_KEY, value || DEFAULT_AI_PROMPT);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function schedulePromptSave() {
+    clearTimeout(promptSaveTimer);
+    els.copyTip.textContent = '正在保存...';
+    promptSaveTimer = setTimeout(() => {
+      const ok = savePrompt(els.promptText.value);
+      els.copyTip.textContent = ok ? '已自动保存' : '保存失败，浏览器限制本地存储';
+      setTimeout(() => {
+        if (els.copyTip.textContent === '已自动保存') els.copyTip.textContent = '修改会自动保存';
+      }, 1600);
+    }, 350);
+  }
+
+  function setStatus(text) { els.status.textContent = text; }
+
+  function todayKey() {
+    const d = new Date();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${d.getFullYear()}-${m}-${day}`;
+  }
+
+  function safeGet(key, fallback) {
+    try { return localStorage.getItem(key) ?? fallback; }
+    catch (_) { return fallback; }
+  }
+
+  function safeSet(key, value) {
+    try { localStorage.setItem(key, value); }
+    catch (_) {}
+  }
+
+  function ensureTodayLog() {
+    const today = todayKey();
+    const old = safeGet(LOG_DATE_KEY, '');
+    if (old !== today) {
+      safeSet(LOG_DATE_KEY, today);
+      safeSet(LOG_KEY, '[]');
+    }
+  }
+
+  function getLogs() {
+    ensureTodayLog();
+    try { return JSON.parse(safeGet(LOG_KEY, '[]')) || []; }
+    catch (_) { return []; }
+  }
+
+  function renderLogs() {
+    const logs = getLogs();
+    if (!logs.length) {
+      els.logList.innerHTML = '<div class="log-empty">暂无日志。</div>';
+      return;
+    }
+    els.logList.innerHTML = logs.map(item => `<div class="log-line">[${escapeHtml(item.time)}] ${escapeHtml(item.text)}</div>`).join('');
+    els.logList.scrollTop = els.logList.scrollHeight;
+  }
+
+  function addLog(text) {
+    ensureTodayLog();
+    const now = new Date();
+    const time = now.toLocaleTimeString('zh-CN', { hour12: false });
+    const logs = getLogs();
+    logs.push({ time, text: String(text || '') });
+    while (logs.length > 400) logs.shift();
+    safeSet(LOG_KEY, JSON.stringify(logs));
+    renderLogs();
+  }
+
+  function togglePromptPanel() {
+    const open = els.promptPanel.classList.toggle('open');
+    els.togglePromptBtn.textContent = open ? '收起提示词' : 'AI提示词';
+  }
+
+  async function copyPrompt() {
+    const text = els.promptText.value || DEFAULT_AI_PROMPT;
+    savePrompt(text);
+    try {
+      await navigator.clipboard.writeText(text);
+      els.copyTip.textContent = '已复制';
+      addLog('已复制 AI处理提示词。');
+    } catch (_) {
+      els.promptPanel.classList.add('open');
+      els.togglePromptBtn.textContent = '收起提示词';
+      els.promptText.focus();
+      els.promptText.select();
+      els.copyTip.textContent = '自动复制失败，请手动 Ctrl+C';
+      addLog('复制提示词失败：当前浏览器限制剪贴板写入，请手动复制文本框内容。');
+    }
+    setTimeout(() => { if (els.copyTip.textContent === '已复制') els.copyTip.textContent = '修改会自动保存'; }, 1800);
+  }
+
+  function initIndustryMenu() {
+    els.industryMenu.innerHTML = INDUSTRY_OPTIONS
+      .map(v => `<div class="industry-option" data-value="${escapeHtml(v)}">${escapeHtml(v)}</div>`)
+      .join('');
+    els.industryMenu.addEventListener('click', (e) => {
+      const item = e.target.closest('.industry-option');
+      if (!item) return;
+      els.industryInput.value = item.getAttribute('data-value') || '';
+      updateIndustryState();
+      if (industryPrefix) saveLastIndustry(industryPrefix);
+      closeIndustryMenu();
+    });
+  }
+
+  function openIndustryMenu() {
+    els.industryMenu.classList.add('open');
+    const current = cleanIndustryPrefix(els.industryInput.value);
+    Array.from(els.industryMenu.querySelectorAll('.industry-option')).forEach(item => {
+      item.classList.toggle('active', item.getAttribute('data-value') === current);
+    });
+  }
+
+  function closeIndustryMenu() { els.industryMenu.classList.remove('open'); }
+
+  function cloneStyle(obj) {
+    if (!obj) return undefined;
+    try { return JSON.parse(JSON.stringify(obj)); }
+    catch (_) { return obj; }
+  }
+
+  function textOf(value) {
+    if (value == null) return '';
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value).trim();
+    if (value.text) return String(value.text).trim();
+    if (value.hyperlink && value.text) return String(value.text).trim();
+    if (value.richText) return value.richText.map(v => v.text || '').join('').trim();
+    if (value.result != null) return String(value.result).trim();
+    return String(value).trim();
+  }
+
+  function norm(s) {
+    return String(s || '').replace(/\s+/g, '').replace(/[：:]/g, '').toLowerCase();
+  }
+
+  function cleanFilename(name) {
+    const raw = String(name || '').replace(/\.(xlsx|xlsm)$/i, '');
+    return raw
+      .replace(/_?AI分类结果?/gi, '')
+      .replace(/_?AI分类/gi, '')
+      .replace(/优先联系人/g, '')
+      .replace(/优秀联系人/g, '')
+      .replace(/_?单表头/g, '')
+      .replace(/联系人/g, '')
+      .replace(/[\s_\-]+$/g, '')
+      .replace(/^[\s_\-]+/g, '')
+      .trim() || raw.trim() || '联系人';
+  }
+
+  function cleanIndustryPrefix(value) {
+    return String(value || '').replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, '').trim();
+  }
+
+  function loadLastIndustry() {
+    try { return localStorage.getItem(INDUSTRY_KEY) || ''; }
+    catch (_) { return ''; }
+  }
+
+  function saveLastIndustry(value) {
+    try { localStorage.setItem(INDUSTRY_KEY, cleanIndustryPrefix(value)); }
+    catch (_) {}
+  }
+
+  function updateIndustryState() {
+    industryPrefix = cleanIndustryPrefix(els.industryInput.value);
+    els.processBtn.disabled = isProcessing || !(selectedFiles.length && industryPrefix);
+    if (selectedFiles.length) {
+      els.baseName.textContent = industryPrefix
+        ? `文件：${selectedFiles.length} 个 ｜ 行业前缀：${industryPrefix}`
+        : `文件：${selectedFiles.length} 个 ｜ 请填写行业前缀`;
+    }
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  function resetAll() {
+    selectedFiles = [];
+    fileItems = [];
+    generatedFiles = [];
+    rejectedRows = [];
+    els.fileInput.value = '';
+    els.fileName.textContent = '尚未选择文件';
+    els.baseName.textContent = '';
+    els.fileQueue.style.display = 'none';
+    els.fileQueue.innerHTML = '';
+    els.processBtn.disabled = true;
+    els.downloadBtn.disabled = true;
+    els.clearBtn.disabled = true;
+    els.stats.style.display = 'none';
+    els.rejectsBox.style.display = 'none';
+    els.rejectsList.textContent = '';
+    if (els.rejectSummary) els.rejectSummary.textContent = '';
+    setStats({ files: 0, people: 0, output: 0, exec: 0, purchase: 0, packaging: 0, reject: 0 });
+    setStatus('等待上传文件。');
+    addLog('已清除当前文件和生成结果。');
+  }
+
+  function setFiles(fileList) {
+    const files = Array.from(fileList || []).filter(f => /\.(xlsx|xlsm)$/i.test(f.name));
+    const skipped = Array.from(fileList || []).filter(f => !/\.(xlsx|xlsm)$/i.test(f.name));
+    if (!files.length) {
+      setStatus('请选择 .xlsx 或 .xlsm 文件。');
+      if (skipped.length) addLog(`已忽略 ${skipped.length} 个非 xlsx/xlsm 文件。`);
+      return;
+    }
+    selectedFiles = files;
+    fileItems = files.map(file => ({
+      file,
+      name: file.name,
+      companyName: cleanFilename(file.name),
+      status: '等待',
+      people: 0,
+      output: 0,
+      reject: 0,
+      error: ''
+    }));
+    generatedFiles = [];
+    rejectedRows = [];
+    els.fileName.textContent = files.length === 1 ? files[0].name : `已选择 ${files.length} 个文件`;
+    updateIndustryState();
+    renderFileQueue();
+    els.downloadBtn.disabled = true;
+    els.clearBtn.disabled = false;
+    els.stats.style.display = 'none';
+    els.rejectsBox.style.display = 'none';
+    setStatus(industryPrefix ? '文件已选择，点击“开始处理”。' : '文件已选择，请先填写行业前缀。');
+    addLog(`已选择 ${files.length} 个文件；行业前缀：${industryPrefix || '未填写'}`);
+    if (skipped.length) addLog(`已忽略 ${skipped.length} 个非 xlsx/xlsm 文件。`);
+  }
+
+  function renderFileQueue() {
+    if (!fileItems.length) {
+      els.fileQueue.style.display = 'none';
+      els.fileQueue.innerHTML = '';
+      return;
+    }
+    els.fileQueue.style.display = 'block';
+    els.fileQueue.innerHTML = `
+      <table>
+        <thead><tr><th>文件</th><th>状态</th><th>人数</th><th>输出</th><th>剔除</th></tr></thead>
+        <tbody>
+          ${fileItems.map(item => `
+            <tr>
+              <td title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</td>
+              <td>${escapeHtml(item.status)}${item.error ? `：${escapeHtml(item.error)}` : ''}</td>
+              <td>${item.people || 0}</td>
+              <td>${item.output || 0}</td>
+              <td>${item.reject || 0}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  function updateFileItem(index, patch) {
+    Object.assign(fileItems[index], patch);
+    renderFileQueue();
+  }
+
+  function setStats(s) {
+    els.statFiles.textContent = String(s.files || 0);
+    els.statPeople.textContent = String(s.people || 0);
+    els.statOutput.textContent = String(s.output || 0);
+    els.statExec.textContent = String(s.exec || 0);
+    els.statPurchase.textContent = String(s.purchase || 0);
+    els.statPackaging.textContent = String(s.packaging || 0);
+    els.statReject.textContent = String(s.reject || 0);
+  }
+
+  function isHeaderLike(t) {
+    const x = norm(t);
+    return x.includes('姓名') || x.includes('全名') || x.includes('职位') || x.includes('职务') ||
+      x.includes('linkedin') || x.includes('公司') || x.includes('地址') || x.includes('地点') || x.includes('邮箱') ||
+      x.includes('email') || x.includes('标识') || x.includes('ai分类') || x === 'sn' || x === 'rr';
+  }
+
+  function rowTexts(ws, rowNum) {
+    const row = ws.getRow(rowNum);
+    const arr = [];
+    for (let c = 1; c <= ws.columnCount; c++) arr[c] = textOf(row.getCell(c).value);
+    return arr;
+  }
+
+  function detectHeader(ws) {
+    const maxCheck = Math.min(6, ws.rowCount);
+    const rows = {};
+    for (let r = 1; r <= maxCheck; r++) rows[r] = rowTexts(ws, r);
+
+    let aiRow = null;
+    for (let r = 1; r <= maxCheck; r++) {
+      if ((rows[r] || []).some(t => norm(t) === 'ai分类')) {
+        aiRow = r;
+        break;
+      }
+    }
+
+    if (aiRow) {
+      const aiTexts = rows[aiRow] || [];
+      const nextRow = Math.min(aiRow + 1, ws.rowCount);
+      const nextTexts = rows[nextRow] || rowTexts(ws, nextRow);
+      const nextScore = nextTexts.reduce((acc, t) => acc + (isHeaderLike(t) ? 1 : 0), 0);
+      const hasDetailHeaderBelow = nextRow !== aiRow && nextScore >= 2 && nextTexts.some(t => /邮箱|email|标识/i.test(t));
+      const hasBaseHeaderOnAiRow = aiTexts.some(t => /姓名|全名|职位|职务|公司|linkedin|地址|地点/i.test(t));
+      if (hasDetailHeaderBelow && hasBaseHeaderOnAiRow) return { headerRows: [aiRow, nextRow], dataStart: nextRow + 1 };
+      return { headerRows: [aiRow], dataStart: aiRow + 1 };
+    }
+
+    let bestRow = 1;
+    let bestScore = -1;
+    for (let r = 1; r <= maxCheck; r++) {
+      const texts = rows[r] || [];
+      const score = texts.reduce((acc, t) => acc + (isHeaderLike(t) ? 1 : 0), 0);
+      if (score > bestScore) { bestScore = score; bestRow = r; }
+    }
+
+    const nextRow = Math.min(bestRow + 1, ws.rowCount);
+    const bestTexts = rows[bestRow] || rowTexts(ws, bestRow);
+    const nextTexts = rows[nextRow] || rowTexts(ws, nextRow);
+    const nextScore = nextTexts.reduce((acc, t) => acc + (isHeaderLike(t) ? 1 : 0), 0);
+    const hasGroupedMail = nextTexts.some(t => /邮箱|email|标识/i.test(t)) && bestTexts.some(t => /sn|rr/i.test(t));
+    const useDual = nextRow !== bestRow && nextScore >= 2 && hasGroupedMail;
+    return { headerRows: useDual ? [bestRow, nextRow] : [bestRow], dataStart: useDual ? nextRow + 1 : bestRow + 1 };
+  }
+
+  function buildColumns(ws, headerRows) {
+    const cols = [];
+    for (let c = 1; c <= ws.columnCount; c++) {
+      const parts = headerRows.map(r => textOf(ws.getRow(r).getCell(c).value)).filter(Boolean);
+      const combined = parts.join('/');
+      cols[c] = { index: c, parts, header: combined, n: norm(combined) };
+    }
+    return cols;
+  }
+
+  function findCol(cols, tests) {
+    for (let c = 1; c < cols.length; c++) {
+      if (tests.some(fn => fn(cols[c]))) return c;
+    }
+    return null;
+  }
+
+  function findBestCol(cols, tests) {
+    for (const fn of tests) {
+      for (let c = 1; c < cols.length; c++) {
+        if (fn(cols[c])) return c;
+      }
+    }
+    return null;
+  }
+
+  function isLabelCol(col) {
+    const n = col.n;
+    return n.includes('标识') || n.includes('邮箱标识') || n.includes('sn标识') || n.includes('rr标识');
+  }
+
+  function isEmailCol(col) {
+    const n = col.n;
+    return !isLabelCol(col) && (n.includes('邮箱') || n.includes('email') || n === 'mail');
+  }
+
+  function extractEmailsFromCell(cell) {
+    const s = textOf(cell.value);
+    const hits = s.match(EMAIL_RE) || [];
+    return hits.map(e => e.trim().toLowerCase());
+  }
+
+  function normalizeCategory(v) {
+    const s = String(v || '').trim();
+    if (s === '高管') return '高管';
+    if (s === '采购') return '采购';
+    if (s === '包装') return '包装';
+    return '不匹配';
+  }
+
+  function firstNameWord(value) {
+    const s = textOf(value).trim();
+    if (!s) return '';
+    return s.split(/\s+/)[0] || s;
+  }
+
+  function rowHasContent(row, maxCol) {
+    for (let c = 1; c <= maxCol; c++) {
+      if (textOf(row.getCell(c).value)) return true;
+    }
+    return false;
+  }
+
+  function addReject(fileName, rowNum, name, position, reason, detail = '') {
+    rejectedRows.push({ fileName, rowNum, name: name || '', position: position || '', reason, detail });
+  }
+
+  function setCellFromSource(targetCell, sourceCell, value) {
+    targetCell.value = value;
+    if (sourceCell) {
+      targetCell.style = cloneStyle(sourceCell.style);
+      targetCell.numFmt = sourceCell.numFmt;
+      targetCell.alignment = cloneStyle(sourceCell.alignment);
+      targetCell.border = cloneStyle(sourceCell.border);
+      targetCell.fill = cloneStyle(sourceCell.fill);
+      targetCell.font = cloneStyle(sourceCell.font);
+    }
+  }
+
+  function fixedOutputDefs(map) {
+    return [
+      { key: 'name', outHeader: '名字', sourceCol: map.nameCol, width: 18 },
+      { key: 'position', outHeader: '职务', sourceCol: map.positionCol, width: 24 },
+      { key: 'linkedin', outHeader: 'LinkedIn', sourceCol: map.linkedinCol, width: 28 },
+      { key: 'company', outHeader: '公司名称', sourceCol: map.companyCol, width: 24 },
+      { key: 'address', outHeader: '地点', sourceCol: map.addressCol, width: 20 },
+      { key: 'email', outHeader: '邮箱地址', sourceCol: map.emailCols[0], width: 28 }
+    ];
+  }
+
+  function setupOutputSheet(outWs, sourceWs, sourceHeaderRow, outputDefs) {
+    outWs.views = [{ state: 'frozen', ySplit: 1 }];
+    const hRow = outWs.getRow(1);
+    outputDefs.forEach((def, idx) => {
+      const c = idx + 1;
+      const fallbackSourceCol = def.sourceCol || outputDefs.find(d => d.sourceCol)?.sourceCol || 1;
+      const sourceCell = sourceWs.getRow(sourceHeaderRow).getCell(fallbackSourceCol);
+      const cell = hRow.getCell(c);
+      cell.value = def.outHeader;
+      cell.style = cloneStyle(sourceCell.style);
+      cell.numFmt = sourceCell.numFmt;
+      cell.alignment = cloneStyle(sourceCell.alignment);
+      cell.border = cloneStyle(sourceCell.border);
+      cell.fill = cloneStyle(sourceCell.fill);
+      cell.font = cloneStyle(sourceCell.font);
+      const width = def.sourceCol ? sourceWs.getColumn(def.sourceCol).width : def.width;
+      outWs.getColumn(c).width = Math.max(10, Math.min(42, width || def.width || 16));
+    });
+    hRow.height = sourceWs.getRow(sourceHeaderRow).height || 22;
+  }
+
+  function sourceValueForKey(row, key, map, email) {
+    const col = { name: map.nameCol, position: map.positionCol, linkedin: map.linkedinCol, company: map.companyCol, address: map.addressCol }[key];
+    if (key === 'email') return email;
+    if (!col) return '';
+    if (key === 'name') return firstNameWord(row.getCell(col).value);
+    return row.getCell(col).value;
+  }
+
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+  }
+
+  function displayRejects(max = 250) {
+    if (!rejectedRows.length) {
+      els.rejectsBox.style.display = 'none';
+      if (els.rejectSummary) els.rejectSummary.textContent = '';
+      return;
+    }
+    els.rejectsBox.style.display = 'block';
+    if (els.rejectSummary) els.rejectSummary.textContent = `共 ${rejectedRows.length} 条`;
+    const shown = rejectedRows.slice(0, max);
+    els.rejectsList.innerHTML = shown.map(r => {
+      const name = r.name || `第${r.rowNum}行`;
+      const pos = r.position ? `｜${escapeHtml(r.position)}` : '';
+      const detail = r.detail ? `｜${escapeHtml(r.detail)}` : '';
+      return `<div>${escapeHtml(r.fileName)}｜第${r.rowNum}行｜${escapeHtml(name)}${pos}｜${escapeHtml(r.reason)}${detail}</div>`;
+    }).join('') + (rejectedRows.length > max ? `<div class="muted">仅显示前 ${max} 条，其余已计入统计。</div>` : '');
+  }
+
+  function xmlTextOfNode(node) {
+    if (!node) return '';
+    return Array.from(node.childNodes || []).map(n => n.textContent || '').join('');
+  }
+
+  function parseXmlDoc(text) {
+    const clean = String(text || '').replace(/^\uFEFF/, '').trim();
+    const doc = new DOMParser().parseFromString(clean, 'application/xml');
+    const err = doc.getElementsByTagName('parsererror')[0];
+    if (err) throw new Error(`XML 解析失败：${err.textContent || 'parsererror'}`);
+    return doc;
+  }
+
+  function byLocal(root, name) {
+    return Array.from(root.getElementsByTagName('*')).filter(n => (n.localName || n.nodeName.split(':').pop()) === name);
+  }
+
+  function firstByLocal(root, name) { return byLocal(root, name)[0] || null; }
+
+  function colLettersToNumber(letters) {
+    let n = 0;
+    for (const ch of String(letters || '').toUpperCase()) {
+      const code = ch.charCodeAt(0);
+      if (code < 65 || code > 90) continue;
+      n = n * 26 + code - 64;
+    }
+    return n || 1;
+  }
+
+  function cellRefToCol(ref) {
+    const m = String(ref || '').match(/[A-Z]+/i);
+    return m ? colLettersToNumber(m[0]) : 1;
+  }
+
+  function normalizeZipTarget(baseDir, target) {
+    let t = String(target || '').replace(/^\//, '');
+    if (!t) return '';
+    if (t.startsWith('xl/')) return t;
+    if (!baseDir) return t;
+    const parts = `${baseDir}/${t}`.split('/');
+    const out = [];
+    for (const part of parts) {
+      if (!part || part === '.') continue;
+      if (part === '..') out.pop();
+      else out.push(part);
+    }
+    return out.join('/');
+  }
+
+  async function manualReadXlsx(buffer) {
+    if (!window.JSZip) throw new Error('JSZip 未加载，无法启用备用读取器。');
+    const zip = await JSZip.loadAsync(buffer);
+    const workbookFile = zip.file('xl/workbook.xml');
+    if (!workbookFile) throw new Error('备用读取失败：缺少 xl/workbook.xml。');
+
+    const wbDoc = parseXmlDoc(await workbookFile.async('string'));
+    const sheetNode = byLocal(wbDoc, 'sheet')[0];
+    if (!sheetNode) throw new Error('备用读取失败：workbook.xml 中没有 sheet。');
+    const sheetName = sheetNode.getAttribute('name') || 'Sheet1';
+    const relId = sheetNode.getAttribute('r:id') || sheetNode.getAttribute('id');
+
+    let sheetPath = 'xl/worksheets/sheet1.xml';
+    const relsFile = zip.file('xl/_rels/workbook.xml.rels');
+    if (relsFile && relId) {
+      const relsDoc = parseXmlDoc(await relsFile.async('string'));
+      const rel = byLocal(relsDoc, 'Relationship').find(x => x.getAttribute('Id') === relId);
+      if (rel) sheetPath = normalizeZipTarget('xl', rel.getAttribute('Target'));
+    }
+
+    const sheetFile = zip.file(sheetPath);
+    if (!sheetFile) throw new Error(`备用读取失败：缺少工作表文件 ${sheetPath}。`);
+
+    const shared = [];
+    const ssFile = zip.file('xl/sharedStrings.xml');
+    if (ssFile) {
+      const ssDoc = parseXmlDoc(await ssFile.async('string'));
+      byLocal(ssDoc, 'si').forEach(si => shared.push(byLocal(si, 't').map(t => t.textContent || '').join('')));
+    }
+
+    const sheetDoc = parseXmlDoc(await sheetFile.async('string'));
+    const rows = {};
+    const rowHeights = {};
+    const colWidths = {};
+    let rowCount = 0;
+    let columnCount = 0;
+
+    byLocal(sheetDoc, 'col').forEach(col => {
+      const min = Number(col.getAttribute('min') || 1);
+      const max = Number(col.getAttribute('max') || min);
+      const width = Number(col.getAttribute('width') || 0);
+      for (let c = min; c <= max; c++) {
+        if (width) colWidths[c] = Math.max(8, Math.min(42, width));
+        columnCount = Math.max(columnCount, c);
+      }
+    });
+
+    byLocal(sheetDoc, 'row').forEach(rowNode => {
+      const r = Number(rowNode.getAttribute('r') || 0) || rowCount + 1;
+      rowCount = Math.max(rowCount, r);
+      const ht = Number(rowNode.getAttribute('ht') || 0);
+      if (ht) rowHeights[r] = ht;
+      const rowCells = rows[r] || {};
+
+      Array.from(rowNode.childNodes || []).forEach(child => {
+        if ((child.localName || child.nodeName.split(':').pop()) !== 'c') return;
+        const c = cellRefToCol(child.getAttribute('r'));
+        columnCount = Math.max(columnCount, c);
+        const t = child.getAttribute('t') || '';
+        const vNode = firstByLocal(child, 'v');
+        const isNode = firstByLocal(child, 'is');
+        let value = '';
+        if (t === 's') value = shared[Number(vNode ? vNode.textContent : '')] || '';
+        else if (t === 'inlineStr') value = isNode ? byLocal(isNode, 't').map(x => x.textContent || '').join('') : '';
+        else if (t === 'b') value = (vNode && vNode.textContent === '1') ? true : false;
+        else value = vNode ? vNode.textContent : '';
+        rowCells[c] = { value, style: {}, numFmt: undefined, alignment: undefined, border: undefined, fill: undefined, font: undefined };
+      });
+      rows[r] = rowCells;
+    });
+
+    const ws = {
+      name: sheetName,
+      rowCount,
+      columnCount,
+      __manual: true,
+      getRow(r) {
+        return {
+          number: r,
+          height: rowHeights[r],
+          getCell(c) { return (rows[r] && rows[r][c]) || { value: '', style: {}, numFmt: undefined, alignment: undefined, border: undefined, fill: undefined, font: undefined }; },
+          commit() {}
+        };
+      },
+      getColumn(c) { return { width: colWidths[c] || 16 }; }
+    };
+    return { worksheets: [ws], __manual: true };
+  }
+
+  async function repairXlsxPackageForExcelJS(buffer) {
+    if (!window.JSZip) throw new Error('JSZip 未加载，无法修复该 xlsx 包结构。请确认浏览器可以访问 CDN。');
+    const zip = await JSZip.loadAsync(buffer);
+    const contentTypesFile = zip.file('[Content_Types].xml');
+    if (contentTypesFile) {
+      let xml = await contentTypesFile.async('string');
+      xml = xml.replace(/^\uFEFF/, '').trim();
+      xml = xml.replace(/<Default([^>]*Extension=["']xml["'][^>]*)ContentType=["'][^"']*spreadsheetml\.sheet\.main\+xml["']([^>]*)\/>/i,
+        '<Default$1ContentType="application/xml"$2/>');
+      if (!/PartName=["']\/xl\/workbook\.xml["']/i.test(xml)) {
+        const workbookOverride = '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml" />';
+        xml = /<\/Types>\s*$/i.test(xml) ? xml.replace(/<\/Types>\s*$/i, `${workbookOverride}</Types>`) : `${xml}${workbookOverride}`;
+      }
+      zip.file('[Content_Types].xml', xml);
+    }
+
+    const relPatches = [
+      ['_rels/.rels', xml => xml.replace(/Target=["']\/xl\/workbook\.xml["']/g, 'Target="xl/workbook.xml"')],
+      ['xl/_rels/workbook.xml.rels', xml => xml.replace(/Target=["']\/xl\//g, 'Target="').replace(/Target=["']xl\//g, 'Target="')]
+    ];
+
+    const bomCandidates = ['xl/workbook.xml', 'xl/_rels/workbook.xml.rels', '_rels/.rels'];
+    for (const name of bomCandidates) {
+      const file = zip.file(name);
+      if (!file) continue;
+      let text = await file.async('string');
+      text = text.replace(/^\uFEFF/, '');
+      const patch = relPatches.find(p => p[0] === name);
+      if (patch) text = patch[1](text);
+      zip.file(name, text);
+    }
+    return zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+  }
+
+  async function loadWorkbookWithRepair(buffer) {
+    if (!window.ExcelJS) throw new Error('ExcelJS 未加载。请确认浏览器可以访问 CDN，或把依赖改成本地版本。');
+    const wb = new ExcelJS.Workbook();
+    try {
+      await wb.xlsx.load(buffer);
+      return { workbook: wb, repaired: false, manual: false };
+    } catch (firstErr) {
+      const message = firstErr && (firstErr.message || String(firstErr));
+      addLog(`ExcelJS 首次读取失败，尝试修复 xlsx 包结构：${message}`);
+      try {
+        const fixedBuffer = await repairXlsxPackageForExcelJS(buffer);
+        const repairedWb = new ExcelJS.Workbook();
+        await repairedWb.xlsx.load(fixedBuffer);
+        return { workbook: repairedWb, repaired: true, manual: false };
+      } catch (secondErr) {
+        const msg = secondErr && (secondErr.message || String(secondErr));
+        addLog(`ExcelJS 修复读取仍失败，启用备用读取器：${msg}`);
+        const manualWb = await manualReadXlsx(buffer);
+        return { workbook: manualWb, repaired: false, manual: true };
+      }
+    }
+  }
+
+  function buildMap(cols) {
+    const aiCol = findCol(cols, [col => col.n === 'ai分类' || col.n.endsWith('/ai分类') || col.n.includes('ai分类')]);
+    if (!aiCol) throw new Error('未找到 AI分类 列。请先让 AI 新增该列，标准值为：高管 / 采购 / 包装 / 不匹配。');
+    const map = {
+      aiCol,
+      nameCol: findBestCol(cols, [
+        col => col.n === '姓名' || col.n === '名字' || col.n === '全名' || col.n === 'name',
+        col => col.n.includes('姓名') || col.n.includes('名字') || col.n.includes('全名') || col.n.includes('fullname')
+      ]),
+      positionCol: findBestCol(cols, [
+        col => col.n === '职位' || col.n === '职务' || col.n === 'position' || col.n === 'title',
+        col => col.n.includes('职位') || col.n.includes('职务') || col.n.includes('position') || col.n.includes('title')
+      ]),
+      linkedinCol: findBestCol(cols, [
+        col => col.n === 'linkedin' || col.n === '领英',
+        col => col.n.includes('linkedin') || col.n.includes('领英')
+      ]),
+      companyCol: findBestCol(cols, [
+        col => col.n === '公司' || col.n === '公司名称' || col.n === 'company' || col.n === 'companyname',
+        col => (col.n.includes('公司') || col.n.includes('company')) && !col.n.includes('官网') && !col.n.includes('网址') && !col.n.includes('网站') && !col.n.includes('url')
+      ]),
+      addressCol: findBestCol(cols, [
+        col => col.n === '地址' || col.n === '地点' || col.n === 'address' || col.n === 'location',
+        col => col.n.includes('地址') || col.n.includes('地点') || col.n.includes('address') || col.n.includes('location')
+      ]),
+      emailCols: cols.map((col, idx) => idx && isEmailCol(col) ? idx : null).filter(Boolean)
+    };
+    if (!map.nameCol) throw new Error('未找到姓名/名字/全名列。');
+    if (!map.positionCol) throw new Error('未找到职位/职务列。');
+    if (!map.companyCol) throw new Error('未找到公司/公司名称列。');
+    if (!map.emailCols.length) throw new Error('未找到邮箱列。');
+    return map;
+  }
+
+  function ensureOutputState(state, ws, header, map) {
+    if (state.initialized) return;
+    const outputDefs = fixedOutputDefs(map);
+    for (const cat of CATEGORIES) {
+      const owb = new ExcelJS.Workbook();
+      owb.creator = '联系人AI分类拆分工具 v2.0.0';
+      owb.created = new Date();
+      const ows = owb.addWorksheet(cat.key);
+      setupOutputSheet(ows, ws, header.headerRows[0], outputDefs);
+      state.outBooks.set(cat.key, owb);
+      state.outSheets.set(cat.key, ows);
+    }
+    state.initialized = true;
+  }
+
+  async function processOneFile(file, index, batchState) {
+    updateFileItem(index, { status: '读取中', error: '' });
+    const fileStats = { people: 0, output: 0, reject: 0, counts: { '高管': 0, '采购': 0, '包装': 0 } };
+    const buffer = await file.arrayBuffer();
+    const loaded = await loadWorkbookWithRepair(buffer);
+    if (loaded.repaired) addLog(`${file.name}：已完成 xlsx 包结构兼容修复。`);
+    if (loaded.manual) addLog(`${file.name}：已启用备用读取器。`);
+
+    const wb = loaded.workbook;
+    const ws = wb.worksheets[0];
+    if (!ws) throw new Error('未找到工作表。');
+
+    const header = detectHeader(ws);
+    const cols = buildColumns(ws, header.headerRows);
+    const map = buildMap(cols);
+    ensureOutputState(batchState, ws, header, map);
+    const outputDefs = fixedOutputDefs(map);
+
+    updateFileItem(index, { status: '处理中' });
+    addLog(`${index + 1}/${selectedFiles.length} ${file.name}：表头行 ${header.headerRows.join(',')}，数据起始行 ${header.dataStart}。`);
+
+    for (let r = header.dataStart; r <= ws.rowCount; r++) {
+      const row = ws.getRow(r);
+      if (!rowHasContent(row, ws.columnCount)) continue;
+      fileStats.people += 1;
+
+      const name = textOf(row.getCell(map.nameCol).value);
+      const position = textOf(row.getCell(map.positionCol).value);
+      const category = normalizeCategory(textOf(row.getCell(map.aiCol).value));
+      const emails = [];
+      for (const ec of map.emailCols) {
+        for (const em of extractEmailsFromCell(row.getCell(ec))) emails.push(em);
+      }
+      const uniqueEmailsInRow = [...new Set(emails)];
+
+      if (!uniqueEmailsInRow.length) {
+        addReject(file.name, r, name, position, '没有邮箱');
+        fileStats.reject += 1;
+        continue;
+      }
+
+      if (!['高管', '采购', '包装'].includes(category)) {
+        addReject(file.name, r, name, position, '未找到匹配岗位', `AI分类=${textOf(row.getCell(map.aiCol).value) || '空'}`);
+        fileStats.reject += 1;
+        continue;
+      }
+
+      for (const email of uniqueEmailsInRow) {
+        if (batchState.seenEmails.has(email)) {
+          addReject(file.name, r, name, position, '重复邮箱', email);
+          fileStats.reject += 1;
+          continue;
+        }
+        batchState.seenEmails.add(email);
+        const ows = batchState.outSheets.get(category);
+        const newRowNum = ows.rowCount + 1;
+        const outRow = ows.getRow(newRowNum);
+        outputDefs.forEach((def, idx) => {
+          const colIdx = idx + 1;
+          const sourceCol = def.key === 'email'
+            ? map.emailCols.find(ec => extractEmailsFromCell(row.getCell(ec)).includes(email)) || map.emailCols[0]
+            : def.sourceCol;
+          const sourceCell = sourceCol ? row.getCell(sourceCol) : null;
+          setCellFromSource(outRow.getCell(colIdx), sourceCell, sourceValueForKey(row, def.key, map, email));
+        });
+        outRow.height = row.height;
+        outRow.commit && outRow.commit();
+        fileStats.counts[category] += 1;
+        fileStats.output += 1;
+      }
+    }
+
+    updateFileItem(index, { status: '完成', people: fileStats.people, output: fileStats.output, reject: fileStats.reject });
+    addLog(`${index + 1}/${selectedFiles.length} ${file.name} 完成：高管 ${fileStats.counts['高管']}，采购 ${fileStats.counts['采购']}，包装 ${fileStats.counts['包装']}，输出 ${fileStats.output}，剔除 ${fileStats.reject}。`);
+    return fileStats;
+  }
+
+  async function processFiles() {
+    if (!selectedFiles.length) return;
+    updateIndustryState();
+    if (!industryPrefix) {
+      setStatus('请先填写行业前缀，例如：美妆个护香水 / 零售店。');
+      addLog('处理已停止：未填写行业前缀。');
+      return;
+    }
+    saveLastIndustry(industryPrefix);
+    if (industryPrefix === '其他不符行业') {
+      const ok = confirm('当前行业前缀为“其他不符行业”，该类一般不作为本流程重点处理。是否继续？');
+      if (!ok) {
+        addLog('用户取消处理：行业前缀为其他不符行业。');
+        return;
+      }
+    }
+
+    isProcessing = true;
+    generatedFiles = [];
+    rejectedRows = [];
+    fileItems = fileItems.map(item => ({ ...item, status: '等待', people: 0, output: 0, reject: 0, error: '' }));
+    renderFileQueue();
+    els.processBtn.disabled = true;
+    els.downloadBtn.disabled = true;
+    els.stats.style.display = 'grid';
+    els.rejectsBox.style.display = 'none';
+    setStats({ files: selectedFiles.length, people: 0, output: 0, exec: 0, purchase: 0, packaging: 0, reject: 0 });
+    setStatus(`正在处理 ${selectedFiles.length} 个文件...`);
+    addLog(`开始处理：${selectedFiles.length} 个文件；行业前缀：${industryPrefix}；输出不按公司拆分，邮箱整批全局去重。`);
+
+    const batchState = {
+      initialized: false,
+      outBooks: new Map(),
+      outSheets: new Map(),
+      seenEmails: new Set()
+    };
+
+    const totals = { files: selectedFiles.length, success: 0, failed: 0, people: 0, output: 0, reject: 0, counts: { '高管': 0, '采购': 0, '包装': 0 } };
+
+    for (let i = 0; i < selectedFiles.length; i++) {
+      try {
+        const stats = await processOneFile(selectedFiles[i], i, batchState);
+        totals.success += 1;
+        totals.people += stats.people;
+        totals.output += stats.output;
+        totals.reject += stats.reject;
+        for (const cat of CATEGORIES) totals.counts[cat.key] += stats.counts[cat.key] || 0;
+      } catch (err) {
+        const msg = err && (err.message || String(err)) || '未知错误';
+        totals.failed += 1;
+        totals.reject += 1;
+        addReject(selectedFiles[i].name, 0, '', '', '文件处理失败', msg);
+        updateFileItem(i, { status: '失败', error: msg, reject: 1 });
+        addLog(`${i + 1}/${selectedFiles.length} ${selectedFiles[i].name} 处理失败：${msg}`);
+      }
+      setStats({
+        files: totals.files,
+        people: totals.people,
+        output: totals.output,
+        exec: totals.counts['高管'],
+        purchase: totals.counts['采购'],
+        packaging: totals.counts['包装'],
+        reject: totals.reject
+      });
+    }
+
+    if (batchState.initialized) {
+      for (const cat of CATEGORIES) {
+        const count = totals.counts[cat.key] || 0;
+        if (count > 0) {
+          const owb = batchState.outBooks.get(cat.key);
+          const buf = await owb.xlsx.writeBuffer();
+          const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          generatedFiles.push({ filename: `${industryPrefix}${cat.key}.xlsx`, blob });
+        }
+      }
+    }
+
+    displayRejects();
+    const summary = `处理完成。文件 ${totals.files} 个，成功 ${totals.success} 个，失败 ${totals.failed} 个；处理人数 ${totals.people}；输出邮箱行 ${totals.output}；高管 ${totals.counts['高管']}，采购 ${totals.counts['采购']}，包装 ${totals.counts['包装']}；剔除/失败 ${totals.reject}。`;
+    const names = generatedFiles.map(f => `- ${f.filename}`).join('\n');
+    setStatus(generatedFiles.length ? `${summary}\n\n生成 ${generatedFiles.length} 个文件：\n${names}` : `${summary}\n\n无匹配：未生成 xlsx 文件。`);
+    addLog(generatedFiles.length ? `处理完成：生成 ${generatedFiles.length} 个文件。` : '处理完成：无匹配，未生成 xlsx 文件。');
+    if (generatedFiles.length) generatedFiles.forEach(f => addLog(`结果文件：${f.filename}`));
+    els.downloadBtn.disabled = generatedFiles.length === 0;
+    isProcessing = false;
+    updateIndustryState();
+    els.clearBtn.disabled = selectedFiles.length === 0;
+  }
+
+  function downloadAll() {
+    if (!generatedFiles.length) return;
+    generatedFiles.forEach((f, i) => setTimeout(() => downloadBlob(f.blob, f.filename), i * 450));
+    setStatus(`正在下载 ${generatedFiles.length} 个结果文件。若浏览器提示，请允许此页面下载多个文件。`);
+    addLog(`已触发下载结果：${generatedFiles.length} 个文件。`);
+  }
+
+  els.promptText.value = loadPrompt();
+  els.industryInput.value = loadLastIndustry();
+  initIndustryMenu();
+  updateIndustryState();
+  els.promptText.addEventListener('input', schedulePromptSave);
+  els.industryInput.addEventListener('input', updateIndustryState);
+  els.industryInput.addEventListener('focus', openIndustryMenu);
+  els.industryInput.addEventListener('change', () => { updateIndustryState(); if (industryPrefix) saveLastIndustry(industryPrefix); });
+  els.industryDropdownBtn.addEventListener('click', (e) => { e.preventDefault(); els.industryMenu.classList.contains('open') ? closeIndustryMenu() : openIndustryMenu(); });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#industryCombo')) closeIndustryMenu();
+  });
+  els.togglePromptBtn.addEventListener('click', togglePromptPanel);
+  els.copyPromptBtn.addEventListener('click', copyPrompt);
+  els.fileInput.addEventListener('change', (e) => setFiles(e.target.files));
+  els.processBtn.addEventListener('click', processFiles);
+  els.downloadBtn.addEventListener('click', downloadAll);
+  els.clearBtn.addEventListener('click', resetAll);
+
+  ['dragenter', 'dragover'].forEach(evt => {
+    els.drop.addEventListener(evt, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      els.drop.classList.add('dragover');
+    });
+  });
+
+  ['dragleave', 'drop'].forEach(evt => {
+    els.drop.addEventListener(evt, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      els.drop.classList.remove('dragover');
+    });
+  });
+
+  els.drop.addEventListener('drop', (e) => {
+    const files = e.dataTransfer.files;
+    if (files && files.length) setFiles(files);
+  });
+
+  ensureTodayLog();
+  renderLogs();
+  addLog('页面已打开。');
+})();
+</script>
+</body>
+</html>
