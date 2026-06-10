@@ -1,0 +1,1756 @@
+// ==UserScript==
+// @name         Cordys CRM 行业与客户优先级批量填充
+// @namespace    https://codex.local/crm-control
+// @version      1.1.8
+// @description  在 Cordys CRM 客户列表中，支持直接粘贴 WPS“客户名称→rating”区域，批量只更新“行业”和“客户优先级”，保存后回读验证。
+// @author       Codex
+// @match        http://106.53.55.11:8081/*
+// @match        http://106.53.55.11:8081/#/account/index*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+/*
+更新说明：
+v1.1.8
+- 首轮跑完后自动复跑本轮黄色日志涉及的公司；复跑只针对首次出现黄色日志的目标公司。
+- 复跑后如果该公司仍出现黄色日志，脚本进入人工等待状态；人工处理完成后点击“下一个”继续复跑队列中的下一家公司。
+- 新增“下一个”按钮，仅在人工等待状态下可用；停止时会退出等待。
+
+v1.1.7
+- 本轮运行结束时自动汇总所有黄色日志涉及的公司名，按一行一个输出，便于人工复核。
+- 黄色日志公司名按处理中的目标公司归集；非公司级提醒不计入清单。
+
+v1.1.6
+- 修复保存后回读验证误判：保存返回列表后优先直接读取当前目标行，不再强制重新搜索，也不再要求搜索结果必须变化。
+- 搜索等待改为“目标行出现/暂无数据/结果刷新”三条件，避免当前已是目标搜索结果时被误判为未刷新。
+- 每条写入增加明确日志：字段改动、点击更新、表单关闭、当前列表回读验证。
+- 每条处理结束前确认编辑表单已关闭、列表与搜索框可用，降低多条连续处理时串状态风险。
+
+v1.1.5
+- 修复进入编辑客户抽屉后卡在“编辑表单等待稳定”的问题：不再等待整页稳定，只等待客户名称、行业、客户优先级三个精确字段就绪。
+- 搜索前、清空搜索后、保存后不再使用整页稳定等待，改为字段/表格/表单状态级等待，减少启动和切换时的无意义等待。
+- 保存后只等待“更新成功”或编辑表单关闭，再执行回读验证。
+
+v1.1.4
+- 接入实页确认后的 CRM 精确 DOM 路径：列表行、客户名称列、行业列、客户优先级列、操作列、行内编辑按钮、编辑表单字段都使用固定 selector。
+- 行内编辑按钮不再使用文本/坐标/同行兜底猜测；路径不存在时直接报路径失效。
+- 列表读取改为 Naive UI data-col-key 精确读取，避免表头文本错位。
+- 搜索仍采用“清空 → 输入 → Enter → 等待结果变化/稳定”的流程，避免读取全量列表误判。
+
+v1.1.3
+- 修复点击行内“编辑”未生效的问题：不再点击内部 span/div 文本，优先点击真实 button/.n-button。
+- 增加同行坐标兜底：如果操作列是固定列/独立表格，也会按目标行纵向位置寻找同一行的“编辑”按钮。
+- 点击编辑后若未立刻出现表单，会二次尝试同一行可点击按钮，避免只读到按钮文字但未真正触发。
+
+v1.1.2
+- 修复搜索未真正刷新却读取全列表的问题：不再把“搜索框有值”当成搜索成功。
+- 搜索流程参考 CRM 联系人搜集整合版：focus/select、清空、写入、延迟、Enter，并增加二次触发兜底。
+- 如果 10 秒内搜索结果仍是原全列表，直接报“搜索未刷新”，不会拿 13936 条全量列表做匹配。
+
+v1.1.1
+- 删除开始处理前的确认弹窗，点击“开始处理”后直接执行。
+- 增强搜索触发：输入公司名后同时触发 Enter、搜索图标点击和 input/change 事件。
+- 修正部分页面 loading 标记常驻导致“搜索结果等待稳定超时”的问题。
+
+v1.1.0
+- 面板改为 CRM 风格：白底、柔和提示色、固定日志区、顶部栏最小化。
+- 支持直接粘贴 WPS 从“客户名称”到“rating”的整块区域，含表头或不含表头均可。
+- 删除“只读预检”“最多处理 30 条”“搜索等待”“每条间隔”“复制结果”“清空日志”等低频/多余控件。
+- 内部统一页面稳定超时为 10 秒，不在面板暴露。
+- 增加页面状态检测、筛选状态提醒、行业白名单校验、暂停/继续、停止。
+- 重做拖拽：按住顶部栏拖动，位置保存，最小化后顶部栏位置不漂移。
+*/
+
+(function () {
+  'use strict';
+
+  const SCRIPT_NAME = 'CRM 行业/优先级填充';
+  const VERSION = '1.1.8';
+  const PAGE_STABLE_TIMEOUT = 10000;
+  const STABLE_HOLD_MS = 650;
+  const POLL_INTERVAL = 180;
+
+  /*
+   * 这些路径来自 2026-06-08 对 Cordys CRM 实页 DOM 的检查。
+   * 正式写入流程只使用这些已确认路径；路径失效时直接报错，不使用泛化文本/坐标猜测。
+   */
+  const CRM_PATHS = {
+    appRoot: '#app',
+    searchInput: '#app input.n-input__input-el[placeholder="通过名称搜索"]',
+
+    dataTable: '#app .n-data-table.crm-data-table-compact.n-data-table--bottom-bordered.n-data-table--single-line.n-data-table--flex-height',
+    headerTh: '#app .n-data-table.crm-data-table-compact .n-data-table-base-table-header table.n-data-table-table thead th.n-data-table-th',
+    visibleRows: '#app .n-data-table.crm-data-table-compact .n-data-table-base-table-body .v-vl-items table.n-data-table-table.v-vl-visible-items tbody tr.n-data-table-tr',
+
+    rowNameCell: 'td[data-col-key="name"]',
+    rowIndustryCell: 'td[data-col-key="176587792522900000"]',
+    rowPriorityCell: 'td[data-col-key="176577819667000000"]',
+    rowOperationCell: 'td[data-col-key="operation"]',
+    rowEditButton: 'td[data-col-key="operation"] button[label="编辑"][permission="CUSTOMER_MANAGEMENT:UPDATE"]',
+
+    editDrawer: '.crm-drawer.n-drawer.n-drawer--right-placement',
+    editForm: 'form.n-form.crm-form-create',
+    formNameInput: 'form.n-form.crm-form-create [id="846039837843470"].n-form-item input.n-input__input-el',
+    formIndustryInput: 'form.n-form.crm-form-create [id="176587792522900000"].n-form-item input.n-input__input-el',
+    formPriorityInput: 'form.n-form.crm-form-create [id="176577819667000000"].n-form-item input.n-input__input-el',
+    formUpdateButton: 'form.n-form.crm-form-create .crm-form-create-footer button.n-button--primary-type',
+    formCancelButton: 'form.n-form.crm-form-create .crm-form-create-footer button.n-button--secondary'
+  };
+
+  const STORAGE_KEYS = {
+    input: 'crmBatchIndustryInputV110',
+    panelPos: 'crmBatchPanelPosV110',
+    minimized: 'crmBatchPanelMinimizedV110'
+  };
+
+  const INDUSTRY_ALLOW_LIST = [
+    '珠宝',
+    '酒水',
+    '鞋服',
+    '3c电子',
+    '3C电子',
+    '美妆个护香水',
+    '美妆个护',
+    '美妆',
+    '奢侈品',
+    '桌游',
+    '礼品',
+    '食品',
+    '零售店',
+    '零售',
+    '设计公司',
+    '贸易公司',
+    '贸易',
+    '同行',
+    '出版社',
+    '出版商',
+    '其他不符行业'
+  ];
+  const INDUSTRY_ALLOW_SET = new Set(INDUSTRY_ALLOW_LIST.map(v => normalize(v).toLowerCase()));
+
+  const state = {
+    running: false,
+    pauseRequested: false,
+    stopRequested: false,
+    results: [],
+    logs: [],
+    warnCompanyNames: new Set(),
+    retryWarnCompanyNames: new Set(),
+    retryStillWarnCompanyNames: new Set(),
+    activeCompanyName: '',
+    currentCompanyWarned: false,
+    inRetryPass: false,
+    retryProcessed: 0,
+    waitingManual: false,
+    manualContinueResolve: null,
+    total: 0,
+    current: 0
+  };
+
+  let panelEls = {};
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async function waitFor(predicate, timeout = PAGE_STABLE_TIMEOUT, interval = POLL_INTERVAL) {
+    const started = Date.now();
+    let lastError;
+    while (Date.now() - started < timeout) {
+      try {
+        const value = await predicate();
+        if (value) return value;
+      } catch (err) {
+        lastError = err;
+      }
+      await sleep(interval);
+    }
+    if (lastError) throw lastError;
+    return null;
+  }
+
+  function normalize(value) {
+    return String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  }
+
+  function normalizeHeader(value) {
+    return normalize(value).toLowerCase().replace(/[\s_\-｜|:：]/g, '');
+  }
+
+  function dashToEmpty(value) {
+    const text = normalize(value);
+    return text === '-' ? '' : text;
+  }
+
+  function textOf(el) {
+    return normalize(el ? (el.innerText || el.textContent || '') : '');
+  }
+
+  function stripRequiredStar(label) {
+    return normalize(label).replace(/\s*\*\s*$/, '');
+  }
+
+  function stripQuotes(value) {
+    const text = normalize(value);
+    if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+      return text.slice(1, -1).trim();
+    }
+    return text;
+  }
+
+  function baseCompanyName(value) {
+    return normalize(value)
+      .replace(/（[^）]*）/g, '')
+      .replace(/\([^)]*\)/g, '')
+      .replace(/[.，,]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toUpperCase();
+  }
+
+  function simplifiedCompanyName(value) {
+    const text = baseCompanyName(value)
+      .replace(/[\u3000]/g, ' ')
+      .replace(/[.,，。'’`&/\\-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const suffixes = new Set([
+      'INC', 'INCORPORATED', 'LLC', 'LTD', 'LIMITED', 'CO', 'COMPANY',
+      'CORP', 'CORPORATION', 'GROUP', 'SAS', 'SA', 'CV'
+    ]);
+    const parts = text.split(' ').filter(Boolean);
+    while (parts.length > 1 && suffixes.has(parts[parts.length - 1])) {
+      parts.pop();
+    }
+    return parts.join(' ');
+  }
+
+  function namesAreSimilar(a, b) {
+    const baseA = baseCompanyName(a);
+    const baseB = baseCompanyName(b);
+    if (!baseA || !baseB) return false;
+    if (baseA === baseB) return true;
+    const simpleA = simplifiedCompanyName(a);
+    const simpleB = simplifiedCompanyName(b);
+    if (simpleA && simpleA === simpleB) return true;
+    const minLen = Math.min(baseA.length, baseB.length);
+    return minLen >= 8 && (baseA.includes(baseB) || baseB.includes(baseA));
+  }
+
+  function isVisible(el) {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+
+  function setNativeValue(el, value) {
+    if (!el) throw new Error('目标输入框不存在');
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(el, value);
+    else el.value = value;
+    try {
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: String(value || '') }));
+    } catch (_) {
+      el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    }
+    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+  }
+
+  function pressEnter(el) {
+    ['keydown', 'keypress', 'keyup'].forEach(type => {
+      el.dispatchEvent(new KeyboardEvent(type, {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+        composed: true
+      }));
+    });
+  }
+
+  function pressCtrlA(el) {
+    ['keydown', 'keyup'].forEach(type => {
+      el.dispatchEvent(new KeyboardEvent(type, {
+        key: 'a',
+        code: 'KeyA',
+        keyCode: 65,
+        which: 65,
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true
+      }));
+    });
+  }
+
+  function pressBackspace(el) {
+    ['keydown', 'keyup'].forEach(type => {
+      el.dispatchEvent(new KeyboardEvent(type, {
+        key: 'Backspace',
+        code: 'Backspace',
+        keyCode: 8,
+        which: 8,
+        bubbles: true,
+        cancelable: true
+      }));
+    });
+  }
+
+  function clickLikeUser(el) {
+    if (!el) throw new Error('点击目标不存在');
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    const realWin = el.ownerDocument?.defaultView || window;
+    const rect = el.getBoundingClientRect();
+    const clientX = rect.left + Math.max(4, Math.min(rect.width - 4, rect.width / 2));
+    const clientY = rect.top + Math.max(4, Math.min(rect.height - 4, rect.height / 2));
+    ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(type => {
+      try {
+        el.dispatchEvent(new realWin.MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          view: realWin,
+          clientX,
+          clientY
+        }));
+      } catch (_) {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX, clientY }));
+      }
+    });
+    if (typeof el.click === 'function') {
+      try { el.click(); } catch (_) {}
+    }
+  }
+
+  function findSearchInput() {
+    return document.querySelector(CRM_PATHS.searchInput);
+  }
+
+  function findCountText() {
+    const body = document.body?.innerText || '';
+    return (body.match(/共\s*\d+\s*条/) || [''])[0];
+  }
+
+  function findNoDataText() {
+    const preferred = Array.from(document.querySelectorAll('.n-data-table-empty, .empty, .no-data'))
+      .find(el => isVisible(el) && /暂无数据|无数据|No Data/i.test(textOf(el)));
+    if (preferred) return preferred;
+
+    return Array.from(document.querySelectorAll('span, div, td, p'))
+      .find(el => {
+        if (!isVisible(el)) return false;
+        const text = textOf(el);
+        if (!/^(暂无数据|无数据|No Data)$/i.test(text)) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 20 && rect.height > 10;
+      }) || null;
+  }
+
+  function getVisibleExactText(text) {
+    return Array.from(document.querySelectorAll('button, a, span, div'))
+      .filter(el => isVisible(el) && textOf(el) === text);
+  }
+
+  function hasActiveFilterHint() {
+    return getVisibleExactText('清空筛选').length > 0;
+  }
+
+  function readTableState() {
+    const headerCells = Array.from(document.querySelectorAll(CRM_PATHS.headerTh));
+    const headers = headerCells.map(th => ({
+      text: textOf(th),
+      colKey: th.getAttribute('data-col-key') || ''
+    }));
+
+    const rows = Array.from(document.querySelectorAll(CRM_PATHS.visibleRows))
+      .map((tr, rowIndex) => {
+        const nameCell = tr.querySelector(CRM_PATHS.rowNameCell);
+        const industryCell = tr.querySelector(CRM_PATHS.rowIndustryCell);
+        const priorityCell = tr.querySelector(CRM_PATHS.rowPriorityCell);
+        const operationCell = tr.querySelector(CRM_PATHS.rowOperationCell);
+        if (!nameCell) return null;
+
+        const name = textOf(nameCell);
+        const industry = textOf(industryCell);
+        const priority = textOf(priorityCell);
+        const obj = {
+          '客户名称': name,
+          '行业': industry,
+          '客户优先级': priority
+        };
+
+        return {
+          rowIndex,
+          tr,
+          nameCell,
+          industryCell,
+          priorityCell,
+          operationCell,
+          editButton: tr.querySelector(CRM_PATHS.rowEditButton),
+          obj,
+          vals: [name, industry, priority],
+          text: [name, industry, priority, textOf(operationCell)].join('\t')
+        };
+      })
+      .filter(Boolean);
+
+    return {
+      headers: headers.map(item => item.text).filter(Boolean),
+      headerMap: headers,
+      rows,
+      countText: findCountText(),
+      searchValue: findSearchInput()?.value || ''
+    };
+  }
+
+  function tableContentSignature() {
+    const stateNow = readTableState();
+    return JSON.stringify({
+      headers: stateNow.headers,
+      rows: stateNow.rows.slice(0, 20).map(row => row.text),
+      countText: stateNow.countText
+    });
+  }
+
+  function tableSignature() {
+    const stateNow = readTableState();
+    return JSON.stringify({
+      headers: stateNow.headers,
+      rows: stateNow.rows.slice(0, 20).map(row => row.text),
+      countText: stateNow.countText,
+      searchValue: stateNow.searchValue
+    });
+  }
+
+  function looksLoading() {
+    const text = document.body?.innerText || '';
+    if (/加载中|Loading/i.test(text)) return true;
+    const selectors = [
+      '.n-spin--show',
+      '.n-data-table-loading',
+      '.n-base-loading',
+      '[aria-busy="true"]'
+    ];
+    return selectors.some(sel => Array.from(document.querySelectorAll(sel)).some(el => {
+      if (!isVisible(el)) return false;
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden';
+    }));
+  }
+
+  function hasTargetInVisibleRows(targetName) {
+    if (!targetName) return false;
+    const targetExact = normalize(targetName).toUpperCase();
+    const targetBase = baseCompanyName(targetName);
+    return readTableState().rows.some(row => {
+      const name = row.obj['客户名称'];
+      return normalize(name).toUpperCase() === targetExact || baseCompanyName(name) === targetBase;
+    });
+  }
+
+  function forceFocusSearchInput(input) {
+    input.scrollIntoView({ block: 'center', inline: 'center' });
+    input.focus();
+    input.click();
+    try { input.select?.(); } catch (_) {}
+  }
+
+  async function triggerSearch(input, label = '') {
+    // 搜索触发只使用已验证可用的输入框 Enter，不猜测搜索图标路径。
+    await sleep(120);
+    pressEnter(input);
+    input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
+    await sleep(label ? 900 : 500);
+  }
+
+  function searchApplied(previousContentSignature, targetName, options = {}) {
+    const stateNow = readTableState();
+    const contentSig = tableContentSignature();
+    const noData = !!findNoDataText() || /共\s*0\s*条/.test(stateNow.countText || '');
+    const contentChanged = previousContentSignature && contentSig !== previousContentSignature;
+    const inputMatched = normalize(stateNow.searchValue).toUpperCase() === normalize(targetName).toUpperCase();
+    const targetVisible = hasTargetInVisibleRows(targetName);
+    const allowUnchangedTarget = !!options.allowUnchangedTarget;
+
+    if (!targetName) return contentChanged || (!previousContentSignature && (stateNow.rows.length > 0 || noData));
+
+    // 初次搜索：优先要求表格内容发生变化后出现目标行/暂无数据，避免拿全量旧列表误判。
+    if (inputMatched && contentChanged && (targetVisible || noData)) return true;
+
+    // 保存后回读或当前列表已经停在同一个搜索结果时，允许“未变化但目标已可见”。
+    if (inputMatched && allowUnchangedTarget && (targetVisible || noData)) return true;
+
+    // 部分 CRM 场景下搜索结果只有一条且输入框已是目标名，即使虚拟表格 signature 未变，也可视为目标结果可读。
+    if (inputMatched && targetVisible && stateNow.rows.length === 1 && /共\s*1\s*条/.test(stateNow.countText || '')) return true;
+
+    return false;
+  }
+
+  async function waitForPageStable(label = '页面', timeout = PAGE_STABLE_TIMEOUT) {
+    const started = Date.now();
+    let lastSignature = '';
+    let stableSince = 0;
+    while (Date.now() - started < timeout) {
+      const sig = tableSignature() + '|' + (!!findEditForm()) + '|' + (document.body?.innerText || '').length;
+      const loading = looksLoading();
+      if (!loading && sig === lastSignature) {
+        if (!stableSince) stableSince = Date.now();
+        if (Date.now() - stableSince >= STABLE_HOLD_MS) return true;
+      } else {
+        lastSignature = sig;
+        stableSince = 0;
+      }
+      await sleep(POLL_INTERVAL);
+    }
+    throw new Error(`${label}等待稳定超时（${Math.round(timeout / 1000)}s）`);
+  }
+
+  async function waitForSearchResultStable(label = '搜索结果', previousContentSignature = '', targetName = '', options = {}) {
+    const started = Date.now();
+    let lastSignature = '';
+    let stableSince = 0;
+    let applied = false;
+
+    while (Date.now() - started < PAGE_STABLE_TIMEOUT) {
+      const sig = tableSignature();
+      const loading = looksLoading();
+
+      if (searchApplied(previousContentSignature, targetName, options)) applied = true;
+
+      if (sig === lastSignature) {
+        if (!stableSince) stableSince = Date.now();
+        const stableEnough = Date.now() - stableSince >= STABLE_HOLD_MS;
+        const loadingCanIgnore = !loading || Date.now() - started >= 1800;
+        if (applied && stableEnough && loadingCanIgnore) return true;
+      } else {
+        lastSignature = sig;
+        stableSince = 0;
+      }
+      await sleep(POLL_INTERVAL);
+    }
+
+    const stateNow = readTableState();
+    if (searchApplied(previousContentSignature, targetName, options)) return true;
+
+    const targetInfo = targetName ? `：${targetName}` : '';
+    const countInfo = stateNow.countText || `${stateNow.rows.length} 条`;
+    throw new Error(`${label}未得到目标结果${targetInfo}；当前结果（${countInfo}），已停止读取，避免拿旧列表误判`);
+  }
+
+  async function setSearchValueAndRun(input, value, label) {
+    forceFocusSearchInput(input);
+    setNativeValue(input, value);
+    await triggerSearch(input, label);
+
+    if (normalize(input.value) !== normalize(value)) {
+      forceFocusSearchInput(input);
+      setNativeValue(input, value);
+      await triggerSearch(input, label);
+    }
+  }
+
+  async function clearSearch() {
+    const input = findSearchInput();
+    if (!input) throw new Error(`找不到“通过名称搜索”搜索框：${CRM_PATHS.searchInput}`);
+    forceFocusSearchInput(input);
+    try {
+      pressCtrlA(input);
+      await sleep(60);
+      pressBackspace(input);
+      await sleep(80);
+    } catch (_) {}
+    setNativeValue(input, '');
+    await triggerSearch(input, '清空搜索');
+    await waitFor(() => normalize(input.value) === '', 2500, 100).catch(() => null);
+  }
+
+  async function prepareSearchBase(input) {
+    forceFocusSearchInput(input);
+    const beforeValue = normalize(input.value);
+    if (!beforeValue) {
+      return;
+    }
+
+    try {
+      pressCtrlA(input);
+      await sleep(60);
+      pressBackspace(input);
+      await sleep(80);
+    } catch (_) {}
+    setNativeValue(input, '');
+    await triggerSearch(input, '清空搜索');
+    await waitFor(() => normalize(input.value) === '', 2500, 100).catch(() => null);
+  }
+
+  async function searchCompany(name, options = {}) {
+    const input = findSearchInput();
+    if (!input) throw new Error(`找不到“通过名称搜索”搜索框：${CRM_PATHS.searchInput}`);
+
+    const currentBefore = readTableState();
+    const alreadyOnTarget = normalize(currentBefore.searchValue).toUpperCase() === normalize(name).toUpperCase()
+      && hasTargetInVisibleRows(name);
+
+    // 回读验证场景：当前列表已经是目标搜索结果时，不重复搜索。
+    if (options.allowCurrentResult && alreadyOnTarget) {
+      await waitForSearchResultStable('当前列表结果', tableContentSignature(), name, { allowUnchangedTarget: true });
+      return readTableState();
+    }
+
+    await prepareSearchBase(input);
+    const baseSignature = tableContentSignature();
+    await setSearchValueAndRun(input, name, name);
+
+    try {
+      await waitForSearchResultStable('搜索结果', baseSignature, name, { allowUnchangedTarget: !!options.allowUnchangedTarget });
+    } catch (err) {
+      log(`搜索未得到目标结果，二次触发：${name}`, 'warn');
+      await setSearchValueAndRun(input, name, name);
+      await waitForSearchResultStable('二次搜索结果', baseSignature, name, { allowUnchangedTarget: !!options.allowUnchangedTarget });
+    }
+
+    return readTableState();
+  }
+
+  async function waitForListReadyAfterSave(targetName) {
+    await waitFor(() => !findEditForm(), PAGE_STABLE_TIMEOUT, POLL_INTERVAL)
+      .catch(() => { throw new Error('点击更新后编辑表单未关闭，无法进入回读验证'); });
+    await waitFor(() => findSearchInput(), PAGE_STABLE_TIMEOUT, POLL_INTERVAL)
+      .catch(() => { throw new Error('编辑表单关闭后未找到搜索框，无法进入下一条'); });
+    await waitFor(() => readTableState().rows.length > 0 || findNoDataText(), PAGE_STABLE_TIMEOUT, POLL_INTERVAL)
+      .catch(() => { throw new Error(`保存后列表不可读：${targetName}`); });
+    log('编辑表单已关闭，列表可读。', 'info');
+  }
+
+  async function verifyCurrentOrSearch(targetName) {
+    await waitForListReadyAfterSave(targetName);
+
+    let currentState = readTableState();
+    let currentRows = findAcceptableRows(currentState.rows, targetName, true);
+    if (currentRows.length === 1) {
+      log('当前列表已包含目标行，直接回读验证。', 'info');
+      return { tableState: currentState, rows: currentRows, source: 'current_list' };
+    }
+
+    log(`当前列表未直接读到唯一目标，重新搜索回读：${targetName}`, 'warn');
+    currentState = await searchCompany(targetName, { allowCurrentResult: true, allowUnchangedTarget: true });
+    currentRows = findAcceptableRows(currentState.rows, targetName, true);
+    return { tableState: currentState, rows: currentRows, source: 'search' };
+  }
+
+  function findAcceptableRows(rows, targetName, allowBracketMatch = true) {
+    const targetExact = normalize(targetName).toUpperCase();
+    const targetBase = baseCompanyName(targetName);
+
+    const exact = rows.filter(row => normalize(row.obj['客户名称']).toUpperCase() === targetExact);
+    if (exact.length) return exact.map(row => ({ ...row, matchMode: 'exact' }));
+
+    if (allowBracketMatch) {
+      const base = rows.filter(row => baseCompanyName(row.obj['客户名称']) === targetBase);
+      if (base.length) return base.map(row => ({ ...row, matchMode: 'base_equal' }));
+    }
+
+    return [];
+  }
+
+  function shouldReportAmbiguity(tableState, acceptedRow, targetName) {
+    if (!acceptedRow || tableState.rows.length <= 1) return false;
+    if (acceptedRow.matchMode !== 'exact') return true;
+    const acceptedName = acceptedRow.obj['客户名称'];
+    const similar = tableState.rows.filter(row => {
+      const name = row.obj['客户名称'];
+      if (normalize(name).toUpperCase() === normalize(acceptedName).toUpperCase()) return false;
+      return namesAreSimilar(name, acceptedName) || namesAreSimilar(name, targetName);
+    });
+    return similar.length > 0;
+  }
+
+  function getPreciseFormInputOrNull(label) {
+    const map = {
+      '客户名称': CRM_PATHS.formNameInput,
+      '行业': CRM_PATHS.formIndustryInput,
+      '客户优先级': CRM_PATHS.formPriorityInput
+    };
+    const selector = map[label];
+    return selector ? document.querySelector(selector) : null;
+  }
+
+  async function waitForEditFormReady() {
+    const form = await waitFor(() => document.querySelector(CRM_PATHS.editForm), PAGE_STABLE_TIMEOUT, POLL_INTERVAL);
+    if (!form) throw new Error(`点击编辑后未出现编辑表单：${CRM_PATHS.editForm}`);
+
+    await waitFor(() => {
+      const nameInput = getPreciseFormInputOrNull('客户名称');
+      return nameInput && normalize(nameInput.value);
+    }, PAGE_STABLE_TIMEOUT, POLL_INTERVAL);
+
+    await waitFor(() => getPreciseFormInputOrNull('行业'), PAGE_STABLE_TIMEOUT, POLL_INTERVAL);
+    await waitFor(() => getPreciseFormInputOrNull('客户优先级'), PAGE_STABLE_TIMEOUT, POLL_INTERVAL);
+    return form;
+  }
+
+  async function clickEditInRow(row) {
+    const button = row.editButton || row.tr.querySelector(CRM_PATHS.rowEditButton);
+    if (!button) {
+      throw new Error(`目标行找不到精确编辑按钮：${CRM_PATHS.rowEditButton}`);
+    }
+
+    clickLikeUser(button);
+    log(`已点击精确编辑按钮：${CRM_PATHS.rowEditButton}`, 'info');
+
+    const form = await waitForEditFormReady();
+    log('编辑表单字段已就绪：客户名称、行业、客户优先级', 'info');
+    return form;
+  }
+
+  function findEditForm() {
+    return document.querySelector(CRM_PATHS.editForm);
+  }
+
+  function readFormFields() {
+    const form = findEditForm();
+    if (!form) return { hasForm: false, fields: {} };
+    const fields = {
+      '客户名称': document.querySelector(CRM_PATHS.formNameInput)?.value || '',
+      '行业': document.querySelector(CRM_PATHS.formIndustryInput)?.value || '',
+      '客户优先级': document.querySelector(CRM_PATHS.formPriorityInput)?.value || ''
+    };
+    return { hasForm: true, form, fields };
+  }
+
+  function getFormField(fields, label) {
+    return fields?.[label] || '';
+  }
+
+  function getPreciseFormInput(label) {
+    const map = {
+      '客户名称': CRM_PATHS.formNameInput,
+      '行业': CRM_PATHS.formIndustryInput,
+      '客户优先级': CRM_PATHS.formPriorityInput
+    };
+    const selector = map[label];
+    if (!selector) throw new Error(`未配置字段路径：${label}`);
+    const input = document.querySelector(selector);
+    if (!input) throw new Error(`找不到字段“${label}”输入框：${selector}`);
+    return input;
+  }
+
+  function fillFormField(label, value) {
+    const input = getPreciseFormInput(label);
+    input.scrollIntoView({ block: 'center', inline: 'center' });
+    input.focus();
+    setNativeValue(input, value);
+    input.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
+  }
+
+  async function cancelFormIfPresent() {
+    if (!findEditForm()) return;
+    const cancel = document.querySelector(CRM_PATHS.formCancelButton);
+    if (cancel) {
+      clickLikeUser(cancel);
+      await waitFor(() => !findEditForm(), PAGE_STABLE_TIMEOUT, POLL_INTERVAL).catch(() => sleep(300));
+    }
+  }
+
+  async function saveForm() {
+    const update = document.querySelector(CRM_PATHS.formUpdateButton);
+    if (!update) throw new Error(`找不到更新按钮：${CRM_PATHS.formUpdateButton}`);
+    const before = Date.now();
+    clickLikeUser(update);
+    await waitFor(() => {
+      const body = document.body?.innerText || '';
+      if (/更新成功/.test(body)) return true;
+      if (!findEditForm() && Date.now() - before > 500) return true;
+      return false;
+    }, PAGE_STABLE_TIMEOUT, POLL_INTERVAL);
+    return {
+      successText: /更新成功/.test(document.body?.innerText || ''),
+      formStill: !!findEditForm()
+    };
+  }
+
+  function splitInputLine(line) {
+    if (line.includes('\t')) return line.split('\t');
+    if (line.includes('|')) return line.split('|');
+    return line.split(',');
+  }
+
+  function detectHeaderIndexes(parts) {
+    const headers = parts.map(normalizeHeader);
+    const findAny = aliases => headers.findIndex(h => aliases.includes(h));
+    const nameIndex = findAny(['客户名称', '公司名称', '名字', '名称']);
+    const industryIndex = findAny(['行业']);
+    const priorityIndex = findAny(['rating', '客户优先级', '优先级', '评级']);
+    if (nameIndex >= 0 && industryIndex >= 0 && priorityIndex >= 0) {
+      return { nameIndex, industryIndex, priorityIndex, source: 'header' };
+    }
+    return null;
+  }
+
+  function inferIndexes(parts) {
+    if (parts.length >= 7) {
+      return { nameIndex: 0, industryIndex: 3, priorityIndex: 6, source: 'wps_B_to_H' };
+    }
+    if (parts.length >= 3) {
+      return { nameIndex: 0, industryIndex: 1, priorityIndex: 2, source: 'three_columns' };
+    }
+    return null;
+  }
+
+  function validateIndustry(value, lineNumber) {
+    const industry = normalize(value);
+    if (!industry) throw new Error(`第 ${lineNumber} 行行业为空`);
+    if (!INDUSTRY_ALLOW_SET.has(industry.toLowerCase())) {
+      throw new Error(`第 ${lineNumber} 行行业不在允许范围内：${industry}`);
+    }
+    return industry;
+  }
+
+  function validatePriority(value, lineNumber) {
+    const priority = normalize(value).toUpperCase();
+    if (!priority) throw new Error(`第 ${lineNumber} 行 rating/客户优先级为空`);
+    if (!/^[A-D]$/.test(priority)) {
+      throw new Error(`第 ${lineNumber} 行 rating/客户优先级不是 A/B/C/D：${value}`);
+    }
+    return priority;
+  }
+
+  function parseInput() {
+    const text = panelEls.input.value || '';
+    const lines = text.split(/\r?\n/);
+    const targets = [];
+    const errors = [];
+    let indexes = null;
+    let indexSource = '';
+
+    lines.forEach((line, idx) => {
+      const lineNumber = idx + 1;
+      const raw = line.trim();
+      if (!raw || raw.startsWith('#')) return;
+
+      const parts = splitInputLine(line).map(stripQuotes);
+      const headerIndexes = detectHeaderIndexes(parts);
+      if (headerIndexes) {
+        indexes = headerIndexes;
+        indexSource = headerIndexes.source;
+        return;
+      }
+
+      const useIndexes = indexes || inferIndexes(parts);
+      if (!useIndexes) {
+        errors.push(`第 ${lineNumber} 行列数不足，无法识别客户名称/行业/rating`);
+        return;
+      }
+      if (!indexes) {
+        indexes = useIndexes;
+        indexSource = useIndexes.source;
+      }
+
+      try {
+        const name = stripQuotes(parts[useIndexes.nameIndex]);
+        const industry = validateIndustry(parts[useIndexes.industryIndex], lineNumber);
+        const priority = validatePriority(parts[useIndexes.priorityIndex], lineNumber);
+        if (!name) throw new Error(`第 ${lineNumber} 行客户名称为空`);
+        targets.push({ lineNumber, name, industry, priority });
+      } catch (err) {
+        errors.push(err.message || String(err));
+      }
+    });
+
+    return { targets, errors, indexSource };
+  }
+
+  function formatVisibleRows(rows) {
+    return rows.slice(0, 8).map(row => {
+      const name = row.obj['客户名称'] || '';
+      const industry = row.obj['行业'] || '';
+      const priority = row.obj['客户优先级'] || '';
+      return `${name} [行业:${industry || '-'} 优先级:${priority || '-'}]`;
+    }).join(' / ');
+  }
+
+  function summarizeResult(result) {
+    const changed = result.changed?.map(item => `${item.field}:${item.from || '-'} -> ${item.to}`).join('; ') || '';
+    const note = result.note ? `；${result.note}` : '';
+    if (result.status === 'updated_verified') return `已更新并验证 ${changed}${note}`;
+    if (result.status === 'already_match_verified') return `已一致，未写入${note}`;
+    if (result.status === 'skipped_ambiguous') return `跳过：无法唯一确认；${result.note || ''}`;
+    if (result.status === 'verify_failed') return `保存后回读不一致；${result.note || ''}`;
+    if (result.status === 'error') return `异常：${result.error}`;
+    return `${result.status || '未知状态'}${note}`;
+  }
+
+  async function processTarget(target) {
+    const result = {
+      index: target.lineNumber,
+      name: target.name,
+      industry: target.industry,
+      priority: target.priority,
+      status: '',
+      changed: [],
+      note: ''
+    };
+
+    const tableState = await searchCompany(target.name);
+    const acceptedRows = findAcceptableRows(tableState.rows, target.name, true);
+
+    result.searchCountText = tableState.countText;
+    result.searchRows = tableState.rows.map(row => row.obj['客户名称']).slice(0, 12);
+
+    if (acceptedRows.length !== 1) {
+      result.status = 'skipped_ambiguous';
+      const filterNote = tableState.rows.length === 0 && hasActiveFilterHint()
+        ? '；当前检测到“清空筛选”，筛选可能导致搜不到客户'
+        : '';
+      result.note = `搜索结果 ${tableState.countText || tableState.rows.length + ' 条'}；可接受匹配 ${acceptedRows.length} 条；可见结果：${formatVisibleRows(tableState.rows) || '无'}${filterNote}`;
+      return result;
+    }
+
+    const accepted = acceptedRows[0];
+    result.crmName = accepted.obj['客户名称'];
+    result.matchMode = accepted.matchMode;
+
+    const beforeIndustry = dashToEmpty(accepted.obj['行业']);
+    const beforePriority = dashToEmpty(accepted.obj['客户优先级']);
+    result.beforeIndustry = beforeIndustry;
+    result.beforePriority = beforePriority;
+
+    const needsReport = shouldReportAmbiguity(tableState, accepted, target.name);
+    if (needsReport) {
+      result.note = `多结果但已按 ${accepted.matchMode === 'exact' ? '完全同名' : '去括号同名'} 处理；可见结果：${formatVisibleRows(tableState.rows)}`;
+    }
+
+    if (beforeIndustry === normalize(target.industry) && beforePriority === normalize(target.priority)) {
+      result.status = 'already_match_verified';
+      result.afterIndustry = beforeIndustry;
+      result.afterPriority = beforePriority;
+      return result;
+    }
+
+    await clickEditInRow(accepted);
+
+    const formState = readFormFields();
+    const formName = getFormField(formState.fields, '客户名称');
+    result.formName = formName;
+    if (baseCompanyName(formName) !== baseCompanyName(target.name)) {
+      await cancelFormIfPresent();
+      result.status = 'skipped_ambiguous';
+      result.note = `编辑页客户名称不匹配：输入=${target.name}，表单=${formName}`;
+      return result;
+    }
+
+    const currentIndustry = getFormField(formState.fields, '行业');
+    const currentPriority = getFormField(formState.fields, '客户优先级');
+
+    if (normalize(currentIndustry) !== normalize(target.industry)) {
+      fillFormField('行业', target.industry);
+      result.changed.push({ field: '行业', from: currentIndustry, to: target.industry });
+      log(`已填写行业：${currentIndustry || '-'} -> ${target.industry}`, 'info');
+    }
+    if (normalize(currentPriority) !== normalize(target.priority)) {
+      fillFormField('客户优先级', target.priority);
+      result.changed.push({ field: '客户优先级', from: currentPriority, to: target.priority });
+      log(`已填写客户优先级：${currentPriority || '-'} -> ${target.priority}`, 'info');
+    }
+
+    if (!result.changed.length) {
+      await cancelFormIfPresent();
+      result.status = 'already_match_verified';
+      result.afterIndustry = currentIndustry;
+      result.afterPriority = currentPriority;
+      return result;
+    }
+
+    log('已填写完成，点击更新。', 'info');
+    const saveInfo = await saveForm();
+    result.saveInfo = saveInfo;
+    log(`已点击更新，保存返回状态：${saveInfo.successText ? '检测到更新成功' : '表单已关闭/返回列表'}`, saveInfo.successText ? 'ok' : 'info');
+
+    const verifyInfo = await verifyCurrentOrSearch(target.name);
+    const verifyRows = verifyInfo.rows;
+    if (verifyRows.length !== 1) {
+      result.status = 'verify_failed';
+      result.note = `疑似已保存，但回读未确认；来源=${verifyInfo.source}；结果：${formatVisibleRows(verifyInfo.tableState.rows)}`;
+      return result;
+    }
+
+    let finalRows = verifyRows;
+    const settled = await waitFor(() => {
+      const st = readTableState();
+      const rows = findAcceptableRows(st.rows, target.name, true);
+      if (rows.length !== 1) return null;
+      const rowObj = rows[0].obj;
+      const industry = dashToEmpty(rowObj['行业']);
+      const priority = dashToEmpty(rowObj['客户优先级']);
+      if (industry === normalize(target.industry) && priority === normalize(target.priority)) {
+        return rows;
+      }
+      return null;
+    }, 4500, 300).catch(() => null);
+
+    if (settled) finalRows = settled;
+
+    const verified = finalRows[0].obj;
+    const afterIndustry = dashToEmpty(verified['行业']);
+    const afterPriority = dashToEmpty(verified['客户优先级']);
+    result.afterIndustry = afterIndustry;
+    result.afterPriority = afterPriority;
+
+    if (afterIndustry === normalize(target.industry) && afterPriority === normalize(target.priority)) {
+      result.status = 'updated_verified';
+      log(`当前列表回读验证通过：行业=${afterIndustry || '-'}，客户优先级=${afterPriority || '-'}`, 'ok');
+    } else {
+      result.status = 'verify_failed';
+      result.note = `疑似已保存，但回读不一致；目标 行业=${target.industry} 优先级=${target.priority}；回读 行业=${afterIndustry || '-'} 优先级=${afterPriority || '-'}`;
+    }
+
+    return result;
+  }
+
+  function log(message, level = 'info') {
+    const time = new Date().toLocaleTimeString();
+    const item = { time, level, message };
+    state.logs.push(item);
+    if (level === 'warn' && state.activeCompanyName) {
+      state.currentCompanyWarned = true;
+      if (state.inRetryPass) state.retryWarnCompanyNames.add(state.activeCompanyName);
+      else state.warnCompanyNames.add(state.activeCompanyName);
+    }
+    if (!panelEls.log) return;
+    const div = document.createElement('div');
+    div.className = `crm-batch-log-row ${level}`;
+    div.textContent = `[${time}] ${message}`;
+    panelEls.log.appendChild(div);
+    panelEls.log.scrollTop = panelEls.log.scrollHeight;
+  }
+
+  function resetRunLogs() {
+    state.logs = [];
+    state.results = [];
+    state.warnCompanyNames = new Set();
+    state.retryWarnCompanyNames = new Set();
+    state.retryStillWarnCompanyNames = new Set();
+    state.activeCompanyName = '';
+    state.currentCompanyWarned = false;
+    state.inRetryPass = false;
+    state.retryProcessed = 0;
+    state.waitingManual = false;
+    state.manualContinueResolve = null;
+    state.total = 0;
+    state.current = 0;
+    if (panelEls.log) panelEls.log.innerHTML = '';
+    refreshSummary();
+  }
+
+
+  function logWarnCompanySummary(title = '本次黄色日志涉及公司（需人工复核）：', sourceSet = state.warnCompanyNames) {
+    const names = Array.from(sourceSet || []);
+    if (!names.length) {
+      log('本次黄色日志涉及公司：无', 'info');
+      return;
+    }
+    log(title, 'warn');
+    names.forEach(name => log(name, 'warn'));
+  }
+
+  function logRetryFinalSummary() {
+    const names = Array.from(state.retryStillWarnCompanyNames || []);
+    if (!names.length) {
+      log('复跑后仍为黄色的公司：无', 'info');
+      return;
+    }
+    log('复跑后仍为黄色，已交由人工处理/复核的公司：', 'warn');
+    names.forEach(name => log(name, 'warn'));
+  }
+
+  async function waitForManualNext(companyName) {
+    state.waitingManual = true;
+    state.pauseRequested = false;
+    setMode('等待人工', 'paused');
+    refreshButtons();
+    log(`${companyName}：复跑后仍为黄色。请人工处理，完成后点击“下一个”继续。`, 'warn');
+
+    await new Promise(resolve => {
+      state.manualContinueResolve = resolve;
+    });
+
+    state.manualContinueResolve = null;
+    state.waitingManual = false;
+    if (state.running && !state.stopRequested) setMode('运行中', 'running');
+    refreshButtons();
+  }
+
+  function continueAfterManual() {
+    if (!state.waitingManual) return;
+    log('已点击“下一个”，继续处理后续黄色公司。', 'info');
+    const resolve = state.manualContinueResolve;
+    if (resolve) resolve();
+  }
+
+  async function retryWarnTargets(targets) {
+    const warnNames = Array.from(state.warnCompanyNames || []);
+    if (!warnNames.length) {
+      log('首轮无黄色公司，无需复跑。', 'info');
+      return;
+    }
+
+    const warnNameSet = new Set(warnNames);
+    const retryTargets = targets.filter(target => warnNameSet.has(target.name));
+    if (!retryTargets.length) {
+      log('首轮存在黄色日志，但未匹配到可复跑的输入行。', 'warn');
+      return;
+    }
+
+    logWarnCompanySummary('首轮黄色日志涉及公司，开始自动复跑：', warnNameSet);
+    state.inRetryPass = true;
+    state.retryWarnCompanyNames = new Set();
+    state.retryStillWarnCompanyNames = new Set();
+    state.retryProcessed = 0;
+
+    for (const target of retryTargets) {
+      if (state.stopRequested) break;
+      await waitIfPaused();
+      if (state.stopRequested) break;
+
+      state.retryProcessed += 1;
+      state.activeCompanyName = target.name;
+      state.currentCompanyWarned = false;
+      refreshSummary();
+
+      let retryHardFailed = false;
+      try {
+        log(`复跑 ${state.retryProcessed}/${retryTargets.length}：${target.name} -> 行业=${target.industry} 优先级=${target.priority}`, 'info');
+        const result = await processTarget(target);
+        result.retry = true;
+        state.results.push(result);
+        const level = ['updated_verified', 'already_match_verified'].includes(result.status)
+          ? (result.note ? 'warn' : 'ok')
+          : (result.status === 'verify_failed' || result.status === 'error' ? 'error' : 'warn');
+        if (result.status === 'verify_failed' || result.status === 'error') retryHardFailed = true;
+        log(`${target.name}：复跑结果：${summarizeResult(result)}`, level);
+      } catch (err) {
+        await cancelFormIfPresent().catch(() => {});
+        const result = {
+          index: target.lineNumber,
+          name: target.name,
+          industry: target.industry,
+          priority: target.priority,
+          status: 'error',
+          retry: true,
+          error: err && err.stack ? err.stack : String(err)
+        };
+        retryHardFailed = true;
+        state.results.push(result);
+        log(`${target.name}：复跑异常 ${err.message || err}`, 'error');
+      }
+
+      const stillWarn = state.currentCompanyWarned || state.retryWarnCompanyNames.has(target.name);
+      if (stillWarn || retryHardFailed) {
+        state.retryStillWarnCompanyNames.add(target.name);
+        await waitForManualNext(target.name);
+      } else {
+        log(`${target.name}：复跑未再出现黄色日志。`, 'ok');
+      }
+
+      state.activeCompanyName = '';
+      state.currentCompanyWarned = false;
+      refreshSummary();
+      await sleep(120);
+    }
+
+    state.inRetryPass = false;
+    state.activeCompanyName = '';
+    state.currentCompanyWarned = false;
+    logRetryFinalSummary();
+  }
+
+  function refreshSummary() {
+    const counts = state.results.reduce((acc, item) => {
+      acc[item.status] = (acc[item.status] || 0) + 1;
+      return acc;
+    }, {});
+    const processed = state.results.length;
+    const text = [
+      `总 ${state.total || 0}`,
+      `已处理 ${processed}`,
+      `更新 ${counts.updated_verified || 0}`,
+      `一致 ${counts.already_match_verified || 0}`,
+      `跳过 ${counts.skipped_ambiguous || 0}`,
+      `失败 ${counts.verify_failed || 0}`,
+      `异常 ${counts.error || 0}`,
+      `复跑 ${state.retryProcessed || 0}`
+    ].join(' ｜ ');
+    if (panelEls.summary) panelEls.summary.textContent = text;
+  }
+
+  function setMode(text, type = 'idle') {
+    if (panelEls.mode) {
+      panelEls.mode.textContent = text;
+      panelEls.mode.dataset.type = type;
+    }
+  }
+
+  function refreshButtons() {
+    if (!panelEls.start) return;
+    panelEls.start.disabled = state.running;
+    panelEls.pause.disabled = !state.running || state.waitingManual;
+    panelEls.stop.disabled = !state.running && !state.waitingManual;
+    if (panelEls.next) panelEls.next.disabled = !state.waitingManual;
+    panelEls.clearInput.disabled = state.running || state.waitingManual;
+    panelEls.pause.textContent = state.pauseRequested ? '继续' : '暂停';
+  }
+
+  function ensurePageReadyBeforeRun() {
+    if (!/\/account\/index/.test(location.href)) {
+      log('当前 URL 可能不是客户列表页，请确认在 CRM 客户列表运行。', 'warn');
+    }
+    if (!findSearchInput()) {
+      throw new Error(`找不到“通过名称搜索”搜索框：${CRM_PATHS.searchInput}`);
+    }
+    if (!document.querySelector(CRM_PATHS.dataTable)) {
+      throw new Error(`找不到客户数据表：${CRM_PATHS.dataTable}`);
+    }
+    if (findEditForm()) {
+      throw new Error('当前存在未关闭的编辑表单，请先手动取消或保存后再运行。');
+    }
+    const tableState = readTableState();
+    if (!tableState.headers.length) {
+      throw new Error(`当前页面未读到客户表格表头：${CRM_PATHS.headerTh}`);
+    }
+    log('路径自检通过：搜索框、客户表格、精确列路径可用。', 'ok');
+    if (hasActiveFilterHint()) {
+      log('检测到页面存在“清空筛选”。脚本不会自动清空筛选；若后续搜索 0 条，可能与筛选有关。', 'warn');
+    }
+  }
+
+  async function waitIfPaused() {
+    while (state.running && state.pauseRequested && !state.stopRequested) {
+      setMode('暂停中', 'paused');
+      await sleep(300);
+    }
+    if (state.running && !state.stopRequested) setMode('运行中', 'running');
+  }
+
+  async function run() {
+    if (state.running) return;
+
+    resetRunLogs();
+
+    let parsed;
+    try {
+      parsed = parseInput();
+    } catch (err) {
+      log(err.message || String(err), 'error');
+      return;
+    }
+
+    if (parsed.errors.length) {
+      parsed.errors.slice(0, 20).forEach(msg => log(msg, 'error'));
+      if (parsed.errors.length > 20) log(`还有 ${parsed.errors.length - 20} 条输入错误未显示。`, 'error');
+      log('输入存在错误，已停止。请修正后重新开始。', 'error');
+      return;
+    }
+
+    const targets = parsed.targets;
+    if (!targets.length) {
+      log('没有识别到可处理数据。请从 WPS 复制“客户名称”到“rating”的列区域，包含表头或内容均可。', 'error');
+      return;
+    }
+
+    try {
+      ensurePageReadyBeforeRun();
+    } catch (err) {
+      log(err.message || String(err), 'error');
+      return;
+    }
+
+    state.running = true;
+    state.pauseRequested = false;
+    state.stopRequested = false;
+    state.total = targets.length;
+    state.current = 0;
+    setMode('运行中', 'running');
+    refreshButtons();
+    refreshSummary();
+
+    log(`开始处理：${targets.length} 条。输入识别方式：${parsed.indexSource || '自动'}`, 'info');
+    log('运行规则：只写入“行业”和“客户优先级”；每次保存后都会回到列表回读验证。', 'info');
+
+    for (const target of targets) {
+      await waitIfPaused();
+      if (state.stopRequested) {
+        log('已收到停止请求，当前批次中止。', 'warn');
+        break;
+      }
+
+      state.current += 1;
+      state.activeCompanyName = target.name;
+      refreshSummary();
+
+      try {
+        log(`处理 ${state.current}/${state.total}：${target.name} -> 行业=${target.industry} 优先级=${target.priority}`, 'info');
+        const result = await processTarget(target);
+        state.results.push(result);
+        const level = ['updated_verified', 'already_match_verified'].includes(result.status)
+          ? (result.note ? 'warn' : 'ok')
+          : (result.status === 'verify_failed' || result.status === 'error' ? 'error' : 'warn');
+        log(`${target.name}：${summarizeResult(result)}`, level);
+      } catch (err) {
+        await cancelFormIfPresent().catch(() => {});
+        const result = {
+          index: target.lineNumber,
+          name: target.name,
+          industry: target.industry,
+          priority: target.priority,
+          status: 'error',
+          error: err && err.stack ? err.stack : String(err)
+        };
+        state.results.push(result);
+        log(`${target.name}：异常 ${err.message || err}`, 'error');
+      }
+
+      state.activeCompanyName = '';
+      refreshSummary();
+      await sleep(120);
+    }
+
+    state.activeCompanyName = '';
+
+    await retryWarnTargets(targets);
+
+    try {
+      await clearSearch();
+      log('已清空搜索框。', 'info');
+    } catch (err) {
+      log(`清空搜索框失败：${err.message || err}`, 'warn');
+    }
+
+    state.running = false;
+    state.pauseRequested = false;
+    state.stopRequested = false;
+    state.waitingManual = false;
+    state.manualContinueResolve = null;
+    setMode('空闲', 'idle');
+    refreshButtons();
+    refreshSummary();
+    log('处理结束。', 'info');
+  }
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function applySavedPanelPosition(panel) {
+    const defaultWidth = 430;
+    const defaultLeft = Math.max(12, window.innerWidth - defaultWidth - 18);
+    const defaultTop = 76;
+    let pos = null;
+    try {
+      pos = JSON.parse(localStorage.getItem(STORAGE_KEYS.panelPos) || 'null');
+    } catch (_) {}
+    const left = clamp(Number(pos?.left ?? defaultLeft), 6, Math.max(6, window.innerWidth - 120));
+    const top = clamp(Number(pos?.top ?? defaultTop), 6, Math.max(6, window.innerHeight - 36));
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  }
+
+  function savePanelPosition(panel) {
+    const rect = panel.getBoundingClientRect();
+    localStorage.setItem(STORAGE_KEYS.panelPos, JSON.stringify({ left: Math.round(rect.left), top: Math.round(rect.top) }));
+  }
+
+  function initDrag(panel, handle) {
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let startLeft = 0;
+    let startTop = 0;
+
+    handle.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      if (event.target.closest('button, input, textarea, select, a')) return;
+      const rect = panel.getBoundingClientRect();
+      dragging = true;
+      startX = event.clientX;
+      startY = event.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      handle.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    });
+
+    handle.addEventListener('pointermove', event => {
+      if (!dragging) return;
+      const dx = event.clientX - startX;
+      const dy = event.clientY - startY;
+      const rect = panel.getBoundingClientRect();
+      const maxLeft = window.innerWidth - Math.min(120, rect.width);
+      const maxTop = window.innerHeight - 34;
+      const nextLeft = clamp(startLeft + dx, 6, maxLeft);
+      const nextTop = clamp(startTop + dy, 6, maxTop);
+      panel.style.left = `${nextLeft}px`;
+      panel.style.top = `${nextTop}px`;
+      event.preventDefault();
+    });
+
+    const endDrag = event => {
+      if (!dragging) return;
+      dragging = false;
+      savePanelPosition(panel);
+      try { handle.releasePointerCapture?.(event.pointerId); } catch (_) {}
+    };
+    handle.addEventListener('pointerup', endDrag);
+    handle.addEventListener('pointercancel', endDrag);
+  }
+
+  function minimizePanel(minimized) {
+    panelEls.panel.classList.toggle('crm-minimized', minimized);
+    panelEls.minimize.textContent = minimized ? '□' : '—';
+    panelEls.minimize.title = minimized ? '展开' : '最小化';
+    localStorage.setItem(STORAGE_KEYS.minimized, minimized ? '1' : '0');
+    savePanelPosition(panelEls.panel);
+  }
+
+  function closePanel() {
+    if (state.running) {
+      log('脚本正在运行，请先暂停或停止后再关闭面板。', 'warn');
+      return;
+    }
+    const rect = panelEls.panel.getBoundingClientRect();
+    panelEls.launcher.style.left = `${Math.round(rect.left)}px`;
+    panelEls.launcher.style.top = `${Math.round(rect.top)}px`;
+    panelEls.panel.style.display = 'none';
+    panelEls.launcher.style.display = 'flex';
+  }
+
+  function restorePanel() {
+    panelEls.panel.style.display = 'block';
+    panelEls.launcher.style.display = 'none';
+    applySavedPanelPosition(panelEls.panel);
+  }
+
+  function buildPanel() {
+    if (document.getElementById('crm-batch-fill-panel')) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #crm-batch-fill-panel {
+        position: fixed;
+        z-index: 2147483647;
+        width: 430px;
+        max-height: 86vh;
+        background: #ffffff;
+        color: #1f2937;
+        border: 1px solid #cfd8e3;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.16);
+        border-radius: 5px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        font-size: 13px;
+        overflow: hidden;
+      }
+      #crm-batch-fill-panel.crm-minimized {
+        max-height: none;
+      }
+      #crm-batch-fill-panel.crm-minimized .crm-batch-body {
+        display: none;
+      }
+      .crm-batch-header {
+        height: 34px;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        background: #f6f9fc;
+        color: #263342;
+        border-bottom: 1px solid #dce5ee;
+        padding: 0 8px 0 10px;
+        cursor: move;
+        user-select: none;
+      }
+      .crm-batch-title {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+        font-weight: 700;
+      }
+      .crm-batch-title span:first-child {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .crm-batch-version {
+        color: #64748b;
+        font-weight: 500;
+        font-size: 12px;
+      }
+      .crm-batch-head-right {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      #crm-batch-mode {
+        min-width: 48px;
+        height: 20px;
+        line-height: 20px;
+        padding: 0 7px;
+        border-radius: 3px;
+        background: #e8eef5;
+        color: #475569;
+        text-align: center;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      #crm-batch-mode[data-type="running"] { background: #e2f4ef; color: #0f766e; }
+      #crm-batch-mode[data-type="paused"] { background: #fff5d6; color: #9a6700; }
+      #crm-batch-mode[data-type="idle"] { background: #e8eef5; color: #475569; }
+      .crm-head-btn {
+        width: 24px;
+        height: 24px;
+        border: 1px solid #cbd5e1;
+        border-radius: 3px;
+        background: #ffffff;
+        color: #334155;
+        cursor: pointer;
+        line-height: 20px;
+        padding: 0;
+      }
+      .crm-head-btn:hover { background: #eef4f8; }
+      .crm-batch-body {
+        padding: 9px;
+      }
+      .crm-batch-hint {
+        margin-bottom: 6px;
+        color: #64748b;
+        line-height: 1.35;
+        font-size: 12px;
+      }
+      #crm-batch-input {
+        width: 100%;
+        height: 132px;
+        box-sizing: border-box;
+        border: 1px solid #cbd5e1;
+        border-radius: 4px;
+        padding: 7px;
+        resize: vertical;
+        font-family: Consolas, "Microsoft YaHei", monospace;
+        font-size: 12px;
+        line-height: 1.45;
+        color: #172033;
+        background: #ffffff;
+        outline: none;
+      }
+      #crm-batch-input:focus {
+        border-color: #7aa7c7;
+        box-shadow: 0 0 0 2px rgba(122, 167, 199, 0.16);
+      }
+      .crm-batch-actions {
+        display: flex;
+        gap: 7px;
+        margin: 8px 0 7px;
+      }
+      .crm-batch-actions button {
+        height: 30px;
+        border: 1px solid #cbd5e1;
+        background: #ffffff;
+        color: #1f2937;
+        border-radius: 4px;
+        padding: 0 11px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      .crm-batch-actions button.primary {
+        background: #2f7d75;
+        border-color: #2f7d75;
+        color: #ffffff;
+      }
+      .crm-batch-actions button.warn {
+        background: #fff8e6;
+        border-color: #ead28d;
+        color: #7a5500;
+      }
+      .crm-batch-actions button.danger {
+        background: #fff1f1;
+        border-color: #e5a1a1;
+        color: #a12222;
+      }
+      .crm-batch-actions button:disabled {
+        opacity: 0.52;
+        cursor: not-allowed;
+      }
+      #crm-batch-summary {
+        min-height: 20px;
+        line-height: 20px;
+        margin: 0 0 6px;
+        color: #475569;
+        font-size: 12px;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 4px;
+        padding: 3px 6px;
+        box-sizing: border-box;
+      }
+      #crm-batch-log {
+        height: 220px;
+        overflow: auto;
+        border: 1px solid #dfe7ef;
+        border-radius: 4px;
+        background: #fbfdff;
+        color: #334155;
+        padding: 6px;
+        font-family: Consolas, "Microsoft YaHei", monospace;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      .crm-batch-log-row {
+        white-space: pre-wrap;
+        border-left: 3px solid #cbd5e1;
+        padding: 2px 4px 2px 6px;
+        margin: 0 0 3px;
+        background: #ffffff;
+      }
+      .crm-batch-log-row.ok { border-left-color: #72b58b; color: #20643b; background: #f4fbf6; }
+      .crm-batch-log-row.warn { border-left-color: #dfbd55; color: #7a5500; background: #fffaf0; }
+      .crm-batch-log-row.error { border-left-color: #d36b6b; color: #9f1d1d; background: #fff6f6; }
+      .crm-batch-log-row.info { border-left-color: #7aa7c7; color: #315d7d; background: #f5f9fc; }
+      #crm-batch-launcher {
+        position: fixed;
+        z-index: 2147483647;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        height: 30px;
+        min-width: 84px;
+        padding: 0 10px;
+        border: 1px solid #cbd5e1;
+        border-radius: 4px;
+        background: #ffffff;
+        color: #2f7d75;
+        box-shadow: 0 8px 18px rgba(15, 23, 42, 0.12);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+    `;
+    document.documentElement.appendChild(style);
+
+    const panel = document.createElement('div');
+    panel.id = 'crm-batch-fill-panel';
+    panel.innerHTML = `
+      <div class="crm-batch-header">
+        <div class="crm-batch-title">
+          <span>${SCRIPT_NAME}</span>
+          <span class="crm-batch-version">v${VERSION}</span>
+        </div>
+        <div class="crm-batch-head-right">
+          <span id="crm-batch-mode" data-type="idle">空闲</span>
+          <button type="button" class="crm-head-btn" id="crm-batch-minimize" title="最小化">—</button>
+          <button type="button" class="crm-head-btn" id="crm-batch-close" title="关闭">×</button>
+        </div>
+      </div>
+      <div class="crm-batch-body">
+        <div class="crm-batch-hint">从 WPS 复制 <b>客户名称 → rating</b> 列区域后粘贴；脚本自动读取客户名称、行业、rating。</div>
+        <textarea id="crm-batch-input" spellcheck="false" placeholder="示例表头：客户名称<Tab>公司官网<Tab>官网建联<Tab>行业<Tab>product_category<Tab>packaging_fit<Tab>rating"></textarea>
+        <div class="crm-batch-actions">
+          <button type="button" id="crm-batch-start" class="primary">开始处理</button>
+          <button type="button" id="crm-batch-pause" class="warn" disabled>暂停</button>
+          <button type="button" id="crm-batch-stop" class="danger" disabled>停止</button>
+          <button type="button" id="crm-batch-next" disabled>下一个</button>
+          <button type="button" id="crm-batch-clear-input">清空输入</button>
+        </div>
+        <div id="crm-batch-summary">总 0 ｜ 已处理 0 ｜ 更新 0 ｜ 一致 0 ｜ 跳过 0 ｜ 失败 0 ｜ 异常 0 ｜ 复跑 0</div>
+        <div id="crm-batch-log"></div>
+      </div>
+    `;
+
+    const launcher = document.createElement('div');
+    launcher.id = 'crm-batch-launcher';
+    launcher.textContent = 'CRM填充';
+
+    document.body.appendChild(panel);
+    document.body.appendChild(launcher);
+
+    panelEls = {
+      panel,
+      launcher,
+      header: panel.querySelector('.crm-batch-header'),
+      input: panel.querySelector('#crm-batch-input'),
+      mode: panel.querySelector('#crm-batch-mode'),
+      minimize: panel.querySelector('#crm-batch-minimize'),
+      close: panel.querySelector('#crm-batch-close'),
+      start: panel.querySelector('#crm-batch-start'),
+      pause: panel.querySelector('#crm-batch-pause'),
+      stop: panel.querySelector('#crm-batch-stop'),
+      next: panel.querySelector('#crm-batch-next'),
+      clearInput: panel.querySelector('#crm-batch-clear-input'),
+      summary: panel.querySelector('#crm-batch-summary'),
+      log: panel.querySelector('#crm-batch-log')
+    };
+
+    applySavedPanelPosition(panel);
+    initDrag(panel, panelEls.header);
+
+    panelEls.input.value = localStorage.getItem(STORAGE_KEYS.input) || '';
+    panelEls.input.addEventListener('input', () => {
+      localStorage.setItem(STORAGE_KEYS.input, panelEls.input.value);
+    });
+
+    panelEls.minimize.addEventListener('click', () => {
+      minimizePanel(!panel.classList.contains('crm-minimized'));
+    });
+    panelEls.close.addEventListener('click', closePanel);
+    launcher.addEventListener('click', restorePanel);
+
+    panelEls.start.addEventListener('click', () => run());
+    panelEls.pause.addEventListener('click', () => {
+      if (!state.running) return;
+      state.pauseRequested = !state.pauseRequested;
+      log(state.pauseRequested ? '已请求暂停：当前客户处理完后暂停。' : '继续处理。', state.pauseRequested ? 'warn' : 'info');
+      setMode(state.pauseRequested ? '暂停中' : '运行中', state.pauseRequested ? 'paused' : 'running');
+      refreshButtons();
+    });
+    panelEls.stop.addEventListener('click', () => {
+      if (!state.running && !state.waitingManual) return;
+      state.stopRequested = true;
+      state.pauseRequested = false;
+      if (state.waitingManual && state.manualContinueResolve) {
+        state.manualContinueResolve();
+      }
+      log('正在停止：会等当前客户处理完后中止。', 'warn');
+      refreshButtons();
+    });
+    panelEls.next.addEventListener('click', continueAfterManual);
+    panelEls.clearInput.addEventListener('click', () => {
+      panelEls.input.value = '';
+      localStorage.removeItem(STORAGE_KEYS.input);
+      log('已清空输入区。', 'info');
+    });
+
+    if (localStorage.getItem(STORAGE_KEYS.minimized) === '1') {
+      minimizePanel(true);
+    }
+
+    refreshButtons();
+    refreshSummary();
+    log('脚本已加载。请从 WPS 复制“客户名称→rating”区域后粘贴，再点击“开始处理”。', 'info');
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', buildPanel);
+  } else {
+    buildPanel();
+  }
+})();
