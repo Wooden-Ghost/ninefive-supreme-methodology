@@ -1,0 +1,902 @@
+// ==UserScript==
+// @name         Doubao 消息结构侦察 v0.3.0
+// @namespace    doubao-message-structure-scout
+// @version      0.3.0
+// @description  豆包网页版消息结构侦察：用于确认消息根、回答正文、动作按钮组、生成状态与新回答识别条件。可直接粘贴控制台运行，也可放油猴运行。不发送、不复制、不写剪贴板。
+// @match        https://www.doubao.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  const SCRIPT_VERSION = 'v0.3.0';
+  const APP_KEY = '__DOUBAO_MESSAGE_SCOUT_V030__';
+  const PANEL_ID = '__doubao_message_scout_panel__';
+  const STYLE_ID = '__doubao_message_scout_style__';
+  const MAX_LOG_LINES = 5000;
+
+  try {
+    if (window[APP_KEY] && typeof window[APP_KEY].destroy === 'function') {
+      window[APP_KEY].destroy();
+    }
+  } catch {}
+
+  const state = {
+    destroyed: false,
+    observing: false,
+    logs: [],
+    baseline: null,
+    observer: null,
+    drag: false,
+    dragX: 0,
+    dragY: 0
+  };
+
+  let panelEl = null;
+  let logEl = null;
+  let exportEl = null;
+  let statusEl = null;
+  let observeBtnEl = null;
+
+  function pad(n) {
+    return String(n).padStart(2, '0');
+  }
+
+  function time() {
+    const d = new Date();
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function normText(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function short(s, n = 220) {
+    const t = normText(s);
+    if (t.length <= n) return t;
+    return `${t.slice(0, n)}…`;
+  }
+
+  function classStr(el) {
+    if (!el) return '';
+    try {
+      if (typeof el.className === 'string') return el.className;
+      if (el.className && typeof el.className.baseVal === 'string') return el.className.baseVal;
+      return String(el.getAttribute('class') || '');
+    } catch {
+      return '';
+    }
+  }
+
+  function isVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.closest && el.closest(`#${PANEL_ID}`)) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return !(
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      style.opacity === '0' ||
+      rect.width <= 0 ||
+      rect.height <= 0
+    );
+  }
+
+  function rectInfo(el) {
+    if (!el || !el.getBoundingClientRect) return 'rect=NA';
+    const r = el.getBoundingClientRect();
+    const round = v => Math.round(v);
+    return `x=${round(r.left)}, y=${round(r.top)}, w=${round(r.width)}, h=${round(r.height)}, bottom=${round(r.bottom)}`;
+  }
+
+  function tagInfo(el) {
+    if (!el || el.nodeType !== 1) return '<null>';
+    const id = el.id ? `#${el.id}` : '';
+    const cls = classStr(el);
+    return `<${el.tagName.toLowerCase()}${id}${cls ? ` class="${short(cls, 120)}"` : ''}>`;
+  }
+
+  function escapeCssIdent(value) {
+    if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(value);
+    return String(value).replace(/([ #;?%&,.+*~':"!^$[\]()=>|/@])/g, '\\$1');
+  }
+
+  function cssPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (el.id) return `#${escapeCssIdent(el.id)}`;
+
+    const parts = [];
+    let node = el;
+    let depth = 0;
+
+    while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement && depth < 8) {
+      let part = node.tagName.toLowerCase();
+      const dtid = node.getAttribute('data-target-id');
+      const dmid = node.getAttribute('data-message-id');
+      const testid = node.getAttribute('data-testid');
+      const aria = node.getAttribute('aria-label');
+
+      if (dtid) part += `[data-target-id="${dtid}"]`;
+      else if (dmid) part += `[data-message-id="${dmid}"]`;
+      else if (testid) part += `[data-testid="${testid}"]`;
+      else if (aria && aria.length < 60) part += `[aria-label="${aria}"]`;
+      else {
+        const cls = classStr(node).split(/\s+/).filter(Boolean).slice(0, 2);
+        if (cls.length) part += cls.map(c => `.${escapeCssIdent(c)}`).join('');
+      }
+
+      const parent = node.parentElement;
+      if (parent) {
+        const siblings = [...parent.children].filter(x => x.tagName === node.tagName);
+        if (siblings.length > 1 && !/\[data-|\./.test(part)) {
+          part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+        }
+      }
+
+      parts.unshift(part);
+      node = parent;
+      depth++;
+    }
+
+    return parts.join(' > ');
+  }
+
+  function cleanHtml(html) {
+    return String(html || '')
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function outerHtml(el, limit = 1400) {
+    if (!el) return '';
+    const html = cleanHtml(el.outerHTML || '');
+    return html.length > limit ? `${html.slice(0, limit)}…` : html;
+  }
+
+  function domOrderSort(a, b) {
+    if (a === b) return 0;
+    const pos = a.compareDocumentPosition(b);
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  }
+
+  function uniq(list) {
+    const out = [];
+    const seen = new Set();
+    for (const item of list) {
+      if (!item || seen.has(item)) continue;
+      seen.add(item);
+      out.push(item);
+    }
+    return out;
+  }
+
+  function log(message, type = 'info') {
+    const line = `[${time()}] ${message}`;
+    state.logs.push(line);
+    if (state.logs.length > MAX_LOG_LINES) state.logs.splice(0, state.logs.length - MAX_LOG_LINES);
+    if (logEl) {
+      const div = document.createElement('div');
+      div.className = `line ${type}`;
+      div.textContent = line;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+  }
+
+  function block(title) {
+    log(`\n========== ${title} ==========`);
+  }
+
+  function setStatus(text, type = 'info') {
+    if (!statusEl) return;
+    statusEl.textContent = `${text} | ${SCRIPT_VERSION}`;
+    statusEl.className = `status ${type}`;
+  }
+
+  function qsa(sel, root = document) {
+    try {
+      return [...root.querySelectorAll(sel)];
+    } catch {
+      return [];
+    }
+  }
+
+  function count(sel) {
+    return qsa(sel).length;
+  }
+
+  function featureInfo(root) {
+    if (!root) return {};
+    return {
+      flowMarkdown: qsa('.flow-markdown-body', root).length,
+      actionGroup: qsa('.message-action-button-main', root).length,
+      targetId: qsa('div[data-target-id="message-box-target-id"]', root).length,
+      userBubble: qsa('.bg-g-send-msg-bubble-bg', root).length,
+      messageId: qsa('[data-message-id]', root).length,
+      copyTelemetry: qsa('[data-copy-telemetry]', root).length,
+      buttons: qsa('button', root).length,
+      textLen: normText(root.innerText || root.textContent || '').length
+    };
+  }
+
+  function featureLine(root) {
+    const f = featureInfo(root);
+    return `textLen=${f.textLen} | markdown=${f.flowMarkdown} | actions=${f.actionGroup} | targetId=${f.targetId} | userBubble=${f.userBubble} | data-message-id=${f.messageId} | copyTelemetry=${f.copyTelemetry} | buttons=${f.buttons}`;
+  }
+
+  function looksMessageLike(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.closest && el.closest(`#${PANEL_ID}`)) return false;
+    const cls = classStr(el);
+    const txtLen = normText(el.innerText || el.textContent || '').length;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'html' || tag === 'body' || tag === 'main') return false;
+    if (txtLen < 1) return false;
+
+    return (
+      el.getAttribute('data-target-id') === 'message-box-target-id' ||
+      el.hasAttribute('data-message-id') ||
+      el.hasAttribute('data-copy-telemetry') ||
+      /message|Message|inner-item|bubble|flow|markdown|assistant|answer|chat/i.test(cls) ||
+      !!el.querySelector?.('.flow-markdown-body, .message-action-button-main, [data-message-id], [data-copy-telemetry], .bg-g-send-msg-bubble-bg')
+    );
+  }
+
+  function pickMessageRoot(seed) {
+    if (!seed || seed.nodeType !== 1) return null;
+    let node = seed;
+    let best = null;
+    let depth = 0;
+
+    while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement && depth < 12) {
+      if (node.closest && node.closest(`#${PANEL_ID}`)) break;
+      const txtLen = normText(node.innerText || node.textContent || '').length;
+      const cls = classStr(node);
+      const strong = (
+        node.getAttribute('data-target-id') === 'message-box-target-id' ||
+        node.hasAttribute('data-message-id') ||
+        node.hasAttribute('data-copy-telemetry') ||
+        /inner-item|message-box|message|Message|bubble|flow/i.test(cls) ||
+        !!node.querySelector?.('.flow-markdown-body, .message-action-button-main, .bg-g-send-msg-bubble-bg')
+      );
+
+      if (strong && txtLen > 0 && txtLen < 25000) {
+        best = node;
+      }
+
+      if (node.getAttribute('data-target-id') === 'message-box-target-id') break;
+      node = node.parentElement;
+      depth++;
+    }
+
+    return best || seed;
+  }
+
+  function getMessageRoots() {
+    const seeds = [];
+    const selectors = [
+      'div[data-target-id="message-box-target-id"]',
+      '.flow-markdown-body',
+      '.message-action-button-main',
+      '[data-message-id]',
+      '[data-copy-telemetry]',
+      '.bg-g-send-msg-bubble-bg',
+      '[class*="message"]',
+      '[class*="Message"]',
+      '[class*="inner-item"]'
+    ];
+
+    for (const sel of selectors) seeds.push(...qsa(sel));
+
+    const roots = uniq(seeds.map(pickMessageRoot).filter(Boolean));
+
+    const filtered = roots.filter(el => {
+      if (!looksMessageLike(el)) return false;
+      if (!isVisible(el)) return false;
+      const txtLen = normText(el.innerText || el.textContent || '').length;
+      if (txtLen > 30000) return false;
+      return true;
+    });
+
+    return uniq(filtered).sort(domOrderSort);
+  }
+
+  function getLatestRootByDom() {
+    const roots = getMessageRoots();
+    return roots.length ? roots[roots.length - 1] : null;
+  }
+
+  function getLatestRootByBottom() {
+    const roots = getMessageRoots().filter(isVisible);
+    if (!roots.length) return null;
+    return roots.sort((a, b) => a.getBoundingClientRect().bottom - b.getBoundingClientRect().bottom)[roots.length - 1];
+  }
+
+  function getLatestActionGroup() {
+    const groups = qsa('.message-action-button-main').filter(isVisible).sort(domOrderSort);
+    return groups.length ? groups[groups.length - 1] : null;
+  }
+
+  function getDirectButtons(group) {
+    if (!group) return [];
+    try {
+      return [...group.querySelectorAll(':scope > button')];
+    } catch {
+      return [...group.children].filter(el => el.tagName === 'BUTTON');
+    }
+  }
+
+  function getPossibleLoadingSignals() {
+    const out = [];
+    const toBottom = document.querySelector('#to-bottom-button');
+    if (toBottom) {
+      out.push(`#to-bottom-button | visible=${isVisible(toBottom)} | class=${classStr(toBottom)} | ${rectInfo(toBottom)}`);
+    }
+    const loadingNodes = qsa('[class*="loading"], [class*="Loading"], [data-loading="true"], button[data-loading="true"]')
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .slice(0, 20);
+    out.push(`loading-like nodes=${loadingNodes.length}`);
+    loadingNodes.slice(0, 8).forEach((el, idx) => {
+      out.push(`#${idx + 1} ${tagInfo(el)} | visible=${isVisible(el)} | ${rectInfo(el)} | text="${short(el.innerText || el.textContent || '', 80)}"`);
+    });
+    return out;
+  }
+
+  function pageCounts() {
+    return {
+      flowMarkdown: count('.flow-markdown-body'),
+      actionGroup: count('.message-action-button-main'),
+      targetId: count('div[data-target-id="message-box-target-id"]'),
+      userBubble: count('.bg-g-send-msg-bubble-bg'),
+      dataMessageId: count('[data-message-id]'),
+      copyTelemetry: count('[data-copy-telemetry]'),
+      textareaSend: count('textarea[placeholder*="发消息"]'),
+      sendBtn: count('#flow-end-msg-send'),
+      messageRoots: getMessageRoots().length
+    };
+  }
+
+  function snapshotLabel() {
+    const latestDom = getLatestRootByDom();
+    const latestBottom = getLatestRootByBottom();
+    const group = getLatestActionGroup();
+    const latestText = latestDom ? normText(latestDom.innerText || latestDom.textContent || '') : '';
+    return {
+      time: Date.now(),
+      counts: pageCounts(),
+      latestDomPath: latestDom ? cssPath(latestDom) : '',
+      latestBottomPath: latestBottom ? cssPath(latestBottom) : '',
+      latestDomTextLen: latestText.length,
+      latestDomTextTail: latestText.slice(-160),
+      latestActionGroupPath: group ? cssPath(group) : '',
+      latestActionButtonCount: group ? getDirectButtons(group).length : 0
+    };
+  }
+
+  function logObject(obj) {
+    try {
+      log(JSON.stringify(obj, null, 2));
+    } catch {
+      log(String(obj));
+    }
+  }
+
+  function inspectCounts() {
+    block('页面计数快照');
+    logObject(pageCounts());
+    block('生成 / loading 线索');
+    getPossibleLoadingSignals().forEach(line => log(line));
+    setStatus('已输出页面计数快照');
+  }
+
+  function inspectMessageRoots(limit = 8) {
+    block(`底部 / 最新消息块侦察（后 ${limit} 个 DOM 消息候选）`);
+
+    const roots = getMessageRoots();
+    log(`候选消息根数量：${roots.length}`);
+
+    if (!roots.length) {
+      log('未找到消息候选。说明旧选择器已大幅失效，需要复制当前回答附近 HTML。', 'warn');
+      setStatus('未找到消息候选', 'err');
+      return;
+    }
+
+    const tail = roots.slice(-limit);
+    tail.forEach((root, idx) => {
+      const text = normText(root.innerText || root.textContent || '');
+      log(`\n--- 候选 #${roots.length - tail.length + idx + 1} ---`);
+      log(`selector=${cssPath(root)}`);
+      log(`node=${tagInfo(root)}`);
+      log(`visible=${isVisible(root)} | ${rectInfo(root)}`);
+      log(featureLine(root));
+      log(`textHead="${short(text.slice(0, 220), 220)}"`);
+      log(`textTail="${short(text.slice(-260), 260)}"`);
+      log(`outerHTML=${outerHtml(root, 1600)}`);
+    });
+
+    const latestDom = getLatestRootByDom();
+    const latestBottom = getLatestRootByBottom();
+    block('最新候选判断');
+    log(`DOM 最后候选：${latestDom ? cssPath(latestDom) : '无'}`);
+    if (latestDom) log(`DOM 最后候选特征：${featureLine(latestDom)} | tail="${short(normText(latestDom.innerText || latestDom.textContent || '').slice(-180), 180)}"`);
+    log(`页面底部候选：${latestBottom ? cssPath(latestBottom) : '无'}`);
+    if (latestBottom) log(`页面底部候选特征：${featureLine(latestBottom)} | tail="${short(normText(latestBottom.innerText || latestBottom.textContent || '').slice(-180), 180)}"`);
+
+    setStatus('已输出消息块侦察');
+  }
+
+  function inspectActionGroup() {
+    block('动作按钮组侦察');
+
+    const groups = qsa('.message-action-button-main').filter(isVisible).sort(domOrderSort);
+    log(`.message-action-button-main 可见数量：${groups.length}`);
+
+    groups.slice(-4).forEach((group, gi) => {
+      const realIndex = groups.length - Math.min(groups.length, 4) + gi + 1;
+      log(`\n--- 动作组 #${realIndex} ---`);
+      log(`selector=${cssPath(group)}`);
+      log(`node=${tagInfo(group)} | ${rectInfo(group)}`);
+      log(`parent=${tagInfo(group.parentElement)} | parentSelector=${cssPath(group.parentElement)}`);
+      log(`groupOuterHTML=${outerHtml(group, 1600)}`);
+
+      const buttons = getDirectButtons(group);
+      log(`direct button 数量：${buttons.length}`);
+      buttons.forEach((btn, idx) => {
+        const attrs = [
+          `aria-label=${btn.getAttribute('aria-label') || ''}`,
+          `title=${btn.getAttribute('title') || ''}`,
+          `data-disabled=${btn.getAttribute('data-disabled') || ''}`,
+          `data-loading=${btn.getAttribute('data-loading') || ''}`,
+          `data-dbx-name=${btn.getAttribute('data-dbx-name') || ''}`,
+          `data-state=${btn.getAttribute('data-state') || ''}`,
+          `disabled=${btn.disabled}`
+        ].join(' | ');
+        log(`Button ${idx + 1}: visible=${isVisible(btn)} | ${attrs} | text="${short(btn.innerText || btn.textContent || '', 80)}" | html=${outerHtml(btn, 900)}`);
+      });
+    });
+
+    setStatus('已输出动作按钮组侦察');
+  }
+
+  function inspectParentChain() {
+    block('最新动作按钮组父级链路');
+    const group = getLatestActionGroup();
+    if (!group) {
+      log('未找到最新动作按钮组。', 'warn');
+      setStatus('未找到动作按钮组', 'err');
+      return;
+    }
+
+    let node = group;
+    for (let depth = 0; node && node.nodeType === 1 && depth < 9; depth++, node = node.parentElement) {
+      const text = normText(node.innerText || node.textContent || '');
+      log(`\n--- depth ${depth} ---`);
+      log(`selector=${cssPath(node)}`);
+      log(`node=${tagInfo(node)} | visible=${isVisible(node)} | ${rectInfo(node)}`);
+      log(featureLine(node));
+      log(`textTail="${short(text.slice(-240), 240)}"`);
+      log(`outerHTML=${outerHtml(node, 1400)}`);
+    }
+    setStatus('已输出父级链路');
+  }
+
+  function hover(el) {
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const x = r.left + Math.min(Math.max(r.width / 2, 2), r.width - 2);
+    const y = r.top + Math.min(Math.max(r.height / 2, 2), r.height - 2);
+    for (const type of ['pointerover', 'mouseover', 'mouseenter', 'pointermove', 'mousemove']) {
+      try {
+        el.dispatchEvent(new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: x,
+          clientY: y
+        }));
+      } catch {}
+    }
+  }
+
+  async function inspectTooltips() {
+    block('动作按钮 tooltip 侦察（只 hover，不点击）');
+    const group = getLatestActionGroup();
+    if (!group) {
+      log('未找到动作按钮组。', 'warn');
+      setStatus('未找到动作按钮组', 'err');
+      return;
+    }
+
+    const buttons = getDirectButtons(group);
+    log(`最新动作组 direct button 数量：${buttons.length}`);
+
+    for (let i = 0; i < buttons.length; i++) {
+      const btn = buttons[i];
+      hover(group);
+      hover(btn);
+      await sleep(450);
+      const tips = qsa('[role="tooltip"], [data-radix-popper-content-wrapper], [class*="tooltip"], [class*="Tooltip"]')
+        .filter(el => !el.closest(`#${PANEL_ID}`) && isVisible(el));
+      log(`Button ${i + 1}: ${tagInfo(btn)} | tooltipCount=${tips.length}`);
+      tips.slice(0, 4).forEach((tip, ti) => {
+        log(`  tooltip #${ti + 1}: text="${short(tip.innerText || tip.textContent || '', 120)}" | selector=${cssPath(tip)} | html=${outerHtml(tip, 700)}`);
+      });
+    }
+
+    setStatus('已输出 tooltip 侦察');
+  }
+
+  async function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function recordBaseline() {
+    state.baseline = snapshotLabel();
+    block('已记录基线');
+    logObject(state.baseline);
+    setStatus('已记录基线；接着可人工发送问题，再点“观察90秒”');
+  }
+
+  async function observe90() {
+    if (state.observing) return;
+    state.observing = true;
+    if (observeBtnEl) observeBtnEl.disabled = true;
+    setStatus('观察中：90秒内不要刷新页面', 'run');
+
+    const startSnap = snapshotLabel();
+    const base = state.baseline || startSnap;
+    const mutations = [];
+    let lastLine = '';
+
+    block('开始观察 90 秒');
+    log('用途：建议先点“记录基线”，再人工发送问题，然后马上点本按钮；或者先点本按钮，再人工发送问题。');
+    log('本观察不会发送、不会复制、不会点击豆包按钮。');
+    log('基线：');
+    logObject(base);
+    log('观察开始快照：');
+    logObject(startSnap);
+
+    try {
+      if (state.observer) state.observer.disconnect();
+      state.observer = new MutationObserver(records => {
+        for (const rec of records) {
+          for (const node of rec.addedNodes || []) {
+            if (!node || node.nodeType !== 1) continue;
+            if (node.closest && node.closest(`#${PANEL_ID}`)) continue;
+            const text = normText(node.innerText || node.textContent || '');
+            const cls = classStr(node);
+            const line = `added ${tagInfo(node)} | textLen=${text.length} | text="${short(text, 120)}" | class="${short(cls, 120)}"`;
+            mutations.push(line);
+            if (mutations.length > 80) mutations.shift();
+          }
+        }
+      });
+      state.observer.observe(document.body, { childList: true, subtree: true });
+    } catch (e) {
+      log(`MutationObserver 启动失败：${e.message || e}`, 'warn');
+    }
+
+    const startedAt = Date.now();
+    const endAt = startedAt + 90 * 1000;
+    let tick = 0;
+
+    while (!state.destroyed && Date.now() < endAt) {
+      const snap = snapshotLabel();
+      const deltaCount = snap.counts.messageRoots - base.counts.messageRoots;
+      const deltaMarkdown = snap.counts.flowMarkdown - base.counts.flowMarkdown;
+      const deltaAction = snap.counts.actionGroup - base.counts.actionGroup;
+      const textChanged = snap.latestDomTextTail !== base.latestDomTextTail;
+      const line = [
+        `t+${Math.round((Date.now() - startedAt) / 1000)}s`,
+        `roots=${snap.counts.messageRoots}(${deltaCount >= 0 ? '+' : ''}${deltaCount})`,
+        `markdown=${snap.counts.flowMarkdown}(${deltaMarkdown >= 0 ? '+' : ''}${deltaMarkdown})`,
+        `actions=${snap.counts.actionGroup}(${deltaAction >= 0 ? '+' : ''}${deltaAction})`,
+        `latestLen=${snap.latestDomTextLen}`,
+        `tailChanged=${textChanged}`,
+        `latestTail="${short(snap.latestDomTextTail, 100)}"`
+      ].join(' | ');
+
+      if (line !== lastLine || tick % 5 === 0) {
+        log(line);
+        lastLine = line;
+      }
+
+      tick++;
+      await sleep(1000);
+    }
+
+    try {
+      if (state.observer) state.observer.disconnect();
+      state.observer = null;
+    } catch {}
+
+    block('观察结束：最近新增节点摘要');
+    if (!mutations.length) log('未记录到新增节点，可能回答在已有节点内流式更新，需看上方 latestLen / tailChanged。');
+    mutations.slice(-30).forEach(line => log(line));
+
+    block('观察结束快照');
+    logObject(snapshotLabel());
+
+    state.observing = false;
+    if (observeBtnEl) observeBtnEl.disabled = false;
+    setStatus('观察结束；点“生成导出文本”复制给我');
+  }
+
+  function exportLogs() {
+    const text = state.logs.join('\n');
+    if (exportEl) {
+      exportEl.value = text;
+      exportEl.style.display = 'block';
+      exportEl.focus();
+      exportEl.select();
+    }
+    setStatus('已生成导出文本；已自动选中，请手动 Ctrl+C');
+  }
+
+  function clearLogs() {
+    state.logs.length = 0;
+    if (logEl) logEl.innerHTML = '';
+    if (exportEl) exportEl.value = '';
+    log(`Doubao 消息结构侦察 ${SCRIPT_VERSION} 已清空本次侦察日志`);
+    setStatus('日志已清空');
+  }
+
+  function installStyle() {
+    const old = document.getElementById(STYLE_ID);
+    if (old) old.remove();
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${PANEL_ID} {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        width: 450px;
+        height: 610px;
+        z-index: 2147483646;
+        background: #fff;
+        color: #1f2937;
+        border: 1px solid #d8dee9;
+        box-shadow: 0 10px 28px rgba(15, 23, 42, .16);
+        font: 12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+        box-sizing: border-box;
+      }
+      #${PANEL_ID} * { box-sizing: border-box; }
+      #${PANEL_ID} .hdr {
+        height: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 8px 0 10px;
+        background: #f7f9fc;
+        border-bottom: 1px solid #e5e7eb;
+        cursor: move;
+        user-select: none;
+      }
+      #${PANEL_ID} .title {
+        font-weight: 700;
+        color: #111827;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #${PANEL_ID} .x {
+        width: 26px;
+        height: 24px;
+        border: 1px solid #d1d5db;
+        background: #fff;
+        cursor: pointer;
+        color: #374151;
+      }
+      #${PANEL_ID} .bd {
+        height: calc(100% - 34px);
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+      #${PANEL_ID} .btns {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px;
+      }
+      #${PANEL_ID} button {
+        height: 30px;
+        border: 1px solid #cbd5e1;
+        background: #f8fafc;
+        color: #111827;
+        cursor: pointer;
+        font: inherit;
+      }
+      #${PANEL_ID} button:hover { background: #eef4ff; }
+      #${PANEL_ID} button.primary {
+        border-color: #4f7ecb;
+        background: #2563eb;
+        color: #fff;
+        font-weight: 700;
+      }
+      #${PANEL_ID} button.warn {
+        border-color: #f59e0b;
+        background: #fff7ed;
+      }
+      #${PANEL_ID} button:disabled {
+        opacity: .55;
+        cursor: not-allowed;
+      }
+      #${PANEL_ID} .status {
+        height: 22px;
+        line-height: 22px;
+        border: 1px solid #e5e7eb;
+        background: #fbfdff;
+        padding: 0 6px;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        color: #475569;
+      }
+      #${PANEL_ID} .status.err { color: #dc2626; }
+      #${PANEL_ID} .status.run { color: #b45309; }
+      #${PANEL_ID} .log {
+        flex: 1;
+        min-height: 0;
+        border: 1px solid #e5e7eb;
+        background: #ffffff;
+        padding: 6px;
+        overflow: auto;
+        white-space: pre-wrap;
+        user-select: text;
+        font-family: Consolas, Monaco, "Courier New", monospace;
+        color: #111827;
+      }
+      #${PANEL_ID} .line { margin: 0 0 2px; }
+      #${PANEL_ID} .line.warn { color: #b45309; }
+      #${PANEL_ID} .line.err { color: #dc2626; }
+      #${PANEL_ID} .export {
+        display: none;
+        height: 110px;
+        resize: none;
+        border: 1px solid #cbd5e1;
+        padding: 6px;
+        font: 12px/1.45 Consolas, Monaco, "Courier New", monospace;
+        color: #111827;
+        background: #f8fafc;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function startDrag(e) {
+    if (e.button !== 0) return;
+    if (e.target.closest('.x')) return;
+    state.drag = true;
+    const rect = panelEl.getBoundingClientRect();
+    state.dragX = e.clientX - rect.left;
+    state.dragY = e.clientY - rect.top;
+    panelEl.style.left = `${rect.left}px`;
+    panelEl.style.top = `${rect.top}px`;
+    panelEl.style.right = 'auto';
+    panelEl.style.bottom = 'auto';
+
+    const onMove = ev => {
+      if (!state.drag) return;
+      const x = Math.max(0, Math.min(ev.clientX - state.dragX, window.innerWidth - panelEl.offsetWidth));
+      const y = Math.max(0, Math.min(ev.clientY - state.dragY, window.innerHeight - panelEl.offsetHeight));
+      panelEl.style.left = `${x}px`;
+      panelEl.style.top = `${y}px`;
+    };
+
+    const onUp = () => {
+      state.drag = false;
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+    };
+
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+  }
+
+  function mountPanel() {
+    const old = document.getElementById(PANEL_ID);
+    if (old) old.remove();
+
+    panelEl = document.createElement('div');
+    panelEl.id = PANEL_ID;
+
+    const hdr = document.createElement('div');
+    hdr.className = 'hdr';
+    hdr.addEventListener('pointerdown', startDrag);
+
+    const title = document.createElement('div');
+    title.className = 'title';
+    title.textContent = `Doubao 消息结构侦察 ${SCRIPT_VERSION}`;
+
+    const close = document.createElement('button');
+    close.className = 'x';
+    close.textContent = '×';
+    close.addEventListener('click', destroy);
+
+    hdr.appendChild(title);
+    hdr.appendChild(close);
+
+    const bd = document.createElement('div');
+    bd.className = 'bd';
+
+    const btns = document.createElement('div');
+    btns.className = 'btns';
+
+    const addBtn = (text, cls, fn) => {
+      const b = document.createElement('button');
+      b.textContent = text;
+      if (cls) b.className = cls;
+      b.addEventListener('click', fn);
+      btns.appendChild(b);
+      return b;
+    };
+
+    addBtn('页面计数', '', inspectCounts);
+    addBtn('消息块', 'primary', () => inspectMessageRoots(8));
+    addBtn('动作按钮', '', inspectActionGroup);
+    addBtn('父级链路', '', inspectParentChain);
+    addBtn('Tooltip', '', inspectTooltips);
+    addBtn('记录基线', 'warn', recordBaseline);
+    observeBtnEl = addBtn('观察90秒', 'primary', observe90);
+    addBtn('生成导出文本', '', exportLogs);
+    addBtn('清空日志', '', clearLogs);
+
+    statusEl = document.createElement('div');
+    statusEl.className = 'status';
+    statusEl.textContent = `待命 | ${SCRIPT_VERSION}`;
+
+    logEl = document.createElement('div');
+    logEl.className = 'log';
+
+    exportEl = document.createElement('textarea');
+    exportEl.className = 'export';
+    exportEl.readOnly = true;
+
+    bd.appendChild(btns);
+    bd.appendChild(statusEl);
+    bd.appendChild(logEl);
+    bd.appendChild(exportEl);
+
+    panelEl.appendChild(hdr);
+    panelEl.appendChild(bd);
+    document.body.appendChild(panelEl);
+
+    log(`Doubao 消息结构侦察 ${SCRIPT_VERSION} 已启动`);
+    log('运行环境：控制台 / 油猴均可。@grant none；不会发送、不会复制、不会写剪贴板。');
+    log('建议顺序：页面计数 → 消息块 → 动作按钮 → 父级链路；如要复现新回答识别问题：记录基线 → 人工发送问题 → 观察90秒 → 生成导出文本。');
+  }
+
+  function destroy() {
+    state.destroyed = true;
+    try { if (state.observer) state.observer.disconnect(); } catch {}
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) panel.remove();
+    const style = document.getElementById(STYLE_ID);
+    if (style) style.remove();
+    delete window[APP_KEY];
+  }
+
+  installStyle();
+  mountPanel();
+
+  window[APP_KEY] = {
+    version: SCRIPT_VERSION,
+    inspectCounts,
+    inspectMessageRoots,
+    inspectActionGroup,
+    inspectParentChain,
+    inspectTooltips,
+    recordBaseline,
+    observe90,
+    exportLogs,
+    destroy
+  };
+})();
