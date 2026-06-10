@@ -1,0 +1,1162 @@
+// ==UserScript==
+// @name         Doubao 自动问答复制 v1.0.9
+// @namespace    doubao-auto-qa-copy
+// @version      1.0.9
+// @description  豆包网页版：在当前对话输入问题、发送、等待回答完成、读取最新回答正文；油猴用 GM_setClipboard 静默复制；控制台仅作为调试模式尝试浏览器可用复制能力，不点击豆包复制按钮，显示左下角 RPA 状态标记；适配豆包新版 md-box-root 消息结构；支持默认开启的自动追加视频原文案提取提示词。
+// @match        https://www.doubao.com/*
+// @run-at       document-idle
+// @grant        GM_setClipboard
+// ==/UserScript==
+
+// 更新说明 v1.0.9：
+// 1. 适配豆包新版消息结构：不再依赖 .flow-markdown-body，改用 .md-box-root / [data-streaming] / data-message-id 识别助手回答。
+// 2. 新回答开始判断不再依赖“助手回答数量增加”，改为比较发送前后的最新 data-message-id 与正文变化，规避虚拟列表导致的数量波动。
+// 3. 回答完成判断加入 data-streaming="false" + 文本稳定 + 动作按钮组出现。
+// 4. 增加“自动添加提示词”复选框，默认开启；开启后会在用户输入内容末尾追加视频原文案提取限制提示词。
+// 5. 主操作按钮仍只保留“开始运行”和“清除缓存”；清除缓存不清空日志。
+
+(() => {
+  'use strict';
+
+  const SCRIPT_VERSION = 'v1.0.9';
+  const APP_KEY = '__DOUBAO_AUTO_QA_COPY_V109__';
+  const LEGACY_APP_KEYS = ['__DOUBAO_AUTO_QA_COPY_V100__', '__DOUBAO_AUTO_QA_COPY_V101__', '__DOUBAO_AUTO_QA_COPY_V102__', '__DOUBAO_AUTO_QA_COPY_V103__', '__DOUBAO_AUTO_QA_COPY_V104__', '__DOUBAO_AUTO_QA_COPY_V105__', '__DOUBAO_AUTO_QA_COPY_V106__', '__DOUBAO_AUTO_QA_COPY_V107__', '__DOUBAO_AUTO_QA_COPY_V108__', '__DOUBAO_AUTO_QA_COPY_V109__'];
+  const PANEL_ID = '__doubao_auto_qa_copy_panel__';
+  const STYLE_ID = '__doubao_auto_qa_copy_style__';
+  const STORE_KEY = '__DOUBAO_AUTO_QA_COPY_STORE_V109__';
+  const LEGACY_STORE_KEYS = ['__DOUBAO_AUTO_QA_COPY_STORE_V100__', '__DOUBAO_AUTO_QA_COPY_STORE_V101__', '__DOUBAO_AUTO_QA_COPY_STORE_V102__', '__DOUBAO_AUTO_QA_COPY_STORE_V103__', '__DOUBAO_AUTO_QA_COPY_STORE_V104__', '__DOUBAO_AUTO_QA_COPY_STORE_V105__', '__DOUBAO_AUTO_QA_COPY_STORE_V106__', '__DOUBAO_AUTO_QA_COPY_STORE_V107__', '__DOUBAO_AUTO_QA_COPY_STORE_V108__', '__DOUBAO_AUTO_QA_COPY_STORE_V109__'];
+  const MARKER_ID = '__doubao_auto_qa_copy_marker__';
+  const EXTRA_PROMPT = '仅负责提取视频原生完整口播原文案，禁止进行总结、概括、解读等操作，如果无法提取说明即可。';
+
+  const DEFAULT_STABLE_MS = 2600;
+  const DEFAULT_FALLBACK_STABLE_MS = 7000;
+  const DEFAULT_TIMEOUT_MS = 240000;
+
+  try {
+    for (const key of LEGACY_APP_KEYS) {
+      if (window[key] && typeof window[key].destroy === 'function') window[key].destroy();
+    }
+  } catch (_) {}
+
+  const store = (() => {
+    try { return JSON.parse(localStorage.getItem(STORE_KEY) || '{}'); }
+    catch (_) { return {}; }
+  })();
+
+  const state = {
+    running: false,
+    stopped: false,
+    destroyed: false,
+    dragging: false,
+    collapsed: !!store.collapsed,
+    dragOffsetX: 0,
+    dragOffsetY: 0,
+    logs: []
+  };
+
+  let panelEl = null;
+  let inputEl = null;
+  let runBtnEl = null;
+  let clearCacheBtnEl = null;
+  let autoPromptEl = null;
+  let statusEl = null;
+  let logEl = null;
+  let collapseEl = null;
+
+  function saveStore() {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch (_) {}
+  }
+
+  function clearStoreObject() {
+    for (const key of Object.keys(store)) delete store[key];
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function nowTime() {
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function normText(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function shortText(s, n = 160) {
+    const t = normText(s);
+    return t.length > n ? `${t.slice(0, n)}…` : t;
+  }
+
+  function shortErr(err) {
+    if (!err) return '未知错误';
+    return err && err.message ? err.message : String(err);
+  }
+
+  function getClassString(el) {
+    if (!el) return '';
+    try {
+      if (typeof el.className === 'string') return el.className;
+      if (el.className && typeof el.className.baseVal === 'string') return el.className.baseVal;
+    } catch (_) {}
+    return '';
+  }
+
+  function isVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return !(
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      rect.width <= 0 ||
+      rect.height <= 0
+    );
+  }
+
+  function isInViewport(el) {
+    if (!el || !isVisible(el)) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
+  }
+
+  function isButtonEnabled(btn) {
+    if (!btn) return false;
+    if (btn.disabled) return false;
+    if (btn.getAttribute('aria-disabled') === 'true') return false;
+    if (btn.getAttribute('data-disabled') === 'true') return false;
+    if (btn.getAttribute('data-loading') === 'true') return false;
+    return true;
+  }
+
+  function ensureMarker() {
+    if (state.destroyed) return null;
+    let el = document.getElementById(MARKER_ID);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = MARKER_ID;
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+
+  function setMarker(status, message) {
+    if (state.destroyed) return;
+    const safeStatus = status || 'IDLE';
+    const safeMessage = String(message || '');
+    const el = ensureMarker();
+    if (el) {
+      el.setAttribute('data-status', safeStatus);
+      el.textContent = `DOUBAO_STATUS=${safeStatus}\nDOUBAO_MESSAGE=${safeMessage}\nVERSION=${SCRIPT_VERSION}`;
+    }
+    window.__DOUBAO_AUTO_QA_COPY_STATUS__ = {
+      status: safeStatus,
+      message: safeMessage,
+      version: SCRIPT_VERSION,
+      time: new Date().toISOString()
+    };
+  }
+
+  function setStatus(text, level = 'info') {
+    if (statusEl) {
+      statusEl.textContent = text;
+      statusEl.className = `status ${level}`;
+    }
+    if (state.running) setMarker(level === 'error' ? 'ERROR' : 'RUNNING', text);
+    else setMarker(level === 'error' ? 'ERROR' : 'IDLE', text);
+  }
+
+  function log(message, level = 'info') {
+    const line = `[${nowTime()}] ${message}`;
+    state.logs.push(line);
+    if (state.logs.length > 800) state.logs.shift();
+    if (logEl) {
+      logEl.textContent = state.logs.join('\n');
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    if (level === 'error') setStatus(message, 'error');
+    else if (level === 'warn') setStatus(message, 'warn');
+    else if (level === 'success') setStatus(message, 'success');
+    else setStatus(message, 'info');
+  }
+
+  function assertNotStopped() {
+    if (state.stopped) throw new Error('运行已中断');
+    if (state.destroyed) throw new Error('脚本面板已关闭');
+  }
+
+  async function waitFor(fn, label, timeout = 30000, interval = 200) {
+    const start = Date.now();
+    let lastErr = null;
+    while (Date.now() - start < timeout) {
+      assertNotStopped();
+      try {
+        const val = fn();
+        if (val) return val;
+      } catch (err) {
+        lastErr = err;
+      }
+      await sleep(interval);
+    }
+    throw new Error(`等待超时：${label}${lastErr ? ` | ${shortErr(lastErr)}` : ''}`);
+  }
+
+  function getPromptEl() {
+    const selectors = [
+      'textarea[placeholder="发消息..."]',
+      'textarea[placeholder*="发消息"]',
+      'textarea.semi-input-textarea'
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && isVisible(el)) return el;
+    }
+    return null;
+  }
+
+  function getSendButton() {
+    const direct = document.querySelector('#flow-end-msg-send');
+    if (direct && isVisible(direct)) return direct;
+
+    const inWrapper = [...document.querySelectorAll('.send-btn-wrapper button')]
+      .find(btn => isVisible(btn));
+    if (inWrapper) return inWrapper;
+
+    return [...document.querySelectorAll('button[data-dbx-name="button"]')]
+      .find(btn => isVisible(btn) && btn.closest('.send-btn-wrapper')) || null;
+  }
+
+  function isScrollable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const style = getComputedStyle(el);
+    const overflow = `${style.overflowY} ${style.overflow}`;
+    return /(auto|scroll|overlay)/i.test(overflow) && (el.scrollHeight - el.clientHeight > 50);
+  }
+
+  function getScrollTargets() {
+    const targets = [];
+    if (document.scrollingElement) targets.push(document.scrollingElement);
+    targets.push(document.documentElement, document.body);
+
+    const likely = [
+      ...document.querySelectorAll('[class*="v_list_scroller"], .scroller, main, [aria-label="doc_editor"], div')
+    ].filter(el => isVisible(el) && isScrollable(el));
+
+    likely.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+    targets.push(...likely.slice(0, 12));
+
+    const out = [];
+    const seen = new Set();
+    for (const el of targets.filter(Boolean)) {
+      if (!seen.has(el)) {
+        seen.add(el);
+        out.push(el);
+      }
+    }
+    return out;
+  }
+
+  function scrollToBottomOnce() {
+    for (const el of getScrollTargets()) {
+      try { el.scrollTop = el.scrollHeight; } catch (_) {}
+      try { el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }); } catch (_) {}
+    }
+
+    const maxH = Math.max(
+      document.documentElement?.scrollHeight || 0,
+      document.body?.scrollHeight || 0,
+      document.scrollingElement?.scrollHeight || 0
+    );
+    try { window.scrollTo({ top: maxH, behavior: 'instant' }); } catch (_) {}
+  }
+
+  async function scrollToBottom(times = 4, gap = 120) {
+    for (let i = 0; i < times; i++) {
+      scrollToBottomOnce();
+      await sleep(gap);
+    }
+  }
+
+  function getAssistantRoots() {
+    return [...document.querySelectorAll('div[data-target-id="message-box-target-id"]')]
+      .filter(root => {
+        if (!root || root.nodeType !== 1) return false;
+        if (root.querySelector('.bg-g-send-msg-bubble-bg')) return false;
+
+        const hasOldMarkdown = !!root.querySelector('.flow-markdown-body');
+        const hasNewMarkdown = !!root.querySelector('.md-box-root, [data-streaming]');
+        const hasCopyTelemetry = !!root.querySelector('[data-copy-telemetry="right_click_copy"]');
+        const hasReceiveAction = !!root.querySelector('[data-foundation-type="receive-message-action-bar"], .message-action-button-main');
+        const hasMessageId = !!root.querySelector('[data-message-id]');
+
+        return hasMessageId && (hasOldMarkdown || hasNewMarkdown || hasCopyTelemetry || hasReceiveAction);
+      });
+  }
+
+  function getLatestAssistantRoot() {
+    const roots = getAssistantRoots();
+    return roots.length ? roots[roots.length - 1] : null;
+  }
+
+  function getAnswerContentElement(root = getLatestAssistantRoot()) {
+    if (!root) return null;
+
+    const selectors = [
+      '.flow-markdown-body',
+      '.md-box-root',
+      '[data-streaming]',
+      '[data-container-type="block-v2"]'
+    ];
+
+    for (const sel of selectors) {
+      const nodes = [...root.querySelectorAll(sel)].filter(isVisible);
+      if (nodes.length) return nodes[nodes.length - 1];
+    }
+
+    return root;
+  }
+
+  function getAnswerText(root = getLatestAssistantRoot()) {
+    const target = getAnswerContentElement(root);
+    if (!target) return '';
+    return normText(target.innerText || target.textContent || '');
+  }
+
+  function getRawAnswerText(root = getLatestAssistantRoot()) {
+    const target = getAnswerContentElement(root);
+    if (!target) return '';
+    try {
+      return String(target.innerText || target.textContent || '');
+    } catch (_) {
+      return String(target.textContent || '');
+    }
+  }
+
+  function getAssistantMeta(root = getLatestAssistantRoot()) {
+    const msgEl = root?.querySelector?.('[data-message-id]') || null;
+    const streamEl = root?.querySelector?.('[data-streaming]') || null;
+    const text = getAnswerText(root);
+    return {
+      root,
+      messageId: msgEl ? (msgEl.getAttribute('data-message-id') || '') : '',
+      streaming: streamEl ? (streamEl.getAttribute('data-streaming') || '') : '',
+      text,
+      textLen: text.length,
+      textTail: text.slice(-160)
+    };
+  }
+
+  function getLatestActionGroup(root = getLatestAssistantRoot()) {
+    if (!root) return null;
+    const groups = [...root.querySelectorAll('.message-action-button-main')].filter(isVisible);
+    return groups.length ? groups[groups.length - 1] : null;
+  }
+
+  function getCopyButton(root = getLatestAssistantRoot()) {
+    const group = getLatestActionGroup(root);
+    if (!group) return null;
+
+    const directButtons = [...group.children]
+      .filter(el => el && el.tagName === 'BUTTON' && isVisible(el));
+
+    if (directButtons.length) return directButtons[0];
+
+    const fallbackButtons = [...group.querySelectorAll(':scope > button, button[data-dbx-name="button"]')].filter(isVisible);
+    return fallbackButtons[0] || null;
+  }
+
+  function getCopyClickTarget(copyBtn) {
+    if (!copyBtn) return null;
+    const overlay = [...copyBtn.querySelectorAll('div')].find(div => {
+      const cls = getClassString(div);
+      return cls.includes('absolute') && cls.includes('opacity-0') && cls.includes('inset-');
+    });
+    return overlay || copyBtn;
+  }
+
+  function getGenerationSignal(root = getLatestAssistantRoot()) {
+    const signals = [];
+
+    const streamEl = root?.querySelector?.('[data-streaming]') || null;
+    if (streamEl && streamEl.getAttribute('data-streaming') === 'true') {
+      signals.push('最新回答 data-streaming=true');
+    }
+
+    const toBottom = document.querySelector('#to-bottom-button');
+    if (toBottom) {
+      const cls = getClassString(toBottom);
+      if (/loading/i.test(cls)) signals.push('#to-bottom-button 含 loading 类');
+    }
+
+    const latestText = normText(root?.innerText || root?.textContent || '');
+    if (latestText.includes('正在思考') && !latestText.includes('已完成思考')) {
+      signals.push('最新回答含“正在思考”且未见“已完成思考”');
+    }
+
+    const visibleLoading = [...document.querySelectorAll('.loading-border-HhwBfA, [class*="loading"]')]
+      .filter(el => isVisible(el) && isInViewport(el));
+    if (visibleLoading.length) signals.push(`视口内可见 loading 元素 ${visibleLoading.length} 个`);
+
+    return signals;
+  }
+
+  function hoverElement(el) {
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const target = document.elementFromPoint(x, y) || el;
+    const common = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window };
+    for (const type of ['pointerover', 'mouseover', 'mouseenter', 'pointermove', 'mousemove']) {
+      try {
+        const Ctor = type.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+        target.dispatchEvent(new Ctor(type, common));
+      } catch (_) {
+        try { target.dispatchEvent(new MouseEvent(type, common)); } catch (_) {}
+      }
+    }
+  }
+
+  function clickElement(el) {
+    if (!el) throw new Error('元素不存在，无法点击');
+    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (_) {}
+    hoverElement(el);
+
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const topEl = document.elementFromPoint(x, y);
+    const target = topEl && (el.contains(topEl) || topEl.contains(el)) ? topEl : el;
+
+    const common = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window };
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      try {
+        const Ctor = type.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+        target.dispatchEvent(new Ctor(type, common));
+      } catch (_) {
+        try { target.dispatchEvent(new MouseEvent(type, common)); } catch (_) {}
+      }
+    }
+
+    // 有些按钮的框架事件只绑定在原生 click 上；补一刀，但不替代上面的真实鼠标序列。
+    try { el.click?.(); } catch (_) {}
+  }
+
+  function setTextareaValue(textarea, value) {
+    textarea.focus();
+    const proto = window.HTMLTextAreaElement && window.HTMLTextAreaElement.prototype;
+    const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+    if (desc && desc.set) desc.set.call(textarea, value);
+    else textarea.value = value;
+
+    textarea.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'insertText',
+      data: value
+    }));
+    textarea.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+  }
+
+  async function fillPrompt(text) {
+    const prompt = await waitFor(() => getPromptEl(), '豆包输入框', 20000, 200);
+    log('已找到输入框，准备写入问题');
+    clickElement(prompt);
+    await sleep(120);
+    setTextareaValue(prompt, '');
+    await sleep(80);
+    setTextareaValue(prompt, text);
+    await waitFor(() => normText(getPromptEl()?.value || '') === normText(text), '问题写入输入框', 8000, 120);
+    log(`问题已写入：${shortText(text, 80)}`);
+  }
+
+  function getPromptCurrentText() {
+    const prompt = getPromptEl();
+    if (!prompt) return '';
+    if ('value' in prompt) return normText(prompt.value || '');
+    return normText(prompt.innerText || prompt.textContent || '');
+  }
+
+  function dispatchEnterSend(prompt) {
+    if (!prompt) throw new Error('输入框不存在，无法用 Enter 发送');
+    try { prompt.focus(); } catch (_) {}
+    try {
+      if ('selectionStart' in prompt && typeof prompt.value === 'string') {
+        prompt.selectionStart = prompt.value.length;
+        prompt.selectionEnd = prompt.value.length;
+      }
+    } catch (_) {}
+
+    const init = {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 13,
+      which: 13,
+      charCode: 13,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      shiftKey: false,
+      ctrlKey: false,
+      altKey: false,
+      metaKey: false,
+      view: window
+    };
+
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      try { prompt.dispatchEvent(new KeyboardEvent(type, init)); } catch (_) {}
+    }
+  }
+
+  async function waitPromptLooksSent(originalText, timeout = 2500) {
+    const start = Date.now();
+    const original = normText(originalText || '');
+    while (Date.now() - start < timeout) {
+      const current = getPromptCurrentText();
+      const btn = getSendButton();
+      if (!current) return true;
+      if (btn && isVisible(btn) && !isButtonEnabled(btn) && current.length < Math.max(8, original.length * 0.25)) return true;
+      await sleep(120);
+    }
+    return false;
+  }
+
+  async function sendPrompt(finalPromptText) {
+    const prompt = await waitFor(() => getPromptEl(), '豆包输入框', 20000, 200);
+    await waitFor(() => {
+      const el = getSendButton();
+      return el && isVisible(el) && isButtonEnabled(el) ? el : null;
+    }, '发送按钮可点击', 20000, 200);
+
+    log('已找到发送按钮；优先用 Enter 键发送');
+    dispatchEnterSend(prompt);
+    await sleep(500);
+
+    let sent = await waitPromptLooksSent(finalPromptText, 3000);
+    if (sent) {
+      log('已通过 Enter 键触发发送');
+      return;
+    }
+
+    log('Enter 后输入框仍未清空，改用发送按钮原生 click 兜底', 'warn');
+    const btn = await waitFor(() => {
+      const el = getSendButton();
+      return el && isVisible(el) && isButtonEnabled(el) ? el : null;
+    }, '发送按钮兜底可点击', 8000, 200);
+
+    clickElement(btn);
+    await sleep(700);
+    sent = await waitPromptLooksSent(finalPromptText, 3000);
+
+    if (!sent) {
+      throw new Error('发送失败：Enter 和发送按钮兜底后，输入框仍未清空，疑似页面拒绝脚本触发发送');
+    }
+
+    log('已通过发送按钮兜底触发发送');
+  }
+
+  async function waitForNewAnswer(beforeMeta) {
+    log('等待豆包开始输出新回答…');
+    const beforeId = beforeMeta?.messageId || '';
+    const beforeText = beforeMeta?.text || '';
+    const beforeTail = beforeMeta?.textTail || '';
+
+    const started = await waitFor(() => {
+      scrollToBottomOnce();
+      const latest = getLatestAssistantRoot();
+      if (!latest) return null;
+
+      const meta = getAssistantMeta(latest);
+      if (!meta.textLen) return null;
+
+      if (beforeId && meta.messageId && meta.messageId !== beforeId) return latest;
+      if (!beforeId && meta.messageId && meta.textLen > 0) return latest;
+      if (meta.text !== beforeText && meta.textTail !== beforeTail && meta.textLen > 0) return latest;
+
+      return null;
+    }, '新回答开始出现', 90000, 300);
+
+    const meta = getAssistantMeta(started);
+    log(`新回答已出现：messageId=${meta.messageId || '无'} | len=${meta.textLen} | streaming=${meta.streaming || '无'}`);
+    return started;
+  }
+
+  async function waitUntilAnswerFinished() {
+    const start = Date.now();
+    let lastText = '';
+    let lastChangedAt = Date.now();
+    let lastLogAt = 0;
+    let latest = null;
+
+    log(`等待回答完成：data-streaming=false + 文本稳定 ${DEFAULT_STABLE_MS}ms + 操作按钮出现`);
+
+    while (Date.now() - start < DEFAULT_TIMEOUT_MS) {
+      assertNotStopped();
+      await scrollToBottom(2, 80);
+
+      latest = getLatestAssistantRoot();
+      if (latest) hoverElement(latest);
+
+      const meta = getAssistantMeta(latest);
+      const text = meta.text;
+      const signals = getGenerationSignal(latest);
+      const generating = signals.length > 0;
+      const streamFinished = meta.streaming === 'false' || !latest?.querySelector?.('[data-streaming="true"]');
+      const group = getLatestActionGroup(latest);
+      if (group) hoverElement(group);
+      const copyBtn = getCopyButton(latest);
+      const hasCopy = !!(group && copyBtn && isVisible(copyBtn));
+
+      if (text !== lastText) {
+        lastText = text;
+        lastChangedAt = Date.now();
+      }
+
+      const stableFor = Date.now() - lastChangedAt;
+      if (Date.now() - lastLogAt > 2500) {
+        lastLogAt = Date.now();
+        log(`生成检测：id=${meta.messageId || '无'} | len=${text.length} | stable=${stableFor}ms | streaming=${meta.streaming || '无'} | loading=${generating ? '是' : '否'} | copy=${hasCopy ? '是' : '否'}${signals.length ? ` | ${signals.join('；')}` : ''}`);
+      }
+
+      if (text.length > 0 && hasCopy && streamFinished && !generating && stableFor >= DEFAULT_STABLE_MS) {
+        log('回答完成：data-streaming 已结束，文本已稳定，复制按钮已出现');
+        return latest;
+      }
+
+      if (text.length > 0 && hasCopy && stableFor >= DEFAULT_FALLBACK_STABLE_MS) {
+        log(`回答完成：文本已稳定 ${DEFAULT_FALLBACK_STABLE_MS}ms，复制按钮已出现；忽略可能残留的 loading 信号`, 'warn');
+        return latest;
+      }
+
+      await sleep(250);
+    }
+
+    throw new Error('等待回答完成超时');
+  }
+
+  function getAnswerCopyText(root = getLatestAssistantRoot()) {
+    const text = getRawAnswerText(root);
+
+    return String(text || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function cacheAnswerText(text) {
+    const value = String(text || '');
+    window.__DOUBAO_LAST_ANSWER__ = value;
+    window.__DOUBAO_LAST_ANSWER_TIME__ = new Date().toISOString();
+    try {
+      sessionStorage.setItem('__DOUBAO_LAST_ANSWER__', value);
+      sessionStorage.setItem('__DOUBAO_LAST_ANSWER_TIME__', window.__DOUBAO_LAST_ANSWER_TIME__);
+    } catch (_) {}
+  }
+
+  function tryDevtoolsCopy(text) {
+    try {
+      // Chrome DevTools 控制台提供的 copy(text)。油猴环境通常没有它。
+      // 这里不能写 window.copy，因为 DevTools Command Line API 不一定挂在 window 上。
+      if (typeof copy === 'function') {
+        copy(text);
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function tryExecCommandCopy(text) {
+    let ta = null;
+    try {
+      ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', 'readonly');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      ta.style.width = '1px';
+      ta.style.height = '1px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand && document.execCommand('copy');
+      return !!ok;
+    } catch (_) {
+      return false;
+    } finally {
+      try { ta && ta.remove(); } catch (_) {}
+    }
+  }
+
+  async function writeClipboardSmart(text) {
+    if (!text || !text.trim()) throw new Error('最新回答文本为空，无法复制');
+
+    cacheAnswerText(text);
+
+    if (typeof GM_setClipboard === 'function') {
+      try {
+        GM_setClipboard(text, 'text');
+        return 'GM_setClipboard';
+      } catch (err) {
+        log(`GM_setClipboard 写入失败，改用控制台/DOM 方案：${shortErr(err)}`, 'warn');
+      }
+    }
+
+    if (tryDevtoolsCopy(text)) {
+      return 'DevTools copy(text)';
+    }
+
+    // 控制台/普通网页环境下，浏览器通常要求“当前真实用户手势”。
+    // 由于本脚本要等待豆包生成完成，原始点击权限可能已过期，所以这里只作为尝试项。
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        return 'navigator.clipboard.writeText';
+      }
+    } catch (err) {
+      log(`navigator.clipboard 写入失败，改用 DOM 方案：${shortErr(err)}`, 'warn');
+    }
+
+    if (tryExecCommandCopy(text)) {
+      return 'document.execCommand("copy")';
+    }
+
+    throw new Error('当前环境不能自动写入系统剪贴板；已把最新回答放入 window.__DOUBAO_LAST_ANSWER__ 和 sessionStorage.__DOUBAO_LAST_ANSWER__。要实现全自动复制，请在油猴中运行并确认 @grant GM_setClipboard 生效；控制台环境只能作为调试模式。');
+  }
+
+  async function copyLatestAnswer() {
+    await scrollToBottom(4, 100);
+    const latest = await waitFor(() => getLatestAssistantRoot(), '最新助手回答', 20000, 200);
+    hoverElement(latest);
+    await sleep(120);
+
+    const text = getAnswerCopyText(latest);
+    log(`准备复制最新回答：长度 ${text.length}`);
+    const method = await writeClipboardSmart(text);
+    await sleep(150);
+    log(`已写入系统剪贴板：${method}；未点击豆包复制按钮，未触发原生弹窗`, 'success');
+    return text;
+  }
+
+  function isAutoPromptEnabled() {
+    return autoPromptEl ? !!autoPromptEl.checked : store.autoPrompt !== false;
+  }
+
+  function buildFinalPrompt(userText) {
+    const base = String(userText || '').trim();
+    if (!isAutoPromptEnabled()) return base;
+    if (base.includes(EXTRA_PROMPT)) return base;
+    return `${base}\n\n${EXTRA_PROMPT}`.trim();
+  }
+
+  async function runOnce() {
+    if (state.running) return;
+    const rawText = inputEl.value;
+    if (!normText(rawText)) {
+      log('请输入要发送给豆包的问题', 'error');
+      return;
+    }
+
+    state.running = true;
+    state.stopped = false;
+    updateButtons();
+    store.lastPrompt = rawText;
+    store.autoPrompt = isAutoPromptEnabled();
+    saveStore();
+
+    setMarker('RUNNING', '开始自动问答并复制结果');
+    log(`开始执行 ${SCRIPT_VERSION}`);
+
+    try {
+      await scrollToBottom(3, 100);
+      const beforeMeta = getAssistantMeta(getLatestAssistantRoot());
+      log(`发送前最新助手回答：id=${beforeMeta.messageId || '无'} | len=${beforeMeta.textLen}`);
+
+      const finalPrompt = buildFinalPrompt(rawText);
+      log(`自动添加提示词：${isAutoPromptEnabled() ? '开启' : '关闭'}${isAutoPromptEnabled() ? ` | 追加长度 ${EXTRA_PROMPT.length}` : ''}`);
+      await fillPrompt(finalPrompt);
+      await sendPrompt(finalPrompt);
+      await waitForNewAnswer(beforeMeta);
+      await waitUntilAnswerFinished();
+      await copyLatestAnswer();
+
+      log('本轮完成：已复制最新回答', 'success');
+      setStatus('完成：已复制最新回答', 'success');
+      setMarker('SUCCESS', '已复制最新回答');
+    } catch (err) {
+      const msg = shortErr(err);
+      log(`运行失败：${msg}`, 'error');
+      setMarker('ERROR', msg);
+    } finally {
+      state.running = false;
+      updateButtons();
+    }
+  }
+
+  function clearCacheOnly() {
+    if (state.running) {
+      log('运行中不能清除缓存；日志保留', 'warn');
+      return;
+    }
+
+    try {
+      for (const key of LEGACY_STORE_KEYS) localStorage.removeItem(key);
+    } catch (_) {}
+    clearStoreObject();
+    if (inputEl) inputEl.value = '';
+    try {
+      delete window.__DOUBAO_LAST_ANSWER__;
+      delete window.__DOUBAO_LAST_ANSWER_TIME__;
+      sessionStorage.removeItem('__DOUBAO_LAST_ANSWER__');
+      sessionStorage.removeItem('__DOUBAO_LAST_ANSWER_TIME__');
+    } catch (_) {}
+    state.collapsed = false;
+    store.autoPrompt = true;
+    if (autoPromptEl) autoPromptEl.checked = true;
+    applyCollapsed();
+    log('缓存已清除：已清空保存的问题和最新回答缓存；日志保留，只有刷新/重启页面才会清空日志', 'success');
+    setMarker('IDLE', `缓存已清除 | ${SCRIPT_VERSION}`);
+  }
+
+  function updateButtons() {
+    if (runBtnEl) {
+      runBtnEl.disabled = state.running;
+      runBtnEl.textContent = state.running ? '运行中' : '开始运行';
+    }
+    if (clearCacheBtnEl) clearCacheBtnEl.disabled = state.running;
+    if (autoPromptEl) autoPromptEl.disabled = state.running;
+    if (inputEl) inputEl.disabled = state.running;
+  }
+
+  function installStyle() {
+    document.getElementById(STYLE_ID)?.remove();
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${PANEL_ID} {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        width: 390px;
+        height: 500px;
+        z-index: 2147483646;
+        background: #ffffff;
+        color: #1f2937;
+        border: 1px solid #d7dbe2;
+        border-radius: 0;
+        box-shadow: 0 10px 28px rgba(15,23,42,.16);
+        font: 12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",Arial,sans-serif;
+        user-select: none;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #${PANEL_ID} * { box-sizing: border-box; }
+      #${PANEL_ID} .hdr {
+        height: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 0 8px 0 10px;
+        background: #f7f8fa;
+        border-bottom: 1px solid #e5e7eb;
+        cursor: move;
+      }
+      #${PANEL_ID} .ttl {
+        font-weight: 700;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #${PANEL_ID} .hdr-tools {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        flex: 0 0 auto;
+      }
+      #${PANEL_ID} .hdr-tool {
+        width: 22px;
+        height: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid #d1d5db;
+        background: #ffffff;
+        color: #374151;
+        cursor: pointer;
+        line-height: 1;
+      }
+      #${PANEL_ID} .hdr-tool:hover { background: #eef2f7; }
+      #${PANEL_ID} .bd { padding: 10px; display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+      #${PANEL_ID}.collapsed .bd { display: none; }
+      #${PANEL_ID}.collapsed { width: 260px; height: 34px; }
+      #${PANEL_ID} textarea.prompt {
+        width: 100%;
+        height: 112px;
+        min-height: 112px;
+        max-height: 112px;
+        resize: none;
+        padding: 8px;
+        border: 1px solid #cbd5e1;
+        background: #ffffff;
+        color: #111827;
+        outline: none;
+        font: inherit;
+        user-select: text;
+      }
+      #${PANEL_ID} textarea.prompt:focus { border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37,99,235,.12); }
+      #${PANEL_ID} .optline {
+        height: 26px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 6px;
+        color: #374151;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        user-select: none;
+      }
+      #${PANEL_ID} .optline input { width: 14px; height: 14px; margin: 0; flex: 0 0 auto; }
+      #${PANEL_ID} .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
+      #${PANEL_ID} button.act {
+        height: 32px;
+        border: 1px solid #cbd5e1;
+        background: #ffffff;
+        color: #111827;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+      }
+      #${PANEL_ID} button.primary { border-color: #2563eb; background: #2563eb; color: #ffffff; }
+      #${PANEL_ID} button.act:hover:not(:disabled) { filter: brightness(.98); }
+      #${PANEL_ID} button:disabled { opacity: .52; cursor: not-allowed; }
+      #${PANEL_ID} .status {
+        margin-top: 8px;
+        height: 20px;
+        line-height: 20px;
+        color: #4b5563;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #${PANEL_ID} .status.error { color: #dc2626; }
+      #${PANEL_ID} .status.warn { color: #b45309; }
+      #${PANEL_ID} .status.success { color: #15803d; }
+      #${PANEL_ID} .log {
+        margin-top: 8px;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: auto;
+        padding: 8px;
+        background: #f8fafc;
+        border: 1px solid #e5e7eb;
+        color: #111827;
+        white-space: pre-wrap;
+        word-break: break-word;
+        user-select: text;
+        font-family: Consolas, Monaco, "Courier New", monospace;
+      }
+      #${PANEL_ID} .note {
+        display: none;
+      }
+      #${MARKER_ID} {
+        position: fixed;
+        left: 10px;
+        bottom: 10px;
+        z-index: 2147483645;
+        max-width: 380px;
+        padding: 5px 7px;
+        background: rgba(255,255,255,.94);
+        border: 1px solid #d1d5db;
+        color: #15803d;
+        font: 11px/1.35 Consolas, Monaco, "Courier New", monospace;
+        white-space: pre-wrap;
+        pointer-events: none;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, .08);
+      }
+      #${MARKER_ID}[data-status="ERROR"] { color: #dc2626; }
+      #${MARKER_ID}[data-status="RUNNING"] { color: #b45309; }
+      #${MARKER_ID}[data-status="SUCCESS"] { color: #2563eb; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function startDrag(e) {
+    if (e.button !== 0) return;
+    if (e.target.closest('.hdr-tool')) return;
+    state.dragging = true;
+    const rect = panelEl.getBoundingClientRect();
+    state.dragOffsetX = e.clientX - rect.left;
+    state.dragOffsetY = e.clientY - rect.top;
+    panelEl.style.left = `${rect.left}px`;
+    panelEl.style.top = `${rect.top}px`;
+    panelEl.style.right = 'auto';
+    panelEl.style.bottom = 'auto';
+
+    const onMove = ev => {
+      if (!state.dragging) return;
+      const x = Math.max(0, Math.min(ev.clientX - state.dragOffsetX, window.innerWidth - panelEl.offsetWidth));
+      const y = Math.max(0, Math.min(ev.clientY - state.dragOffsetY, window.innerHeight - panelEl.offsetHeight));
+      panelEl.style.left = `${x}px`;
+      panelEl.style.top = `${y}px`;
+    };
+
+    const onUp = () => {
+      state.dragging = false;
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+    };
+
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+  }
+
+  function applyCollapsed() {
+    if (!panelEl) return;
+    panelEl.classList.toggle('collapsed', !!state.collapsed);
+    if (collapseEl) collapseEl.textContent = state.collapsed ? '□' : '—';
+    store.collapsed = !!state.collapsed;
+    saveStore();
+  }
+
+  function mountPanel() {
+    document.getElementById(PANEL_ID)?.remove();
+
+    panelEl = document.createElement('div');
+    panelEl.id = PANEL_ID;
+
+    const hdr = document.createElement('div');
+    hdr.className = 'hdr';
+    hdr.addEventListener('pointerdown', startDrag);
+
+    const title = document.createElement('div');
+    title.className = 'ttl';
+    title.textContent = `豆包自动问答复制 ${SCRIPT_VERSION}`;
+
+    const tools = document.createElement('div');
+    tools.className = 'hdr-tools';
+
+    collapseEl = document.createElement('span');
+    collapseEl.className = 'hdr-tool';
+    collapseEl.title = '最小化/展开';
+    collapseEl.textContent = state.collapsed ? '□' : '—';
+    collapseEl.addEventListener('click', () => {
+      state.collapsed = !state.collapsed;
+      applyCollapsed();
+    });
+
+    const closeEl = document.createElement('span');
+    closeEl.className = 'hdr-tool';
+    closeEl.title = '关闭面板';
+    closeEl.textContent = '×';
+    closeEl.addEventListener('click', destroy);
+
+    tools.appendChild(collapseEl);
+    tools.appendChild(closeEl);
+
+    hdr.appendChild(title);
+    hdr.appendChild(tools);
+
+    const bd = document.createElement('div');
+    bd.className = 'bd';
+
+    inputEl = document.createElement('textarea');
+    inputEl.className = 'prompt';
+    inputEl.placeholder = '输入要发给豆包的问题。脚本只在当前对话发送，不新建对话。';
+    inputEl.value = store.lastPrompt || '';
+    inputEl.addEventListener('input', () => {
+      store.lastPrompt = inputEl.value;
+      saveStore();
+    });
+
+    const optline = document.createElement('label');
+    optline.className = 'optline';
+    optline.title = `开启后会在用户输入内容末尾自动追加：${EXTRA_PROMPT}`;
+
+    autoPromptEl = document.createElement('input');
+    autoPromptEl.type = 'checkbox';
+    autoPromptEl.checked = store.autoPrompt !== false;
+    autoPromptEl.addEventListener('change', () => {
+      store.autoPrompt = !!autoPromptEl.checked;
+      saveStore();
+      log(`自动添加提示词：${autoPromptEl.checked ? '开启' : '关闭'}`);
+    });
+
+    const optText = document.createElement('span');
+    optText.textContent = '自动添加提示词';
+
+    optline.appendChild(autoPromptEl);
+    optline.appendChild(optText);
+
+    const row = document.createElement('div');
+    row.className = 'row';
+
+    runBtnEl = document.createElement('button');
+    runBtnEl.className = 'act primary';
+    runBtnEl.textContent = '开始运行';
+    runBtnEl.addEventListener('click', runOnce);
+
+    clearCacheBtnEl = document.createElement('button');
+    clearCacheBtnEl.className = 'act';
+    clearCacheBtnEl.textContent = '清除缓存';
+    clearCacheBtnEl.title = '清空保存的问题和最新回答缓存；不会清空日志。日志只在刷新/重启页面后清空。';
+    clearCacheBtnEl.addEventListener('click', clearCacheOnly);
+
+    row.appendChild(runBtnEl);
+    row.appendChild(clearCacheBtnEl);
+
+    statusEl = document.createElement('div');
+    statusEl.className = 'status';
+    statusEl.textContent = `待命 | ${SCRIPT_VERSION}`;
+
+    logEl = document.createElement('div');
+    logEl.className = 'log';
+
+    const note = document.createElement('div');
+    note.className = 'note';
+    note.textContent = '日志可直接选中复制；清除缓存不会清空日志，只有刷新/重启页面才会清空日志。';
+
+    bd.appendChild(inputEl);
+    bd.appendChild(optline);
+    bd.appendChild(row);
+    bd.appendChild(statusEl);
+    bd.appendChild(logEl);
+    bd.appendChild(note);
+
+    panelEl.appendChild(hdr);
+    panelEl.appendChild(bd);
+    document.body.appendChild(panelEl);
+    applyCollapsed();
+
+    log(`脚本已加载：${SCRIPT_VERSION}`);
+    log('主操作区只保留：开始运行、清除缓存');
+    log('左下角 RPA 状态标记已恢复：可读取 DOUBAO_STATUS / DOUBAO_MESSAGE / VERSION');
+    log('复制规则：不点击豆包复制按钮；读取最新助手回答 .md-box-root / [data-streaming]；油猴优先 GM_setClipboard 静默复制；控制台仅尝试浏览器允许的复制能力，失败则缓存到 window.__DOUBAO_LAST_ANSWER__ 和 sessionStorage.__DOUBAO_LAST_ANSWER__');
+    log(`自动添加提示词默认开启：${EXTRA_PROMPT}`);
+  }
+
+  function destroy() {
+    state.destroyed = true;
+    state.stopped = true;
+    document.getElementById(PANEL_ID)?.remove();
+    document.getElementById(STYLE_ID)?.remove();
+    document.getElementById(MARKER_ID)?.remove();
+    delete window.__DOUBAO_AUTO_QA_COPY_STATUS__;
+    delete window[APP_KEY];
+  }
+
+  installStyle();
+  mountPanel();
+  setMarker('IDLE', `待命 | ${SCRIPT_VERSION}`);
+
+  window[APP_KEY] = { destroy, version: SCRIPT_VERSION, getLastAnswer: () => window.__DOUBAO_LAST_ANSWER__ || '' };
+})();
