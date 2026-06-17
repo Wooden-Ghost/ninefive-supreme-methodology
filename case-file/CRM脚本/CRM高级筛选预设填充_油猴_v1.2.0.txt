@@ -1,0 +1,1461 @@
+// ==UserScript==
+// @name         Cordys CRM 高级筛选预设填充
+// @namespace    https://codex.local/crm-control
+// @version      1.2.0
+// @description  保存/读取 Cordys CRM 高级筛选条件预设，一键只填充或筛选。默认预设：RR收集。已合入极速稳定填充逻辑。
+// @author       Codex
+// @match        http://106.53.55.11:8081/*
+// @run-at       document-idle
+// @grant        GM_setClipboard
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /*
+   * v1.2.0 更新说明
+   * 1. 将控制台极速测试版 v0.9.1 的填充节奏合入完整版。
+   * 2. 填完一行后做本行有效确认；新增下一行后复核已完成行，避免 CRM 重渲染清空上一行关键字。
+   * 3. 字段下拉支持搜索：是否联系人收集 -> “收集”，客户优先级 -> “优先”，避免误选。
+   * 4. 保留预设管理：RR收集默认组、保存新增筛选、重命名、查看关键词、删除。
+   * 5. 主界面保持轻量：无日志、无自检、无诊断按钮。
+   */
+
+  const VERSION = '1.2.0';
+  const SCRIPT_NAME = 'CRM 高级筛选预设填充';
+  const STORAGE_KEY = 'CRM_ADVANCED_FILTER_PRESETS_V1';
+  const DEFAULT_PRESET_ID = 'preset_rr_collect';
+
+  const DEFAULT_RULES = [
+    { field: '行业', operator: '不包含', value: '出版' },
+    { field: '行业', operator: '不包含', value: '博物' },
+    { field: '行业', operator: '不包含', value: '个人' },
+    { field: '行业', operator: '不包含', value: '不符' },
+    { field: '是否联系人收集', operator: '不包含', value: '已做' },
+    { field: '是否联系人收集', operator: '不包含', value: '皆无' },
+    { field: '是否联系人收集', operator: '不包含', value: '邮箱' },
+    { field: '客户优先级', operator: '不包含', value: 'C' },
+    { field: '客户优先级', operator: '不包含', value: 'D' }
+  ];
+
+  const PATHS = {
+    appRoot: '#app',
+    customerPageHash: '#/account/index',
+    filterIconHref: '#iconicon_filter',
+    removeRowIconHref: '#iconicon_minus_circle1',
+
+    modalStrict: '.n-dialog.crm-modal.crm-form-modal.crm-modal-large',
+    modalAny: '.n-dialog',
+    modalTitle: '.n-dialog__title',
+    modalAction: '.n-dialog__action',
+
+    rowStrict: 'form.n-form > div.flex.items-start.gap-\\[8px\\]',
+    rowAnySelect: '.n-select',
+    rowValueInput: 'input.n-input__input-el, textarea.n-input__textarea-el',
+
+    selectInput: 'input.n-base-selection-input',
+    selectMenu: '.n-base-select-menu',
+    selectOption: '.n-base-select-option, .n-base-select-option__content'
+  };
+
+  const state = {
+    running: false,
+    currentAction: '',
+    store: null
+  };
+
+  const FAST = {
+    tiny: 16,
+    afterOpen: 28,
+    afterSelect: 34,
+    afterInput: 42,
+    afterAdd: 54,
+    poll: 20,
+    shortTimeout: 700,
+    timeout: 1800
+  };
+
+  let panel = null;
+  let panelBody = null;
+  let headerBar = null;
+  let reopenHandle = null;
+  let presetSelect = null;
+  let statusBox = null;
+  let keywordBox = null;
+  let actionButtons = [];
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async function waitFor(fn, timeout = 8000, interval = 100, label = '') {
+    const start = Date.now();
+    let lastError = null;
+    while (Date.now() - start < timeout) {
+      try {
+        const value = fn();
+        if (value) return value;
+      } catch (error) {
+        lastError = error;
+      }
+      await sleep(interval);
+    }
+    if (lastError) throw lastError;
+    throw new Error(label ? `等待超时：${label}` : `等待超时：${timeout}ms`);
+  }
+
+  function normalize(value) {
+    return String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  }
+
+  function visibleText(el) {
+    return normalize(el ? (el.innerText || el.textContent || '') : '');
+  }
+
+  function isVisible(el) {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }
+
+  function q(selector, root = document) {
+    return root ? root.querySelector(selector) : null;
+  }
+
+  function qa(selector, root = document) {
+    return root ? Array.from(root.querySelectorAll(selector)) : [];
+  }
+
+  function uniqueElements(list) {
+    const out = [];
+    list.forEach(el => {
+      if (el && !out.includes(el)) out.push(el);
+    });
+    return out;
+  }
+
+  function isAttached(el) {
+    return !!(el && el.ownerDocument && el.ownerDocument.documentElement && el.ownerDocument.documentElement.contains(el));
+  }
+
+  function hasLayoutRect(el) {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function getWin(el) {
+    return (el && el.ownerDocument && el.ownerDocument.defaultView) || window;
+  }
+
+  function getRowSelects(row) {
+    const all = qa(PATHS.rowAnySelect, row);
+    const visible = all.filter(select => {
+      const node = q('.n-base-selection', select) || select;
+      return isAttached(select) && (isVisible(node) || hasLayoutRect(node));
+    });
+    return visible.length ? visible : all.filter(select => isAttached(select));
+  }
+
+  function describeRow(row) {
+    if (!row) return '行不存在';
+    const selects = getRowSelects(row);
+    const input = q(PATHS.rowValueInput, row);
+    return `selects=${selects.length}; input=${input ? 'yes' : 'no'}; text=${visibleText(row).slice(0, 80)}`;
+  }
+
+  function setStatus(message, level = 'info') {
+    if (!statusBox) return;
+    statusBox.textContent = message;
+    const colors = {
+      info: ['#315b72', '#f3f7fa', '#e4ebef'],
+      success: ['#2f6b45', '#f1f8f3', '#dcece0'],
+      warn: ['#8a5b00', '#fff9e8', '#f0e3bd'],
+      error: ['#9f2d2d', '#fff4f2', '#f0d4ce']
+    }[level] || ['#315b72', '#f3f7fa', '#e4ebef'];
+    statusBox.style.color = colors[0];
+    statusBox.style.background = colors[1];
+    statusBox.style.borderColor = colors[2];
+  }
+
+  function setBusy(isBusy, actionName = '') {
+    state.running = isBusy;
+    state.currentAction = isBusy ? actionName : '';
+    actionButtons.forEach(button => {
+      if (button.dataset.role === 'toggle') return;
+      button.disabled = isBusy;
+      button.style.opacity = isBusy ? '0.55' : '1';
+      button.style.cursor = isBusy ? 'not-allowed' : 'pointer';
+    });
+  }
+
+  function setNativeValue(el, value) {
+    if (!el) throw new Error('输入控件不存在');
+    const win = getWin(el);
+    const proto = el instanceof win.HTMLTextAreaElement ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new win.Event('input', { bubbles: true }));
+    el.dispatchEvent(new win.Event('change', { bubbles: true }));
+  }
+
+  async function typeLikeUser(input, value) {
+    const win = getWin(input);
+    input.focus();
+    setNativeValue(input, '');
+    await sleep(30);
+    let current = '';
+    for (const ch of String(value)) {
+      current += ch;
+      input.dispatchEvent(new win.KeyboardEvent('keydown', { key: ch, bubbles: true, cancelable: true }));
+      setNativeValue(input, current);
+      try {
+        input.dispatchEvent(new win.InputEvent('input', { data: ch, inputType: 'insertText', bubbles: true }));
+      } catch (_) {
+        input.dispatchEvent(new win.Event('input', { bubbles: true }));
+      }
+      input.dispatchEvent(new win.KeyboardEvent('keyup', { key: ch, bubbles: true, cancelable: true }));
+      await sleep(3);
+    }
+  }
+
+  function clickElement(el, label = '') {
+    if (!el) throw new Error(label ? `点击元素不存在：${label}` : '点击元素不存在');
+    const win = getWin(el);
+    try {
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+    } catch (_) {}
+    try {
+      el.focus?.({ preventScroll: true });
+    } catch (_) {}
+
+    const eventInit = { bubbles: true, cancelable: true, view: win };
+    if (win.PointerEvent) {
+      el.dispatchEvent(new win.PointerEvent('pointerdown', eventInit));
+      el.dispatchEvent(new win.PointerEvent('pointerup', eventInit));
+    }
+    el.dispatchEvent(new win.MouseEvent('mousedown', eventInit));
+    el.dispatchEvent(new win.MouseEvent('mouseup', eventInit));
+    el.dispatchEvent(new win.MouseEvent('click', eventInit));
+  }
+
+  function getUseHref(useEl) {
+    if (!useEl) return '';
+    return useEl.getAttribute('xlink:href') || useEl.getAttribute('href') || useEl.href?.baseVal || '';
+  }
+
+  function hrefEquals(actual, expected) {
+    return actual === expected || actual.endsWith(expected);
+  }
+
+  function findIconButton(iconHref, root = document) {
+    return qa('button', root).find(button => qa('use', button).some(use => hrefEquals(getUseHref(use), iconHref)));
+  }
+
+  function findButtonByText(text, root = document) {
+    return qa('button', root).filter(isVisible).find(button => visibleText(button) === text || visibleText(button).includes(text));
+  }
+
+  function getAdvancedModal() {
+    const strict = qa(PATHS.modalStrict).find(modal => isVisible(modal) && visibleText(q(PATHS.modalTitle, modal)).includes('高级筛选'));
+    if (strict) return strict;
+    return qa(PATHS.modalAny)
+      .filter(isVisible)
+      .find(modal => {
+        const text = visibleText(modal);
+        return text.includes('高级筛选') && (text.includes('添加条件') || text.includes('筛选'));
+      });
+  }
+
+  function getRows() {
+    const modal = getAdvancedModal();
+    if (!modal) return [];
+    const form = q('form.n-form', modal);
+    if (!form) return [];
+
+    const isRuleRow = row => {
+      if (!row || !isAttached(row)) return false;
+      const selects = getRowSelects(row);
+      const input = q(PATHS.rowValueInput, row);
+      const text = visibleText(row);
+      if (text.includes('添加条件') || text.includes('重置') || text.includes('筛选')) return false;
+      return selects.length >= 1 && (input || selects.length >= 2);
+    };
+
+    const candidates = uniqueElements([
+      ...qa(PATHS.rowStrict, form),
+      ...qa('div.flex.items-start.gap-\\[8px\\]', form),
+      ...qa('div.flex.items-start', form)
+    ]).filter(isRuleRow);
+
+    if (candidates.length) return candidates;
+    return qa(':scope > div', form).filter(isRuleRow);
+  }
+
+  function getDropdownCandidates() {
+    return uniqueElements([
+      ...qa('.n-base-select-menu'),
+      ...qa('.n-select-menu'),
+      ...qa('.v-binder-follower-content'),
+      ...qa('.v-binder-follower-container'),
+      ...qa('.n-popover'),
+      ...qa('.n-popover-shared')
+    ]);
+  }
+
+  function getVisibleMenus() {
+    return getDropdownCandidates().filter(el => {
+      if (!isVisible(el)) return false;
+      if (q('.n-base-select-option, .n-base-select-option__content, [class*="select-option"]', el)) return true;
+      const text = visibleText(el);
+      return /包含|不包含|等于|行业|客户优先级|是否联系人收集/.test(text);
+    });
+  }
+
+  function getLatestVisibleMenu() {
+    const menus = getVisibleMenus();
+    return menus[menus.length - 1] || null;
+  }
+
+  function getOptionClickTarget(option) {
+    if (!option) return null;
+    return option.closest?.('.n-base-select-option') || option;
+  }
+
+  async function openSelectMenu(select, label = '下拉') {
+    const win = getWin(select);
+    const targets = uniqueElements([
+      q('.n-base-selection-label', select),
+      q('.n-base-selection', select),
+      q(PATHS.selectInput, select),
+      select
+    ]).filter(Boolean);
+
+    for (const target of targets) {
+      clickElement(target, `${label} 打开尝试`);
+      await sleep(80);
+      let menu = getLatestVisibleMenu();
+      if (menu) return menu;
+
+      try {
+        target.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+        target.dispatchEvent(new win.KeyboardEvent('keyup', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+      } catch (_) {}
+      await sleep(80);
+      menu = getLatestVisibleMenu();
+      if (menu) return menu;
+    }
+
+    throw new Error(`打开${label}失败`);
+  }
+
+  function looseKey(value) {
+    return normalize(value).replace(/\s+/g, '').replace(/[：:]/g, '');
+  }
+
+  function optionMatches(option, text) {
+    const optionText = visibleText(option);
+    return looseKey(optionText) === looseKey(text);
+  }
+
+  function findVisibleOptionExact(text) {
+    const candidates = qa(PATHS.selectOption)
+      .filter(isVisible)
+      .filter(option => optionMatches(option, text));
+    return candidates.map(getOptionClickTarget).find(Boolean) || null;
+  }
+
+  function getVisibleOptionTexts() {
+    return qa(PATHS.selectOption).filter(isVisible).map(visibleText).filter(Boolean);
+  }
+
+  async function scrollMenuToOption(text) {
+    const menu = getLatestVisibleMenu();
+    if (!menu) return null;
+    const scroller = q('.n-virtual-list', menu) || q('.n-scrollbar-container', menu) || q('.n-scrollbar', menu) || menu;
+    const win = getWin(menu);
+    const step = 260;
+    for (let i = 0; i < 30; i += 1) {
+      const option = findVisibleOptionExact(text);
+      if (option) return option;
+      scroller.scrollTop = i * step;
+      scroller.dispatchEvent(new win.Event('scroll', { bubbles: true }));
+      try {
+        menu.dispatchEvent(new win.WheelEvent('wheel', { deltaY: step, bubbles: true, cancelable: true }));
+      } catch (_) {}
+      await sleep(35);
+    }
+    return findVisibleOptionExact(text);
+  }
+
+  function getSelectDisplayParts(select) {
+    const parts = [];
+    const add = value => {
+      const text = normalize(value);
+      if (text && !parts.includes(text)) parts.push(text);
+    };
+    if (!select) return parts;
+
+    const preferred = [
+      '.n-base-selection-overlay__wrapper',
+      '.n-base-selection-input__content',
+      '.n-base-selection-label[title]',
+      '.n-base-selection-input[title]',
+      '.n-base-selection-render-label',
+      '.n-base-selection-label'
+    ];
+    preferred.forEach(selector => {
+      qa(selector, select).forEach(el => {
+        add(el.getAttribute?.('title'));
+        add(visibleText(el));
+      });
+    });
+
+    ['title', 'aria-label', 'data-value', 'data-label'].forEach(name => add(select.getAttribute?.(name)));
+    qa('input', select).forEach(input => {
+      add(input.value);
+      add(input.getAttribute('value'));
+    });
+    add(visibleText(select));
+
+    return parts.filter(text => !/^loading$/i.test(text));
+  }
+
+  function getSelectDebugText(select) {
+    return getSelectDisplayParts(select).join(' | ') || '未读到显示值';
+  }
+
+  function getSelectPrimaryText(select) {
+    const parts = getSelectDisplayParts(select);
+    return parts[0] || '';
+  }
+
+  function selectHasValue(select, targetText) {
+    const target = looseKey(targetText);
+    if (!target) return false;
+    return getSelectDisplayParts(select).some(part => {
+      const key = looseKey(part);
+      return key === target || key.includes(target);
+    });
+  }
+
+  async function chooseSelect(row, selectIndex, targetText) {
+    if (!row || !isAttached(row)) throw new Error(`第 ${selectIndex + 1} 个下拉所在条件行已失效，需要重新获取行 DOM`);
+    const selects = getRowSelects(row);
+    const select = selects[selectIndex];
+    if (!select) throw new Error(`第 ${selectIndex + 1} 个下拉不存在；当前行状态：${describeRow(row)}`);
+
+    if (selectHasValue(select, targetText)) return;
+
+    const menu = await openSelectMenu(select, `下拉 ${selectIndex + 1}“${targetText}”`).catch(error => {
+      if (selectHasValue(select, targetText)) return null;
+      throw error;
+    });
+
+    if (menu) {
+      let option = findVisibleOptionExact(targetText);
+      const filterInput = q(PATHS.selectInput, select);
+      if (!option && filterInput) {
+        await typeLikeUser(filterInput, targetText);
+        option = await waitFor(() => findVisibleOptionExact(targetText), 1800, 50, `搜索下拉选项“${targetText}”`).catch(() => null);
+      }
+      if (!option) option = await scrollMenuToOption(targetText);
+      if (!option) {
+        const visibleOptions = getVisibleOptionTexts().slice(0, 40).join(' / ') || '无可见选项';
+        throw new Error(`找不到下拉选项“${targetText}”。当前可见选项：${visibleOptions}`);
+      }
+      clickElement(option, `选项：${targetText}`);
+    }
+
+    await sleep(100);
+    await waitFor(() => selectHasValue(select, targetText) || !getLatestVisibleMenu(), 900, 40, `下拉选择完成“${targetText}”`).catch(() => null);
+  }
+
+  async function fillKeyword(row, value) {
+    const input = q(PATHS.rowValueInput, row);
+    const text = String(value == null ? '' : value);
+    if (!input) {
+      if (text) throw new Error(`关键字输入框不存在，无法写入“${text}”`);
+      return;
+    }
+    if (input.disabled) {
+      if (text) throw new Error('关键字输入框被禁用，通常是字段或操作符未选择成功');
+      return;
+    }
+    setNativeValue(input, text);
+    const win = getWin(input);
+    input.dispatchEvent(new win.Event('blur', { bubbles: true }));
+    await waitFor(() => normalize(input.value) === normalize(text), 1200, 40, `写入关键字“${text}”`);
+  }
+
+  async function getRuleRow(index, minSelects = 2, needInput = true) {
+    return waitFor(() => {
+      const row = getRows()[index];
+      if (!row || !isAttached(row)) return null;
+      const selects = getRowSelects(row);
+      const input = q(PATHS.rowValueInput, row);
+      if (selects.length < minSelects) return null;
+      if (needInput && !input) return null;
+      return row;
+    }, 4000, 50, `第 ${index + 1} 行控件就绪`);
+  }
+
+  async function fillRule(rule, index) {
+    let row = await getRuleRow(index, 1, false);
+    await chooseSelect(row, 0, rule.field);
+
+    await sleep(50);
+    row = await getRuleRow(index, 2, false);
+    await chooseSelect(row, 1, rule.operator);
+
+    await sleep(40);
+    row = await getRuleRow(index, 2, false);
+    await fillKeyword(row, rule.value);
+  }
+
+  async function openAdvancedFilter() {
+    let modal = getAdvancedModal();
+    if (modal) return modal;
+
+    const button = findIconButton(PATHS.filterIconHref, q(PATHS.appRoot) || document);
+    if (!button) throw new Error(`找不到高级筛选入口：button 内 use[href="${PATHS.filterIconHref}"]`);
+
+    clickElement(button, '高级筛选入口');
+    modal = await waitFor(() => getAdvancedModal(), 8000, 100, '高级筛选弹窗出现');
+    return modal;
+  }
+
+  async function removeExtraRows(targetCount = 1) {
+    let rows = getRows();
+    if (!rows.length) return;
+    while (rows.length > targetCount) {
+      const row = rows[rows.length - 1];
+      const removeButton = findIconButton(PATHS.removeRowIconHref, row)
+        || qa('button', row).filter(isVisible).find(button => visibleText(button).includes('删除') || visibleText(button).includes('移除'))
+        || qa('button', row).filter(isVisible).slice(-1)[0];
+      if (!removeButton) throw new Error('找不到条件行删除按钮');
+      clickElement(removeButton, '删除条件行');
+      const expectedCount = rows.length - 1;
+      await waitFor(() => getRows().length === expectedCount, 2500, 50, '删除多余条件行');
+      rows = getRows();
+    }
+  }
+
+  async function addOneRow(expectedCount) {
+    const modal = getAdvancedModal();
+    const addButton = findButtonByText('添加条件', modal);
+    if (!addButton) throw new Error('找不到“添加条件”按钮');
+    clickElement(addButton, '添加条件');
+    await waitFor(() => {
+      const rows = getRows();
+      const row = rows[expectedCount - 1];
+      if (rows.length < expectedCount || !row) return null;
+      const selects = getRowSelects(row);
+      return selects.length >= 1 ? row : null;
+    }, 4000, 50, `添加第 ${expectedCount} 条条件行并等待控件就绪`);
+  }
+
+  function cloneRules(rules) {
+    return (Array.isArray(rules) ? rules : []).map(rule => ({
+      field: normalize(rule.field),
+      operator: normalize(rule.operator),
+      value: normalize(rule.value)
+    })).filter(rule => rule.field && rule.operator);
+  }
+
+  function createDefaultStore() {
+    return {
+      version: 1,
+      selectedId: DEFAULT_PRESET_ID,
+      presets: [
+        {
+          id: DEFAULT_PRESET_ID,
+          name: 'RR收集',
+          rules: cloneRules(DEFAULT_RULES),
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        }
+      ]
+    };
+  }
+
+  function loadStore() {
+    let store = null;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) store = JSON.parse(raw);
+    } catch (_) {
+      store = null;
+    }
+
+    if (!store || !Array.isArray(store.presets)) store = createDefaultStore();
+
+    const defaultPreset = store.presets.find(item => item.id === DEFAULT_PRESET_ID);
+    if (!defaultPreset) {
+      store.presets.unshift({
+        id: DEFAULT_PRESET_ID,
+        name: 'RR收集',
+        rules: cloneRules(DEFAULT_RULES),
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      });
+    } else if (!defaultPreset.name || defaultPreset.name === '筛选组1') {
+      defaultPreset.name = 'RR收集';
+    }
+
+    store.presets = store.presets
+      .map(item => ({
+        id: item.id || `preset_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        name: normalize(item.name) || '未命名筛选组',
+        rules: cloneRules(item.rules),
+        createdAt: item.createdAt || Date.now(),
+        updatedAt: item.updatedAt || Date.now()
+      }))
+      .filter(item => item.rules.length);
+
+    if (!store.presets.length) store = createDefaultStore();
+    if (!store.selectedId || !store.presets.some(item => item.id === store.selectedId)) {
+      store.selectedId = store.presets[0].id;
+    }
+
+    state.store = store;
+    saveStore();
+    return store;
+  }
+
+  function saveStore() {
+    if (!state.store) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state.store));
+  }
+
+  function getSelectedPreset() {
+    const store = state.store || loadStore();
+    return store.presets.find(item => item.id === store.selectedId) || store.presets[0];
+  }
+
+  function getNextPresetName() {
+    const store = state.store || loadStore();
+    let index = 1;
+    while (store.presets.some(item => item.name === `筛选组${index}`)) index += 1;
+    return `筛选组${index}`;
+  }
+
+  function sameRules(a, b) {
+    return JSON.stringify(cloneRules(a)) === JSON.stringify(cloneRules(b));
+  }
+
+  function renderPresetSelect() {
+    if (!presetSelect) return;
+    const store = state.store || loadStore();
+    presetSelect.innerHTML = '';
+    store.presets.forEach(item => {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = item.name;
+      presetSelect.appendChild(option);
+    });
+    presetSelect.value = store.selectedId;
+    updateKeywordPreview(false);
+  }
+
+
+  function nativeSetValueOnly(input, value) {
+    const win = getWin(input);
+    const proto = input instanceof win.HTMLTextAreaElement ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(input, value);
+    else input.value = value;
+  }
+
+  function fireInputEvent(input, value, inputType = 'insertText') {
+    const win = getWin(input);
+    try {
+      input.dispatchEvent(new win.InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType
+      }));
+    } catch (_) {
+      input.dispatchEvent(new win.Event('input', { bubbles: true }));
+    }
+    input.dispatchEvent(new win.Event('change', { bubbles: true }));
+  }
+
+  function getRowByIndexFast(rowIndex) {
+    const row = getRows()[rowIndex];
+    if (!row) throw new Error(`第 ${rowIndex + 1} 行不存在`);
+    return row;
+  }
+
+  function getSelectFast(rowIndex, selectIndex) {
+    const row = getRowByIndexFast(rowIndex);
+    const selects = getRowSelects(row);
+    const select = selects[selectIndex];
+    if (!select) throw new Error(`第 ${rowIndex + 1} 行第 ${selectIndex + 1} 个下拉不存在；当前行：${describeRow(row)}`);
+    return select;
+  }
+
+  function getInputFast(rowIndex) {
+    const input = q(PATHS.rowValueInput, getRowByIndexFast(rowIndex));
+    if (!input) throw new Error(`第 ${rowIndex + 1} 行输入框不存在`);
+    return input;
+  }
+
+  function readSelectFast(select) {
+    if (!select) return '';
+    const title = q('.n-base-selection-label', select)?.getAttribute('title');
+    if (title) return normalize(title);
+    const content = q('.n-base-selection-input__content', select);
+    if (content) return visibleText(content);
+    const overlay = q('.n-base-selection-overlay__wrapper', select);
+    if (overlay) return visibleText(overlay);
+    return getSelectPrimaryText(select) || visibleText(select);
+  }
+
+  function readRowFast(rowIndex) {
+    const row = getRowByIndexFast(rowIndex);
+    const selects = getRowSelects(row);
+    const input = q(PATHS.rowValueInput, row);
+    return {
+      field: readSelectFast(selects[0]),
+      operator: readSelectFast(selects[1]),
+      value: normalize(input?.value || ''),
+      text: visibleText(row)
+    };
+  }
+
+  function visibleOptionsFast() {
+    return qa('.n-base-select-option').filter(isVisible);
+  }
+
+  function optionTextFast(option) {
+    const content = q('.n-base-select-option__content', option);
+    return visibleText(content || option);
+  }
+
+  function findOptionExactFast(targetText) {
+    return visibleOptionsFast().find(option => looseKey(optionTextFast(option)) === looseKey(targetText)) || null;
+  }
+
+  function getFieldSearch(target) {
+    if (target === '是否联系人收集') return '收集';
+    if (target === '客户优先级') return '优先';
+    return '';
+  }
+
+  async function waitMenuFast() {
+    return waitFor(() => getLatestVisibleMenu(), FAST.shortTimeout, FAST.poll, '下拉菜单');
+  }
+
+  async function setSelectSearchFast(select, term) {
+    if (!term) return;
+    const input = q(PATHS.selectInput, select);
+    if (!input) return;
+    input.focus();
+    nativeSetValueOnly(input, '');
+    fireInputEvent(input, '', 'deleteContentBackward');
+    await sleep(FAST.tiny);
+    nativeSetValueOnly(input, term);
+    fireInputEvent(input, term, 'insertText');
+    await sleep(FAST.afterOpen);
+  }
+
+  async function chooseSelectFast(rowIndex, selectIndex, targetText, searchTerm = '') {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const select = getSelectFast(rowIndex, selectIndex);
+      if (looseKey(readSelectFast(select)) === looseKey(targetText)) return;
+
+      const trigger = q('.n-base-selection-label', select) || q('.n-base-selection', select) || select;
+      clickElement(trigger, `第 ${rowIndex + 1} 行下拉 ${selectIndex + 1}`);
+      await waitMenuFast();
+      await setSelectSearchFast(select, searchTerm);
+
+      let option = findOptionExactFast(targetText);
+      if (!option) {
+        const menu = getLatestVisibleMenu();
+        const scroller = q('.n-virtual-list, .n-scrollbar', menu) || menu;
+        const win = getWin(scroller);
+        for (let i = 0; i < 24 && !option; i += 1) {
+          scroller.scrollTop = i * 128;
+          scroller.dispatchEvent(new win.Event('scroll', { bubbles: true }));
+          await sleep(18);
+          option = findOptionExactFast(targetText);
+        }
+      }
+      if (!option) {
+        const options = visibleOptionsFast().map(optionTextFast).join(' / ') || '无';
+        throw new Error(`找不到选项“${targetText}”，可见：${options}`);
+      }
+
+      clickElement(option, `选项：${targetText}`);
+      await waitFor(() => looseKey(readSelectFast(getSelectFast(rowIndex, selectIndex))) === looseKey(targetText), FAST.timeout, FAST.poll, `确认下拉 ${targetText}`)
+        .catch(async () => { await sleep(FAST.afterSelect); });
+      if (looseKey(readSelectFast(getSelectFast(rowIndex, selectIndex))) === looseKey(targetText)) return;
+    }
+    throw new Error(`选择失败：第 ${rowIndex + 1} 行第 ${selectIndex + 1} 个下拉 -> ${targetText}`);
+  }
+
+  async function fillInputFast(rowIndex, value) {
+    const input = getInputFast(rowIndex);
+    const text = String(value == null ? '' : value);
+    input.focus();
+    if (typeof input.select === 'function') input.select();
+    nativeSetValueOnly(input, '');
+    fireInputEvent(input, '', 'deleteContentBackward');
+    await sleep(FAST.tiny);
+    nativeSetValueOnly(input, text);
+    fireInputEvent(input, text, 'insertText');
+    const win = getWin(input);
+    input.dispatchEvent(new win.Event('change', { bubbles: true }));
+    input.dispatchEvent(new win.Event('blur', { bubbles: true }));
+    await sleep(FAST.afterInput);
+  }
+
+  async function fillInputHuman(rowIndex, value) {
+    const input = getInputFast(rowIndex);
+    const text = String(value == null ? '' : value);
+    input.focus();
+    if (typeof input.select === 'function') input.select();
+    nativeSetValueOnly(input, '');
+    fireInputEvent(input, '', 'deleteContentBackward');
+    let current = '';
+    for (const ch of text) {
+      current += ch;
+      nativeSetValueOnly(input, current);
+      fireInputEvent(input, ch, 'insertText');
+      await sleep(10);
+    }
+    const win = getWin(input);
+    input.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    input.dispatchEvent(new win.KeyboardEvent('keyup', { key: 'Enter', bubbles: true, cancelable: true }));
+    input.dispatchEvent(new win.Event('change', { bubbles: true }));
+    input.dispatchEvent(new win.Event('blur', { bubbles: true }));
+    await sleep(FAST.afterInput + 20);
+  }
+
+  async function fillInputStable(rowIndex, value) {
+    const text = normalize(value);
+    await fillInputFast(rowIndex, text);
+    if (normalize(getInputFast(rowIndex).value) === text) return;
+    await fillInputHuman(rowIndex, text);
+  }
+
+  async function confirmRuleFast(rowIndex, rule) {
+    const target = {
+      field: normalize(rule.field),
+      operator: normalize(rule.operator),
+      value: normalize(rule.value)
+    };
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      let info = readRowFast(rowIndex);
+      if (looseKey(info.field) !== looseKey(target.field)) {
+        await chooseSelectFast(rowIndex, 0, target.field, getFieldSearch(target.field) || target.field);
+      }
+
+      info = readRowFast(rowIndex);
+      if (looseKey(info.operator) !== looseKey(target.operator)) {
+        await chooseSelectFast(rowIndex, 1, target.operator, target.operator);
+      }
+
+      info = readRowFast(rowIndex);
+      if (normalize(info.value) !== target.value) {
+        await fillInputStable(rowIndex, target.value);
+      }
+
+      let stable = 0;
+      const ok = await waitFor(() => {
+        const now = readRowFast(rowIndex);
+        const pass = looseKey(now.field) === looseKey(target.field)
+          && looseKey(now.operator) === looseKey(target.operator)
+          && normalize(now.value) === target.value;
+        stable = pass ? stable + 1 : 0;
+        return stable >= 2;
+      }, 520, 20, `第 ${rowIndex + 1} 行确认`).catch(() => false);
+      if (ok) return true;
+      await sleep(FAST.afterInput + attempt * 20);
+    }
+
+    const last = readRowFast(rowIndex);
+    throw new Error(`第 ${rowIndex + 1} 行未有效：字段=${last.field}，操作符=${last.operator}，关键字=${last.value}`);
+  }
+
+  async function fillRuleFast(rowIndex, rule) {
+    await chooseSelectFast(rowIndex, 0, rule.field, getFieldSearch(rule.field) || rule.field);
+    await sleep(FAST.tiny);
+    await chooseSelectFast(rowIndex, 1, rule.operator, rule.operator);
+    await sleep(FAST.tiny);
+    await fillInputStable(rowIndex, rule.value);
+    await confirmRuleFast(rowIndex, rule);
+  }
+
+  async function verifyCompletedFast(count, rules) {
+    for (let i = 0; i < count; i += 1) {
+      await confirmRuleFast(i, rules[i]);
+    }
+  }
+
+  async function resetToOneRowFast() {
+    const modal = getAdvancedModal();
+    const reset = findButtonByText('重置', q(PATHS.modalAction, modal) || modal);
+    if (reset) {
+      clickElement(reset, '重置');
+      await sleep(120);
+    }
+
+    await waitFor(() => getRows().length >= 1, FAST.timeout, FAST.poll, '条件行');
+    let guard = 0;
+    while (getRows().length > 1 && guard < 30) {
+      const rows = getRows();
+      const last = rows[rows.length - 1];
+      const remove = findIconButton(PATHS.removeRowIconHref, last)
+        || qa('button', last).filter(isVisible).slice(-1)[0]
+        || q('button', last);
+      if (!remove) break;
+      clickElement(remove, '删除多余条件行');
+      await sleep(50);
+      guard += 1;
+    }
+  }
+
+  function findAddButtonFast() {
+    const modal = getAdvancedModal();
+    if (!modal) return null;
+    const nodes = qa('button, [role="button"], a, span, div', modal)
+      .filter(isVisible)
+      .filter(el => visibleText(el) === '添加条件' || visibleText(el).includes('添加条件'))
+      .sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        return (ra.width * ra.height) - (rb.width * rb.height);
+      });
+    const hit = nodes[0];
+    return hit ? (hit.closest('button,[role="button"],.n-button') || hit) : null;
+  }
+
+  async function clickAddConditionAfterValidFast(completedCount, rules) {
+    await verifyCompletedFast(completedCount, rules);
+    const before = getRows().length;
+    const add = findAddButtonFast();
+    if (!add) throw new Error('找不到“添加条件”');
+    clickElement(add, '添加条件');
+    await sleep(FAST.afterAdd);
+
+    await verifyCompletedFast(completedCount, rules);
+
+    const increased = await waitFor(() => getRows().length > before, FAST.shortTimeout, FAST.poll, '新增条件行').catch(() => false);
+    if (!increased) {
+      await verifyCompletedFast(completedCount, rules);
+      const retryAdd = findAddButtonFast();
+      if (!retryAdd) throw new Error('找不到“添加条件”');
+      clickElement(retryAdd, '添加条件重试');
+      await waitFor(() => getRows().length > before, FAST.timeout, FAST.poll, '新增条件行');
+      await sleep(FAST.afterAdd);
+      await verifyCompletedFast(completedCount, rules);
+    }
+  }
+
+  function findNextRowIndexFast(filledCount) {
+    const rows = getRows();
+    if (rows[filledCount]) return filledCount;
+    const blankIndex = rows.findIndex((row, index) => index >= filledCount && !normalize(q(PATHS.rowValueInput, row)?.value || ''));
+    return blankIndex >= 0 ? blankIndex : rows.length - 1;
+  }
+
+  async function fillAdvancedFilter({ apply }) {
+    if (!location.hash.includes('/account/index')) throw new Error('请先进入 CRM 客户列表页：/#/account/index');
+
+    const preset = getSelectedPreset();
+    const rules = cloneRules(preset.rules);
+    if (!rules.length) throw new Error('当前筛选组没有可填充条件');
+
+    await openAdvancedFilter();
+    await resetToOneRowFast();
+
+    for (let i = 0; i < rules.length; i += 1) {
+      if (i > 0) await clickAddConditionAfterValidFast(i, rules);
+      const rowIndex = findNextRowIndexFast(i);
+      await fillRuleFast(rowIndex, rules[i]);
+      await verifyCompletedFast(i + 1, rules);
+    }
+
+    if (apply) {
+      const modal = getAdvancedModal();
+      const filterButton = findButtonByText('筛选', q(PATHS.modalAction, modal) || modal);
+      if (!filterButton) throw new Error('找不到底部“筛选”按钮');
+      clickElement(filterButton, '筛选按钮');
+      await sleep(350);
+      setStatus(`已筛选：${preset.name}`, 'success');
+    } else {
+      setStatus(`已填充：${preset.name}`, 'success');
+    }
+  }
+
+  function readRulesFromOpenModal() {
+    const modal = getAdvancedModal();
+    if (!modal) throw new Error('未检测到高级筛选弹窗');
+    const rows = getRows();
+    if (!rows.length) throw new Error('未检测到筛选条件行');
+
+    const rules = [];
+    rows.forEach((row, index) => {
+      const selects = getRowSelects(row);
+      if (selects.length < 2) throw new Error(`第 ${index + 1} 行下拉数量不足：${describeRow(row)}`);
+      const field = getSelectPrimaryText(selects[0]);
+      const operator = getSelectPrimaryText(selects[1]);
+      const input = q(PATHS.rowValueInput, row);
+      const value = input ? normalize(input.value) : '';
+
+      if (!field || !operator) throw new Error(`第 ${index + 1} 行字段或操作符读取失败`);
+      if (!value && !/为空/.test(operator)) throw new Error(`第 ${index + 1} 行关键词为空`);
+      rules.push({ field, operator, value });
+    });
+
+    return cloneRules(rules);
+  }
+
+  async function saveCurrentFilterAsPreset() {
+    await openAdvancedFilter();
+    await sleep(120);
+    const rules = readRulesFromOpenModal();
+    const store = state.store || loadStore();
+
+    const duplicate = store.presets.find(item => sameRules(item.rules, rules));
+    if (duplicate) {
+      store.selectedId = duplicate.id;
+      saveStore();
+      renderPresetSelect();
+      setStatus(`当前筛选条件已存在：${duplicate.name}`, 'success');
+      return;
+    }
+
+    const name = getNextPresetName();
+    const item = {
+      id: `preset_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+      name,
+      rules,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    store.presets.push(item);
+    store.selectedId = item.id;
+    saveStore();
+    renderPresetSelect();
+    setStatus(`已保存当前筛选为：${name}`, 'success');
+  }
+
+  function renameSelectedPreset() {
+    const store = state.store || loadStore();
+    const preset = getSelectedPreset();
+    if (!preset) return;
+    const name = normalize(window.prompt('请输入新的筛选组名称', preset.name));
+    if (!name) {
+      setStatus('已取消重命名', 'info');
+      return;
+    }
+    preset.name = name;
+    preset.updatedAt = Date.now();
+    store.selectedId = preset.id;
+    saveStore();
+    renderPresetSelect();
+    setStatus(`已重命名为：${name}`, 'success');
+  }
+
+
+  function deleteSelectedPreset() {
+    const store = state.store || loadStore();
+    const preset = getSelectedPreset();
+    if (!preset) return;
+
+    if (preset.id === DEFAULT_PRESET_ID) {
+      setStatus('默认筛选组“RR收集”已保留，不删除', 'warn');
+      return;
+    }
+
+    if (store.presets.length <= 1) {
+      setStatus('至少需要保留一个筛选组', 'warn');
+      return;
+    }
+
+    const ok = window.confirm(`确认删除筛选组“${preset.name}”？`);
+    if (!ok) {
+      setStatus('已取消删除', 'info');
+      return;
+    }
+
+    const oldIndex = store.presets.findIndex(item => item.id === preset.id);
+    store.presets = store.presets.filter(item => item.id !== preset.id);
+    const next = store.presets[Math.max(0, Math.min(oldIndex, store.presets.length - 1))] || store.presets[0];
+    store.selectedId = next.id;
+    saveStore();
+    renderPresetSelect();
+    setStatus(`已删除筛选组：${preset.name}`, 'success');
+  }
+
+  function formatRulesForDisplay(rules) {
+    const grouped = new Map();
+    cloneRules(rules).forEach(rule => {
+      if (!grouped.has(rule.field)) grouped.set(rule.field, new Map());
+      const byOperator = grouped.get(rule.field);
+      if (!byOperator.has(rule.operator)) byOperator.set(rule.operator, []);
+      byOperator.get(rule.operator).push(rule.value || '');
+    });
+
+    const lines = [];
+    grouped.forEach((byOperator, field) => {
+      const parts = [];
+      byOperator.forEach((values, operator) => {
+        const cleanValues = values.filter(Boolean);
+        parts.push(`${operator}：${cleanValues.length ? cleanValues.join('、') : '空值'}`);
+      });
+      lines.push(`${field}：${parts.join('；')}`);
+    });
+    return lines.join('\n');
+  }
+
+  function formatRulesRaw(rules) {
+    return cloneRules(rules).map(rule => `${rule.field}\t${rule.operator}\t${rule.value || ''}`).join('\n');
+  }
+
+  function updateKeywordPreview(toggle = true) {
+    if (!keywordBox) return;
+    const preset = getSelectedPreset();
+    if (!preset) return;
+
+    if (toggle) {
+      keywordBox.style.display = keywordBox.style.display === 'none' ? '' : 'none';
+    }
+    if (keywordBox.style.display === 'none') return;
+
+    keywordBox.innerHTML = '';
+
+    const title = document.createElement('div');
+    title.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;gap:6px;';
+    const name = document.createElement('strong');
+    name.textContent = preset.name;
+    const copy = createButton('复制关键词', () => copyPresetKeywords(), 'quiet', 'toggle');
+    copy.style.padding = '4px 6px';
+    title.append(name, copy);
+
+    const content = document.createElement('pre');
+    content.textContent = formatRulesForDisplay(preset.rules);
+    content.style.cssText = [
+      'margin:0',
+      'padding:6px',
+      'background:#fbfcfd',
+      'border:1px solid #e4ebef',
+      'border-radius:3px',
+      'white-space:pre-wrap',
+      'word-break:break-word',
+      'font-family:Arial,"Microsoft YaHei",sans-serif',
+      'font-size:12px',
+      'line-height:1.45',
+      'color:#344054'
+    ].join(';');
+
+    keywordBox.append(title, content);
+  }
+
+  async function copyPresetKeywords() {
+    const preset = getSelectedPreset();
+    if (!preset) return;
+    const text = formatRulesRaw(preset.rules);
+    const ok = await writeClipboard(text);
+    setStatus(ok ? `已复制关键词：${preset.name}` : '自动复制失败，请手动复制关键词', ok ? 'success' : 'warn');
+  }
+
+  function fallbackClipboard(text) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', 'readonly');
+    area.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0;';
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch (_) {
+      ok = false;
+    }
+    area.remove();
+    return ok;
+  }
+
+  async function writeClipboard(text) {
+    const value = String(text || '');
+    if (!value) return false;
+
+    try {
+      if (typeof GM_setClipboard === 'function') {
+        GM_setClipboard(value, 'text');
+        return true;
+      }
+    } catch (_) {}
+
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch (_) {}
+
+    return fallbackClipboard(value);
+  }
+
+  async function runAction(label, task) {
+    if (state.running) {
+      setStatus(`正在执行“${state.currentAction || '任务'}”，本次点击已忽略`, 'warn');
+      return;
+    }
+    setBusy(true, label);
+    setStatus(`正在执行：${label}`, 'info');
+    try {
+      await task();
+    } catch (error) {
+      setStatus(`异常：${error && error.message ? error.message : error}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function createButton(text, onClick, variant = 'normal', role = '') {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    button.dataset.role = role;
+    const styles = {
+      normal: ['#d9e2e7', '#ffffff', '#315b72'],
+      primary: ['#6aa5b8', '#eaf6f9', '#21576b'],
+      quiet: ['#e4e8eb', '#f8fafb', '#667085'],
+      danger: ['#efd1ca', '#fff7f5', '#9f2d2d']
+    }[variant] || ['#d9e2e7', '#ffffff', '#315b72'];
+    button.style.cssText = [
+      `border:1px solid ${styles[0]}`,
+      `background:${styles[1]}`,
+      `color:${styles[2]}`,
+      'border-radius:3px',
+      'padding:6px 7px',
+      'font-size:12px',
+      'line-height:1',
+      'cursor:pointer',
+      'min-height:30px',
+      'box-sizing:border-box',
+      'white-space:nowrap'
+    ].join(';');
+    button.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      onClick();
+    }, true);
+    if (role !== 'toggle') actionButtons.push(button);
+    return button;
+  }
+
+  function enableDrag() {
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    headerBar.addEventListener('mousedown', event => {
+      if (event.target.tagName === 'BUTTON') return;
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      offsetX = event.clientX - rect.left;
+      offsetY = event.clientY - rect.top;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      event.preventDefault();
+    });
+
+    document.addEventListener('mousemove', event => {
+      if (!dragging) return;
+      const left = Math.max(4, Math.min(window.innerWidth - panel.offsetWidth - 4, event.clientX - offsetX));
+      const top = Math.max(4, Math.min(window.innerHeight - panel.offsetHeight - 4, event.clientY - offsetY));
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
+    });
+
+    document.addEventListener('mouseup', () => {
+      dragging = false;
+    });
+  }
+
+  function showReopenHandle() {
+    if (reopenHandle) {
+      reopenHandle.style.display = '';
+      return;
+    }
+    reopenHandle = document.createElement('button');
+    reopenHandle.type = 'button';
+    reopenHandle.textContent = 'CRM筛选';
+    reopenHandle.style.cssText = [
+      'position:fixed',
+      'right:14px',
+      'bottom:14px',
+      'z-index:2147483647',
+      'border:1px solid #b9d4dc',
+      'background:#f7fbfc',
+      'color:#236070',
+      'border-radius:4px',
+      'padding:7px 10px',
+      'font-size:12px',
+      'cursor:pointer',
+      'box-shadow:0 6px 18px rgba(15,45,65,.12)'
+    ].join(';');
+    reopenHandle.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (panel) panel.style.display = '';
+      reopenHandle.style.display = 'none';
+    }, true);
+    document.body.appendChild(reopenHandle);
+  }
+
+  function closePanel() {
+    if (panel) panel.style.display = 'none';
+    showReopenHandle();
+  }
+
+  function mountPanel() {
+    if (panel || !document.body) return;
+    loadStore();
+
+    panel = document.createElement('div');
+    panel.id = 'crm-advanced-filter-panel';
+    panel.style.cssText = [
+      'position:fixed',
+      'right:14px',
+      'bottom:14px',
+      'z-index:2147483647',
+      'width:312px',
+      'background:#ffffff',
+      'border:1px solid #d7e1e7',
+      'box-shadow:0 8px 20px rgba(15,45,65,.12)',
+      'border-radius:4px',
+      'font-family:Arial,"Microsoft YaHei",sans-serif',
+      'font-size:12px',
+      'color:#344054',
+      'box-sizing:border-box',
+      'overflow:hidden'
+    ].join(';');
+
+    headerBar = document.createElement('div');
+    headerBar.style.cssText = [
+      'height:32px',
+      'display:flex',
+      'align-items:center',
+      'justify-content:space-between',
+      'padding:0 8px 0 10px',
+      'background:#f8fafb',
+      'border-bottom:1px solid #e4ebef',
+      'cursor:move',
+      'user-select:none'
+    ].join(';');
+
+    const title = document.createElement('div');
+    title.innerHTML = `<strong style="font-size:12px;color:#273b49;">${SCRIPT_NAME}</strong><span style="margin-left:6px;color:#8a98a5;">v${VERSION}</span>`;
+
+    const headerActions = document.createElement('div');
+    headerActions.style.cssText = 'display:flex;gap:5px;align-items:center;';
+    const collapse = createButton('收起', () => {
+      panelBody.style.display = panelBody.style.display === 'none' ? '' : 'none';
+      collapse.textContent = panelBody.style.display === 'none' ? '展开' : '收起';
+    }, 'quiet', 'toggle');
+    const closeBtn = createButton('关闭', closePanel, 'quiet', 'toggle');
+    headerActions.append(collapse, closeBtn);
+    headerBar.append(title, headerActions);
+
+    panelBody = document.createElement('div');
+    panelBody.style.cssText = 'padding:8px 10px 10px;';
+
+    const label = document.createElement('div');
+    label.textContent = '当前筛选组';
+    label.style.cssText = 'font-weight:600;color:#344054;margin-bottom:5px;';
+
+    presetSelect = document.createElement('select');
+    presetSelect.style.cssText = [
+      'width:100%',
+      'height:30px',
+      'box-sizing:border-box',
+      'border:1px solid #d7e1e7',
+      'border-radius:3px',
+      'background:#fff',
+      'color:#344054',
+      'font-size:12px',
+      'outline:none',
+      'padding:0 6px',
+      'margin-bottom:7px'
+    ].join(';');
+    presetSelect.addEventListener('change', () => {
+      const store = state.store || loadStore();
+      store.selectedId = presetSelect.value;
+      saveStore();
+      updateKeywordPreview(false);
+      setStatus(`当前筛选组：${getSelectedPreset().name}`, 'info');
+    });
+
+    const actions1 = document.createElement('div');
+    actions1.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:6px;';
+    actions1.append(
+      createButton('只填充', () => runAction('只填充', () => fillAdvancedFilter({ apply: false })), 'normal'),
+      createButton('筛选', () => runAction('筛选', () => fillAdvancedFilter({ apply: true })), 'primary')
+    );
+
+    const actions2 = document.createElement('div');
+    actions2.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:7px;';
+    actions2.append(
+      createButton('保存新增筛选', () => runAction('保存新增筛选', saveCurrentFilterAsPreset), 'normal'),
+      createButton('重命名', renameSelectedPreset, 'quiet'),
+      createButton('查看关键词', () => updateKeywordPreview(true), 'quiet'),
+      createButton('删除', deleteSelectedPreset, 'danger')
+    );
+
+    statusBox = document.createElement('div');
+    statusBox.style.cssText = [
+      'margin:0',
+      'padding:6px 7px',
+      'border-radius:3px',
+      'background:#f3f7fa',
+      'color:#315b72',
+      'line-height:1.35',
+      'border:1px solid #e4ebef'
+    ].join(';');
+
+    keywordBox = document.createElement('div');
+    keywordBox.style.cssText = 'display:none;margin-top:7px;';
+
+    panelBody.append(label, presetSelect, actions1, actions2, statusBox, keywordBox);
+    panel.append(headerBar, panelBody);
+    document.body.appendChild(panel);
+    enableDrag();
+    renderPresetSelect();
+    setStatus(`待命｜当前筛选组：${getSelectedPreset().name}`, 'info');
+  }
+
+  function boot() {
+    if (!location.host.includes('106.53.55.11:8081')) return;
+    mountPanel();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+
+  window.CRMAdvancedFilterPresetFill = {
+    version: VERSION,
+    paths: PATHS,
+    getStore: () => JSON.parse(JSON.stringify(state.store || loadStore())),
+    fillOnly: () => runAction('只填充', () => fillAdvancedFilter({ apply: false })),
+    fillAndFilter: () => runAction('筛选', () => fillAdvancedFilter({ apply: true })),
+    saveCurrent: () => runAction('保存新增筛选', saveCurrentFilterAsPreset),
+    deleteCurrent: deleteSelectedPreset
+  };
+})();
