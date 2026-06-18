@@ -1,0 +1,1201 @@
+// ==UserScript==
+// @name         Snov 搜索筛选 v8.1.16
+// @namespace    https://app.snov.io/
+// @version      8.1.16
+// @description  适用于新版 domain-search 页面；v8.1.15 兼容新版职位搜索框结构 ps__form/ps__top-target-input，修复选中第一个关键词后找不到输入框的问题
+// @match        https://app.snov.io/domain-search*
+// @exclude      https://app.snov.io/prospects/list/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+  "use strict";
+
+  // ===================== 关键词配置 =====================
+  const kwsText = `
+packaging
+package
+procurement
+purchasing
+buyer
+sourcing
+category
+vendor
+supply
+material
+materials
+demand
+inventory
+mrp
+Manager
+planning
+CEO
+President
+Chief
+Director
+supplier
+managing
+VP
+executive
+  `.trim();
+
+  const DIRECT_PASS_MAX = 5;
+  const MID_FILTER_MIN = 6;
+  const MID_FILTER_MAX = 15;
+  const LARGE_FILTER_STOP_MAX = 120;
+  const SECOND_PASS_EXCLUDES = ["manager", "managing", "director"];
+
+  const CFG = {
+    typeIntervalMs: [5, 15],
+    afterSearchWaitMs: [1200, 1800],
+    pageChangeExtraWaitMs: [900, 1500],
+    waitChangeTimeoutMs: 30000,
+    waitTopSearchReadyMs: 20000,
+    waitCreateEnableMs: 12000,
+    waitListAppearMs: 45000,
+    selectApplyWaitMs: 12000,
+    pollMs: 250,
+    toastDurationMs: 3000,
+    maxPageLoop: 120
+  };
+
+  const PANEL_FLAG = "__SN_CONSOLE_PANEL_V8110__";
+  const PANEL_OB_FLAG = "__SN_PANEL_OBSERVER_V8110__";
+  const panelId = "__sn_console_panel_v8110__";
+  const styleId = "__sn_console_panel_v8110_style__";
+  const toastWrapId = "__snov_toast_wrap_v8110__";
+  const STATUS_STORE_KEY = "__SN_STATUS_HISTORY_V8110__";
+  const LISTNAME_STORE_KEY = "__SN_LISTNAME_V8110__";
+  const MAX_STATUS_LINES = 160;
+
+  if (!/^https:\/\/app\.snov\.io\/domain-search/i.test(location.href)) return;
+  if (/^https:\/\/app\.snov\.io\/prospects\/list\//i.test(location.href)) return;
+  if (window[PANEL_FLAG]) return;
+  window[PANEL_FLAG] = true;
+
+  // ===================== 基础工具 =====================
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rand = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
+  const rands = ([a, b]) => rand(a, b);
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const lower = (s) => norm(s).toLowerCase();
+  const isVisible = (el) => !!(el && el.isConnected && el.offsetParent !== null);
+  const firstVisible = (nodes) => Array.from(nodes || []).find(isVisible) || null;
+
+  const parseIntSafe = (txt) => {
+    const m = String(txt || "").replace(/[\s,]/g, "").match(/\d+/);
+    return m ? parseInt(m[0], 10) : 0;
+  };
+
+  const waitFor = async (cond, timeoutMs, pollMs = CFG.pollMs) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      try {
+        if (cond()) return true;
+      } catch (_) {}
+      await sleep(pollMs);
+    }
+    return false;
+  };
+
+  const safeClick = (el) => {
+    if (!el || !document.contains(el)) return false;
+    try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (_) {}
+    try { el.click(); return true; } catch (_) {}
+    try {
+      el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+      el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+      el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+      return true;
+    } catch (_) {}
+    return false;
+  };
+
+  const setNativeValue = (element, value) => {
+    const proto = Object.getPrototypeOf(element);
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc?.set) desc.set.call(element, value);
+    else element.value = value;
+  };
+
+  const fireInputEvents = (input) => {
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+
+  const fireKeySequence = (el, key, code = key, keyCode = 0) => {
+    try {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key, code, which: keyCode, keyCode, bubbles: true, cancelable: true }));
+      el.dispatchEvent(new KeyboardEvent("keypress", { key, code, which: keyCode, keyCode, bubbles: true, cancelable: true }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { key, code, which: keyCode, keyCode, bubbles: true, cancelable: true }));
+    } catch (_) {}
+  };
+
+  const pressEnter = (el) => {
+    fireKeySequence(el, "Enter", "Enter", 13);
+  };
+
+  const pressArrowDown = (el) => {
+    try {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", which: 40, keyCode: 40, bubbles: true, cancelable: true }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { key: "ArrowDown", code: "ArrowDown", which: 40, keyCode: 40, bubbles: true, cancelable: true }));
+    } catch (_) {}
+  };
+
+  const pressEscape = (el) => {
+    try {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", which: 27, keyCode: 27, bubbles: true, cancelable: true }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { key: "Escape", code: "Escape", which: 27, keyCode: 27, bubbles: true, cancelable: true }));
+    } catch (_) {}
+  };
+
+  const pressBackspace = (el) => {
+    try {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Backspace", code: "Backspace", which: 8, keyCode: 8, bubbles: true, cancelable: true }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { key: "Backspace", code: "Backspace", which: 8, keyCode: 8, bubbles: true, cancelable: true }));
+    } catch (_) {}
+  };
+
+  const fireBeforeInput = (el, data) => {
+    try {
+      el.dispatchEvent(new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data
+      }));
+    } catch (_) {}
+  };
+
+  const fireTextInput = (el, data) => {
+    try {
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        cancelable: false,
+        inputType: "insertText",
+        data
+      }));
+    } catch (_) {
+      fireInputEvents(el);
+    }
+  };
+
+  const getNowTime = () => {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
+
+  let statusHistory = (() => {
+    try {
+      const raw = sessionStorage.getItem(STATUS_STORE_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.slice(-MAX_STATUS_LINES) : [];
+    } catch (_) {
+      return [];
+    }
+  })();
+
+  const persistStatusHistory = () => {
+    try { sessionStorage.setItem(STATUS_STORE_KEY, JSON.stringify(statusHistory.slice(-MAX_STATUS_LINES))); } catch (_) {}
+  };
+
+  const renderStatusHistory = () => {
+    const el = document.querySelector(`#${panelId} .status`);
+    if (!el) return;
+    if (!statusHistory.length) {
+      el.textContent = "等待点击按钮…";
+      return;
+    }
+    el.textContent = statusHistory.join("\n");
+    el.scrollTop = el.scrollHeight;
+  };
+
+  const pushStatusLines = (msg) => {
+    const lines = String(msg || "").split(/\r?\n/).filter(Boolean);
+    if (!lines.length) return;
+    const stamp = `[${getNowTime()}] `;
+    statusHistory.push(stamp + lines[0]);
+    for (let i = 1; i < lines.length; i++) statusHistory.push(`    ${lines[i]}`);
+    if (statusHistory.length > MAX_STATUS_LINES) statusHistory = statusHistory.slice(-MAX_STATUS_LINES);
+    persistStatusHistory();
+    renderStatusHistory();
+  };
+
+  // ===================== 提示弹窗 =====================
+  const ensureToastWrap = () => {
+    let wrap = document.getElementById(toastWrapId);
+    if (wrap) return wrap;
+    wrap = document.createElement("div");
+    wrap.id = toastWrapId;
+    document.body.appendChild(wrap);
+    return wrap;
+  };
+
+  const showToast = (type, text) => {
+    const wrap = ensureToastWrap();
+    const toast = document.createElement("div");
+    toast.className = `snov-toast ${type === "error" ? "is-error" : "is-success"}`;
+    toast.textContent = text;
+    wrap.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add("show"));
+    setTimeout(() => {
+      toast.classList.remove("show");
+      setTimeout(() => toast.remove(), 260);
+    }, CFG.toastDurationMs);
+  };
+
+  const showSuccessToast = (txt = "✅ 筛选完成") => showToast("success", txt);
+  const showErrorToast = (txt = "❌ 运行错误") => showToast("error", txt);
+
+  // ===================== 面板 =====================
+  const setStatus = (t) => {
+    pushStatusLines(t);
+  };
+
+  const setBusy = (busy) => {
+    const runBtn = document.getElementById("__sn_run_btn__");
+    const addBtn = document.getElementById("__sn_add_btn__");
+    const tag = document.getElementById("__sn_run_tag__");
+    if (runBtn) runBtn.disabled = busy;
+    if (addBtn) addBtn.disabled = busy;
+    if (tag) tag.textContent = busy ? "运行中" : "就绪";
+  };
+
+  const makeDraggable = (panel, handle) => {
+    let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
+    const onDown = (e) => {
+      if (e.button !== 0) return;
+      dragging = true;
+      sx = e.clientX;
+      sy = e.clientY;
+      const rect = panel.getBoundingClientRect();
+      sl = rect.left;
+      st = rect.top;
+      e.preventDefault();
+    };
+    const onMove = (e) => {
+      if (!dragging) return;
+      const left = Math.max(0, Math.min(window.innerWidth - 60, sl + e.clientX - sx));
+      const top = Math.max(0, Math.min(window.innerHeight - 40, st + e.clientY - sy));
+      panel.style.left = left + "px";
+      panel.style.top = top + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+    };
+    const onUp = () => { dragging = false; };
+    handle.addEventListener("mousedown", onDown);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const getPanelListName = () => (document.getElementById("__sn_listname__")?.value || "").trim().slice(0, 80);
+
+  const injectStyle = () => {
+    if (document.getElementById(styleId)) return;
+    const s = document.createElement("style");
+    s.id = styleId;
+    s.textContent = `
+      #${panelId}{
+        position:fixed; right:12px; bottom:12px; z-index:999999;
+        width:252px; background:#2b2b2b; color:#f5f7fb;
+        border:1px solid rgba(255,255,255,.10); border-radius:14px;
+        box-shadow:0 14px 36px rgba(0,0,0,.34);
+        font:12px/1.38 "Segoe UI",Arial,sans-serif;
+        user-select:none; overflow:hidden;
+      }
+      #${panelId}, #${panelId} *{ box-sizing:border-box; }
+      #${panelId} .hdr{
+        padding:8px 10px 7px; cursor:move; font-weight:700;
+        display:flex; align-items:center; justify-content:space-between;
+        border-bottom:1px solid rgba(255,255,255,.08);
+        background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.01));
+      }
+      #${panelId} .body{ padding:9px 10px 10px; }
+      #${panelId} .row{ display:flex; gap:8px; }
+      #${panelId} button{
+        flex:1; height:32px; padding:0 10px; border-radius:11px;
+        border:1px solid rgba(255,255,255,.14);
+        background:rgba(255,255,255,.06); color:#f5f7fb; cursor:pointer;
+        font-weight:600;
+      }
+      #${panelId} button:hover{ background:rgba(255,255,255,.14); }
+      #${panelId} button:disabled{ opacity:.48; cursor:not-allowed; }
+      #${panelId} .status{
+        margin-top:8px; padding:8px 9px; border-radius:11px;
+        border:1px solid rgba(255,255,255,.06);
+        background:rgba(255,255,255,.05);
+        white-space:pre-wrap; user-select:text; overflow:auto;
+        height:154px; min-height:154px; max-height:154px;
+        font-size:11px; line-height:1.48;
+        scrollbar-width:thin;
+      }
+      #${panelId} .tag{ font-size:11px; opacity:.88; font-weight:600; }
+      #${panelId} .x{
+        width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center;
+        border-radius:8px; border:1px solid rgba(255,255,255,.14);
+        background:rgba(255,255,255,.06); cursor:pointer;
+        font-size:14px; line-height:1;
+      }
+      #${panelId} .x:hover{ background:rgba(255,255,255,.14); }
+      #${panelId} .lbl{ font-size:11px; opacity:.86; margin:4px 0 4px; font-weight:600; }
+      #${panelId} input{
+        width:100%; border-radius:11px; border:1px solid rgba(255,255,255,.14);
+        background:rgba(255,255,255,.05); color:#f5f7fb;
+        padding:7px 10px; outline:none; user-select:text;
+      }
+      #${panelId} input:focus{ border-color:rgba(255,255,255,.26); background:rgba(255,255,255,.07); }
+      #${toastWrapId}{
+        position:fixed; top:18px; right:18px; z-index:2147483647;
+        display:flex; flex-direction:column; gap:10px; pointer-events:none;
+      }
+      #${toastWrapId} .snov-toast{
+        min-width:180px; max-width:320px; padding:12px 16px;
+        border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,.18);
+        color:#fff; font:14px/1.4 sans-serif;
+        transform:translateY(-8px); opacity:0;
+        transition:all .22s ease; backdrop-filter:blur(6px);
+      }
+      #${toastWrapId} .snov-toast.show{ transform:translateY(0); opacity:1; }
+      #${toastWrapId} .snov-toast.is-success{ background:rgba(19,163,95,.95); }
+      #${toastWrapId} .snov-toast.is-error{ background:rgba(230,72,72,.95); }
+    `;
+    document.head.appendChild(s);
+  };
+
+  const applyNoHistoryToListInput = (input) => {
+    if (!input) return;
+    input.setAttribute("type", "text");
+    input.setAttribute("name", "snov_listname_no_history");
+    input.setAttribute("autocomplete", "new-password");
+    input.setAttribute("autocapitalize", "off");
+    input.setAttribute("autocorrect", "off");
+    input.setAttribute("spellcheck", "false");
+    input.readOnly = true;
+    const unlock = () => { input.readOnly = false; };
+    input.addEventListener("mousedown", unlock, { once: true });
+    input.addEventListener("focus", unlock, { once: true });
+  };
+
+  const createPanel = () => {
+    injectStyle();
+    if (document.getElementById(panelId)) return;
+    const p = document.createElement("div");
+    p.id = panelId;
+    p.innerHTML = `
+      <div class="hdr">
+        <div>Snov 筛选 <span class="tag" id="__sn_run_tag__">就绪</span></div>
+        <div class="x" id="__sn_close__" title="移除">×</div>
+      </div>
+      <div class="body">
+        <div class="lbl">新列表名称：</div>
+        <input id="__sn_listname__" type="text" placeholder="例如：Croda.cod" />
+        <div class="row" style="margin-top:8px;">
+          <button id="__sn_run_btn__">运行筛选</button>
+          <button id="__sn_add_btn__">加入列表</button>
+        </div>
+        <div class="status">等待点击按钮…</div>
+      </div>
+    `;
+    document.body.appendChild(p);
+    const listInput = p.querySelector("#__sn_listname__");
+    applyNoHistoryToListInput(listInput);
+    try { listInput.value = sessionStorage.getItem(LISTNAME_STORE_KEY) || ""; } catch (_) {}
+    listInput.addEventListener("input", () => {
+      try { sessionStorage.setItem(LISTNAME_STORE_KEY, listInput.value || ""); } catch (_) {}
+    });
+    makeDraggable(p, p.querySelector(".hdr"));
+    renderStatusHistory();
+
+    p.querySelector("#__sn_close__").addEventListener("click", () => {
+      p.remove();
+      delete window[PANEL_FLAG];
+    });
+    p.querySelector("#__sn_run_btn__").addEventListener("click", () => runFilter());
+    p.querySelector("#__sn_add_btn__").addEventListener("click", () => addToList());
+  };
+
+  const keepAlive = () => {
+    if (window[PANEL_OB_FLAG]) return;
+    window[PANEL_OB_FLAG] = true;
+    const mo = new MutationObserver(() => {
+      if (!document.getElementById(panelId) && window[PANEL_FLAG]) createPanel();
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+  };
+
+  // ===================== 页面定位 =====================
+  const getPotentialTab = () => {
+    const cands = Array.from(document.querySelectorAll(".tabs-nav__item, .tabs-nav__item-inner")).filter(isVisible);
+    return cands.find(el => /潜在客户/.test(norm(el.innerText || el.textContent || ""))) || null;
+  };
+
+  const getPotentialTabLi = () => {
+    const tab = getPotentialTab();
+    return (tab?.closest("li")) || tab || null;
+  };
+
+  const hasPotentialCountBadge = () => {
+    const tab = getPotentialTab();
+    return !!(tab && (tab.querySelector(".badge__text--number") || tab.querySelector(".badge__text")));
+  };
+
+  const getPotentialTabCount = () => {
+    const tab = getPotentialTab();
+    if (!tab) return -1;
+    const badge = tab.querySelector(".badge__text--number") || tab.querySelector(".badge__text");
+    if (badge) {
+      const txt = norm(badge.textContent || "");
+      return /\d/.test(txt) ? parseIntSafe(txt) : -1;
+    }
+    const txt = norm(tab.textContent || "");
+    const m = txt.match(/潜在客户\D*(\d+)/);
+    return m ? parseInt(m[1], 10) : -1;
+  };
+
+  const getProspectsSearchRoot = () => firstVisible(document.querySelectorAll(".ps__filter, .ps__form, .ps"));
+
+  const getKeywordInput = () => {
+    const root = getProspectsSearchRoot();
+    const accept = (el) => {
+      if (!el || el.closest(`#${panelId}`)) return false;
+      const ph = String(el.getAttribute("placeholder") || "");
+      if (/输入新列表名称/.test(ph)) return false;
+      if (el.matches?.(".ps__top-target-input")) return true;
+      if (el.closest(".ps__filter, .ps__form, .ps__top-target, .ps__select")) return true;
+      if (/按职位搜索/.test(ph)) return true;
+      if (el.closest(".multiselect, .multiselect__input-box, .ps__input-box")) return true;
+      return false;
+    };
+
+    const scoped = root
+      ? Array.from(root.querySelectorAll('input.ps__top-target-input, input, textarea')).filter(el => isVisible(el) && accept(el))
+      : [];
+    if (scoped[0]) return scoped[0];
+
+    return Array.from(document.querySelectorAll('.ps__top-target-input, .ps__form input, .ps__select input, .ps__filter input, .multiselect__input-box input, .ps__input-box input, input[placeholder*="按职位搜索"], input[maxlength="50"], input[type="text"]'))
+      .filter(el => isVisible(el) && accept(el))[0] || null;
+  };
+
+  const waitKeywordInputReady = async (label = "按职位搜索") => {
+    const ok = await waitFor(() => !!getKeywordInput(), 8000, 120);
+    if (!ok) throw new Error(`没找到【${label}】输入框`);
+    return getKeywordInput();
+  };
+
+  const getSearchBtn = () => {
+    const inPs = firstVisible(document.querySelectorAll('.ps__form button.ps__submit-btn[data-test="snov-btn"], .ps__form button.ps__submit-btn, .ps__filter button.ps__search-btn[data-test="snov-btn"], .ps__filter button.ps__search-btn'));
+    if (inPs) return inPs;
+    return Array.from(document.querySelectorAll('button[data-test="snov-btn"], button'))
+      .filter(isVisible)
+      .find(b => norm(b.innerText || "") === "搜索") || null;
+  };
+
+  const getTopDomainInput = () => {
+    return firstVisible(document.querySelectorAll(
+      'input[data-test="domain-name"], input.dci__input[data-test="domain-name"], .dci input.dci__input, .dc__searching-box input.dci__input, .dc__searching-box input[data-test="domain-name"]'
+    ));
+  };
+
+  const getTopSearchSubmitBtn = () => {
+    return firstVisible(document.querySelectorAll(
+      'button[data-test="domain-search-start-search"], button.dci__submit-btn[data-test="domain-search-start-search"], .dci__input-row button.dci__submit-btn'
+    ));
+  };
+
+  const getTopSearchBarReady = () => {
+    const input = getTopDomainInput()
+      || firstVisible(document.querySelectorAll('.dci input, .dc__searching-box input, input[placeholder*="请输入"], input[placeholder*="网址"], input[placeholder*="域名"]'));
+    const submit = getTopSearchSubmitBtn();
+    return { input, submit, ready: !!input || !!submit };
+  };
+
+  const triggerTopSearchSubmit = async () => {
+    const { input, submit } = getTopSearchBarReady();
+    if (submit) {
+      setStatus("二次筛选：使用顶部搜索箭头重置...");
+      safeClick(submit);
+      return "button";
+    }
+    if (input) {
+      setStatus("二次筛选：顶部搜索箭头不存在，改为对顶部输入框发送回车...");
+      try { input.focus(); } catch (_) {}
+      pressEnter(input);
+      return "enter";
+    }
+    throw new Error("没找到顶部域名输入框，也没找到顶部搜索箭头");
+  };
+
+  const getRows = () => Array.from(document.querySelectorAll("tbody tr.row")).filter(isVisible);
+  const getRowSignature = () => getRows().slice(0, 3).map(el => norm(el.innerText || "").slice(0, 140)).join("|");
+
+  const getSelectedCount = () => {
+    const countEl = firstVisible(document.querySelectorAll('.pt__selected-count'));
+    const txt = norm(countEl?.innerText || countEl?.textContent || "");
+    const m = txt.match(/已选择\s*(\d+)\s*个/);
+    if (m) return parseInt(m[1], 10);
+    const header = firstVisible(document.querySelectorAll("thead tr.pt__header, thead tr.pt__header--selected"));
+    const txt2 = norm(header?.innerText || "");
+    const m2 = txt2.match(/已选择\s*(\d+)\s*个/);
+    return m2 ? parseInt(m2[1], 10) : 0;
+  };
+
+  const getFilteredTotalCount = () => {
+    const countEl = firstVisible(document.querySelectorAll('.pt__selected-count'));
+    const txt = norm(countEl?.innerText || countEl?.textContent || "");
+    let m = txt.match(/共\s*(\d+)\s*个/);
+    if (m) return parseInt(m[1], 10);
+
+    const headerCountEl = firstVisible(document.querySelectorAll('th.pt__th--name .pt__count, .pt__th--name .pt__count'));
+    const headerCountTxt = norm(headerCountEl?.innerText || headerCountEl?.textContent || "");
+    m = headerCountTxt.match(/\((\d+)\)/);
+    if (m) return parseInt(m[1], 10);
+
+    const header = firstVisible(document.querySelectorAll('thead tr.pt__header, thead tr.pt__header--selected'));
+    const txt2 = norm(header?.innerText || header?.textContent || "");
+    m = txt2.match(/潜在客户\s*\((\d+)\)/);
+    if (m) return parseInt(m[1], 10);
+
+    const rows = getRows().length;
+    if (rows > 0) return rows;
+
+    return getPotentialTabCount();
+  };
+
+  const waitForUsableFilteredCount = async (phaseLabel = "筛选结果") => {
+    let count = getFilteredTotalCount();
+    if (count > 0) return count;
+    setStatus(`${phaseLabel}：人数暂未就绪，继续等待...`);
+    await waitFor(() => getFilteredTotalCount() > 0 || getRows().length > 0, 12000, 200);
+    count = getFilteredTotalCount();
+    if (count > 0) return count;
+    const rows = getRows().length;
+    return rows > 0 ? rows : -1;
+  };
+
+  const getSaveToListBtn = () => {
+    return Array.from(document.querySelectorAll('button.pl-select__top-target[data-test="snov-btn"], button.pl-select__top-target, button[data-test="snov-btn"], button'))
+      .filter(isVisible)
+      .find(b => /保存到列表/.test(norm(b.innerText || ""))) || null;
+  };
+
+  const getCreateListInput = () => firstVisible(document.querySelectorAll('input[placeholder*="输入新列表名称"]'));
+
+  const getCreateBtn = () => {
+    return Array.from(document.querySelectorAll("button.search-input__submit-btn[data-test='snov-btn'], button.search-input__submit-btn, button[data-test='snov-btn'], button"))
+      .filter(isVisible)
+      .find(b => norm(b.innerText || "") === "创建") || null;
+  };
+
+  const isBtnEnabled = (btn) => {
+    if (!btn) return false;
+    const cls = btn.className || "";
+    const aria = String(btn.getAttribute("aria-disabled") || "").toLowerCase();
+    return !(btn.disabled || cls.includes("disabled") || aria === "true");
+  };
+
+  const findListItemByName = (name) => {
+    const target = norm(name).toUpperCase();
+    if (!target) return null;
+    const items = Array.from(document.querySelectorAll("ul.pl-select__list li.pl-select__item, .pl-select__dropdown li, .pl-select__dropdown [role='option']")).filter(isVisible);
+    return items.find(li => norm(li.innerText || "").toUpperCase() === target) || null;
+  };
+
+  const getPagination = () => firstVisible(document.querySelectorAll(".pagination.prospects-pagination"));
+  const getCurrentPageBtn = () => firstVisible(document.querySelectorAll('.pagination.prospects-pagination .pagination__value.pagination__value--selected'));
+  const getCurrentPageNumber = () => parseIntSafe(getCurrentPageBtn()?.innerText || "");
+  const getNextPageBtn = () => {
+    const pagination = getPagination();
+    if (!pagination) return null;
+    return firstVisible(pagination.querySelectorAll('button.pagination__arrow:not(.pagination__arrow--left), .pagination__arrow:not(.pagination__arrow--left)'));
+  };
+  const isPageBtnDisabled = (btn) => !btn || btn.disabled || /disabled/.test(btn.className || "") || String(btn.getAttribute("aria-disabled") || "").toLowerCase() === "true";
+
+  const getHeaderCheckboxTh = () => firstVisible(document.querySelectorAll("thead tr.pt__header th.pt__th--checkbox, thead tr.pt__header--selected th.pt__th--checkbox"));
+  const getHeaderRowsSelected = () => getRows().length > 0 && getRows().every(r => /row--selected/.test(r.className || ""));
+  const hasProspectsTable = () => !!firstVisible(document.querySelectorAll(".pt, .pt__table, thead tr.pt__header, tbody tr.row"));
+
+  // ===================== 动作辅助 =====================
+  const waitForUsablePotentialCount = async (phaseLabel = "潜在客户") => {
+    let count = getPotentialTabCount();
+    if (count > 0) return count;
+    if (count === 0 && (hasPotentialCountBadge() || getRows().length > 0)) return count;
+
+    setStatus(`${phaseLabel}：数量暂未就绪，继续等待...`);
+    await waitFor(() => {
+      const c = getPotentialTabCount();
+      return c > 0 || (c === 0 && (hasPotentialCountBadge() || getRows().length > 0));
+    }, 15000, 200);
+
+    count = getPotentialTabCount();
+    if (count >= 0) return count;
+    if (getRows().length > 0) return getRows().length;
+    return -1;
+  };
+
+  const waitProspectsReady = async (phaseLabel = "潜在客户") => {
+    setStatus(`${phaseLabel}：等待列表加载...`);
+    const ok = await waitFor(() => {
+      const li = getPotentialTabLi();
+      const active = !!li && /tabs-nav__item--active/.test(li.className || "");
+      return active && !!getKeywordInput() && !!getSearchBtn() && (hasProspectsTable() || getPotentialTabCount() >= 0);
+    }, CFG.waitChangeTimeoutMs);
+    if (!ok) throw new Error(`点击【${phaseLabel}】后等待列表加载超时`);
+    await waitForUsablePotentialCount(phaseLabel);
+    await sleep(700);
+  };
+
+  const ensurePotentialTabActive = async ({ forceClick = false, phaseLabel = "潜在客户" } = {}) => {
+    const tab = getPotentialTab();
+    if (!tab) throw new Error("没找到【潜在客户】tab");
+    const li = getPotentialTabLi();
+    const active = /tabs-nav__item--active/.test(li?.className || "");
+    if (forceClick || !active) {
+      setStatus(`切换到【${phaseLabel}】...`);
+      safeClick(tab);
+      const ok = await waitFor(() => /tabs-nav__item--active/.test(getPotentialTabLi()?.className || ""), CFG.waitChangeTimeoutMs);
+      if (!ok) throw new Error(`切换到【${phaseLabel}】失败`);
+    }
+    await waitProspectsReady(phaseLabel);
+  };
+
+  const cleanKeywordText = (s) => norm(s).replace(/\s*[×✕]\s*$/, "").trim();
+  const selectedKeywordCache = new Set();
+  const keywordCacheKey = (kw) => lower(cleanKeywordText(kw));
+  const markKeywordSelected = (kw) => {
+    const key = keywordCacheKey(kw);
+    if (key) selectedKeywordCache.add(key);
+  };
+  const hasKeywordSelectedCache = (kw) => selectedKeywordCache.has(keywordCacheKey(kw));
+
+  const getKeywordDropdown = () => firstVisible(document.querySelectorAll(".popper-select__dropdown"));
+
+  const getKeywordDropdownItems = () => {
+    const dd = getKeywordDropdown();
+    if (!dd) return [];
+    return Array.from(dd.querySelectorAll(".popper-select__item")).filter(isVisible);
+  };
+
+  const getKeywordItemName = (item) => cleanKeywordText(item?.querySelector(".popper-select__item-name")?.innerText || item?.querySelector(".popper-select__item-name")?.textContent || item?.innerText || item?.textContent || "");
+
+  const isKeywordItemSelected = (item) => {
+    if (!item) return false;
+    const cls = String(item.className || "");
+    const cb = item.querySelector('input[type="checkbox"], input[data-test="snov-checkbox-input"]');
+    return cls.includes("popper-select__item--selected") || !!cb?.checked || !!item.querySelector(".snv-checkbox--checked, .snv-checkbox__svg-check");
+  };
+
+  const findKeywordDropdownItem = (kw) => {
+    const target = lower(kw);
+    const items = getKeywordDropdownItems();
+    return items.find(item => lower(getKeywordItemName(item)) === target) || null;
+  };
+
+  const hasKeywordChip = (kw) => {
+    const root = getProspectsSearchRoot();
+    if (!root) return false;
+    const target = lower(kw);
+    const nodes = Array.from(root.querySelectorAll(".s-tag__value, .ps__top-target-tag, span, div, button"));
+    return nodes.some(node => {
+      if (node.closest(".popper-select__dropdown")) return false;
+      const txt = lower(cleanKeywordText(node.innerText || node.textContent || ""));
+      return txt === target;
+    });
+  };
+
+  const isKeywordConfirmedSelected = (kw) => {
+    if (hasKeywordSelectedCache(kw)) return true;
+    if (hasKeywordChip(kw)) return true;
+    const item = findKeywordDropdownItem(kw);
+    return !!(item && isKeywordItemSelected(item));
+  };
+
+  const focusKeywordInput = async () => {
+    const input = await waitKeywordInputReady("按职位搜索");
+    const box = input.closest(".ps__top-target, .ps__select, .ps__form, .multiselect__input-box, .ps__input-box, .multiselect") || input;
+    safeClick(box);
+    await sleep(80);
+    safeClick(input);
+    try { input.focus(); } catch (_) {}
+    try { input.dispatchEvent(new FocusEvent("focusin", { bubbles: true })); } catch (_) {}
+    return input;
+  };
+
+  const clearKeywordInputText = async (inputArg = null) => {
+    const input = inputArg || getKeywordInput();
+    if (!input) return;
+    try { input.focus(); } catch (_) {}
+    try {
+      input.setSelectionRange?.(0, String(input.value || "").length);
+    } catch (_) {}
+    try { pressBackspace(input); } catch (_) {}
+    try {
+      setNativeValue(input, "");
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (_) {
+      try {
+        setNativeValue(input, "");
+        fireInputEvents(input);
+      } catch (_) {}
+    }
+    await sleep(80);
+  };
+
+  const blurKeywordInput = async (inputArg = null) => {
+    const input = inputArg || getKeywordInput();
+    if (!input) return;
+    try { pressEscape(input); } catch (_) {}
+    try { input.blur(); } catch (_) {}
+    try { input.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); } catch (_) {}
+    await sleep(220);
+  };
+
+  const finalizeKeywordSelection = async (kw, inputArg = null) => {
+    // 新版组件在标签折叠成“+N”后，已选关键词不一定作为可见 tag 暴露。
+    // 只要候选项已确认选中，就写入本轮缓存，后续不再死等可见 tag，避免每个词额外卡 6 秒。
+    markKeywordSelected(kw);
+
+    const input = inputArg || getKeywordInput();
+    if (input) {
+      await blurKeywordInput(input);
+      if (norm(input.value || "")) {
+        await clearKeywordInputText(input);
+        await blurKeywordInput(input);
+      }
+    }
+
+    // 输入框有时会在 tag 折叠动画中短暂重建；这里只做短等待，不再长时间等待可见 tag。
+    await waitFor(() => !!getKeywordInput(), 2200, 80);
+  };
+
+  const typeKeywordLikeHuman = async (input, kw) => {
+    await clearKeywordInputText(input);
+    try { input.focus(); } catch (_) {}
+    let current = "";
+    for (const ch of String(kw)) {
+      const code = ch === " " ? "Space" : `Key${ch.toUpperCase()}`;
+      fireKeySequence(input, ch, code, ch.charCodeAt(0));
+      fireBeforeInput(input, ch);
+      current += ch;
+      setNativeValue(input, current);
+      fireTextInput(input, ch);
+      await sleep(22);
+    }
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+
+  const forceOpenKeywordDropdown = async (input, kw) => {
+    // 新版组件只靠直接赋值不会打开候选层；这里用点击、逐字输入、ArrowDown 多重触发。
+    const box = input.closest(".ps__top-target, .ps__select, .ps__form, .multiselect__input-box, .ps__input-box, .multiselect") || input;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      safeClick(box);
+      safeClick(input);
+      try { input.focus(); } catch (_) {}
+      pressArrowDown(input);
+      await sleep(180);
+      if (findKeywordDropdownItem(kw) || getKeywordDropdownItems().length) return true;
+      fireInputEvents(input);
+      pressArrowDown(input);
+      await sleep(250);
+      if (findKeywordDropdownItem(kw) || getKeywordDropdownItems().length) return true;
+    }
+    return false;
+  };
+
+  const inputKeywordText = async (kw) => {
+    const input = await focusKeywordInput();
+    await typeKeywordLikeHuman(input, kw);
+    await sleep(250);
+    await forceOpenKeywordDropdown(input, kw);
+    return input;
+  };
+
+  const pickKeywordFromDropdown = async (kw, index, total, inputRef = null) => {
+    const target = lower(kw);
+    setStatus(`选择关键词：${index}/${total}\n当前：${kw}\n等待下拉候选...`);
+
+    let okItem = await waitFor(() => !!findKeywordDropdownItem(kw), 8000, 120);
+    if (!okItem) {
+      const input = getKeywordInput();
+      if (input) {
+        setStatus(`未等到精确候选，重新聚焦并唤起下拉：${kw}`);
+        await forceOpenKeywordDropdown(input, kw);
+        okItem = await waitFor(() => !!findKeywordDropdownItem(kw), 4000, 120);
+      }
+    }
+    if (!okItem) {
+      const input = getKeywordInput();
+      if (input) {
+        setStatus(`仍未等到精确候选，尝试回车兜底：${kw}`);
+        pressEnter(input);
+        await sleep(600);
+      }
+      if (hasKeywordChip(kw) || isKeywordItemSelected(findKeywordDropdownItem(kw))) {
+        await finalizeKeywordSelection(kw, input || inputRef);
+        return true;
+      }
+      const seen = getKeywordDropdownItems().map(getKeywordItemName).filter(Boolean).join(" / ") || "无候选项";
+      throw new Error(`关键词【${kw}】未出现可点击的精确候选项；当前候选：${seen}`);
+    }
+
+    let item = findKeywordDropdownItem(kw);
+    if (!item) throw new Error(`关键词【${kw}】候选项消失`);
+
+    if (!isKeywordItemSelected(item)) {
+      const itemName = getKeywordItemName(item);
+      if (lower(itemName) !== target) throw new Error(`关键词【${kw}】候选匹配异常：${itemName}`);
+      setStatus(`点击候选：${itemName}`);
+      const clickable = firstVisible(item.querySelectorAll('label[data-test="snov-checkbox-label"], .popper-select__item-checkbox, input[data-test="snov-checkbox-input"], .snv-checkbox__box')) || item;
+      safeClick(clickable);
+    } else {
+      setStatus(`候选已处于选中状态：${kw}`);
+    }
+
+    const selectedOk = await waitFor(() => {
+      const latestItem = findKeywordDropdownItem(kw);
+      return hasKeywordChip(kw) || isKeywordItemSelected(latestItem);
+    }, 8000, 120);
+
+    if (!selectedOk) throw new Error(`关键词【${kw}】点击后未确认选中`);
+
+    markKeywordSelected(kw);
+    setStatus(`已确认加入关键词：${kw}`);
+    await finalizeKeywordSelection(kw, inputRef || getKeywordInput());
+    await sleep(rands(CFG.typeIntervalMs));
+    return true;
+  };
+
+  const typeKeywords = async (keywords) => {
+    for (let i = 0; i < keywords.length; i++) {
+      const kw = keywords[i];
+      if (isKeywordConfirmedSelected(kw)) {
+        markKeywordSelected(kw);
+        setStatus(`关键词已存在，跳过：${kw}`);
+        continue;
+      }
+      const input = await inputKeywordText(kw);
+      await pickKeywordFromDropdown(kw, i + 1, keywords.length, input);
+    }
+  };
+
+  const clickSearchAndWait = async (label = "本次") => {
+    const searchBtn = getSearchBtn();
+    if (!searchBtn) throw new Error("没找到结果区右侧【搜索】按钮");
+    const beforeSig = getRowSignature();
+    const beforeCount = getPotentialTabCount();
+    setStatus(`${label}筛选：点击【搜索】...`);
+    safeClick(searchBtn);
+    await sleep(rands(CFG.afterSearchWaitMs));
+
+    const ok = await waitFor(() => {
+      const afterSig = getRowSignature();
+      const afterCount = getPotentialTabCount();
+      if (afterCount >= 0 && afterCount !== beforeCount) return true;
+      if (afterSig && afterSig !== beforeSig) return true;
+      if (getRows().length > 0 && !beforeSig) return true;
+      return false;
+    }, CFG.waitChangeTimeoutMs);
+
+    if (!ok) throw new Error(`${label}点击搜索后，结果区未在预期时间内完成变化`);
+    await sleep(600);
+  };
+
+  const waitTopSearchReady = async () => {
+    setStatus("二次筛选：等待顶部搜索区加载...");
+    const ok = await waitFor(() => {
+      const top = getTopSearchBarReady();
+      return top.ready;
+    }, CFG.waitTopSearchReadyMs, 200);
+    if (!ok) throw new Error("等待顶部搜索区加载超时");
+    await sleep(500);
+  };
+
+  const resetForSecondPass = async () => {
+    await waitTopSearchReady();
+
+    const beforeSig = getRowSignature();
+    const beforeCount = getPotentialTabCount();
+    const mode = await triggerTopSearchSubmit();
+
+    const reacted = await waitFor(() => {
+      const afterSig = getRowSignature();
+      const afterCount = getPotentialTabCount();
+      const tabLi = getPotentialTabLi();
+      const active = /tabs-nav__item--active/.test(tabLi?.className || "");
+      if (afterCount >= 0 && beforeCount >= 0 && afterCount !== beforeCount) return true;
+      if (afterSig && beforeSig && afterSig !== beforeSig) return true;
+      if (!active) return true;
+      return false;
+    }, Math.min(8000, CFG.waitChangeTimeoutMs), 200);
+
+    if (!reacted) {
+      setStatus(`二次筛选：已通过${mode === "button" ? "搜索箭头" : "输入框回车"}触发重置，继续等待列表刷新...`);
+    }
+
+    const tabVisible = await waitFor(() => !!getPotentialTab(), CFG.waitChangeTimeoutMs, 200);
+    if (!tabVisible) throw new Error("二次筛选重置后，未等到【潜在客户】tab 出现");
+
+    await sleep(1200);
+    await ensurePotentialTabActive({ forceClick: true, phaseLabel: "潜在客户" });
+  };
+
+  const selectAllCurrentPage = async (pageIndexForLog) => {
+    const rows = getRows();
+    if (!rows.length) throw new Error("当前页没有联系人行，无法勾选");
+    if (getHeaderRowsSelected()) {
+      setStatus(`第 ${pageIndexForLog} 页已全选，跳过重复勾选`);
+      return;
+    }
+
+    const th = getHeaderCheckboxTh();
+    if (!th) throw new Error("没找到表头勾选区域");
+
+    const beforeSelected = getSelectedCount();
+    const clickableList = [
+      firstVisible(th.querySelectorAll("label[data-test='snov-checkbox-label']")),
+      firstVisible(th.querySelectorAll("input[type='checkbox']")),
+      firstVisible(th.querySelectorAll(".snv-checkbox__box")),
+      firstVisible(th.querySelectorAll(".pt__checkbox-wrap")),
+      th
+    ].filter(Boolean);
+
+    let applied = false;
+    for (const el of clickableList) {
+      setStatus(`第 ${pageIndexForLog} 页：勾选当前页...`);
+      safeClick(el);
+      const ok = await waitFor(() => {
+        return getHeaderRowsSelected() || getSelectedCount() > beforeSelected || getRows().some(r => /row--selected/.test(r.className || ""));
+      }, CFG.selectApplyWaitMs, 120);
+      if (ok) {
+        applied = true;
+        break;
+      }
+      await sleep(150);
+    }
+
+    if (!applied) throw new Error(`第 ${pageIndexForLog} 页勾选未生效`);
+    await sleep(350);
+  };
+
+  const goNextPage = async (pageIndexForLog) => {
+    const nextBtn = getNextPageBtn();
+    if (!nextBtn || isPageBtnDisabled(nextBtn)) return false;
+
+    const beforePage = getCurrentPageNumber();
+    const beforeSig = getRowSignature();
+    setStatus(`第 ${pageIndexForLog} 页完成，翻到下一页...`);
+    safeClick(nextBtn);
+
+    const ok = await waitFor(() => {
+      const afterPage = getCurrentPageNumber();
+      const afterSig = getRowSignature();
+      return (afterPage > beforePage) || (!!afterSig && !!beforeSig && afterSig !== beforeSig && afterPage !== beforePage);
+    }, CFG.waitChangeTimeoutMs);
+
+    if (!ok) throw new Error(`翻到第 ${pageIndexForLog + 1} 页失败`);
+    await sleep(rands(CFG.pageChangeExtraWaitMs));
+    return true;
+  };
+
+  const selectAllAcrossPages = async () => {
+    let filteredTotal = getFilteredTotalCount();
+    if (filteredTotal <= 0) throw new Error("未读取到筛选结果数量，无法逐页勾选");
+    if (!getRows().length) throw new Error("当前没有联系人行，无法加入列表");
+
+    let pageIndex = getCurrentPageNumber() || 1;
+    while (pageIndex <= CFG.maxPageLoop) {
+      await waitProspectsReady();
+      await selectAllCurrentPage(pageIndex);
+
+      const selectedCount = getSelectedCount();
+      filteredTotal = getFilteredTotalCount();
+      setStatus(`逐页勾选中...\n当前页：${pageIndex}\n已选择：${selectedCount}/${filteredTotal}`);
+
+      if (selectedCount >= filteredTotal) return;
+
+      const moved = await goNextPage(pageIndex);
+      if (!moved) {
+        if (getHeaderRowsSelected()) {
+          setStatus(`已到最后一页，当前页已全部选中\n站点计数可能异常，按已完成处理\n当前选择：${selectedCount}/${filteredTotal}`);
+          return;
+        }
+        throw new Error(`已到最后一页，但当前仅选择 ${selectedCount}/${filteredTotal}，请检查分页或勾选状态`);
+      }
+      pageIndex = getCurrentPageNumber() || (pageIndex + 1);
+    }
+
+    throw new Error(`逐页勾选超过 ${CFG.maxPageLoop} 页，已停止，避免死循环`);
+  };
+
+  // ===================== 主流程 =====================
+  let busy = false;
+
+  const finishRunSuccessfully = (msg) => {
+    setStatus(msg || "✅ 筛选完成");
+    showSuccessToast("✅ 筛选完成");
+  };
+
+  const failRun = (err) => {
+    setStatus("❌ 运行异常：\n" + (err?.message || err?.stack || String(err)));
+    showErrorToast("❌ 运行错误");
+  };
+
+  const runFilter = async ({ customKeywords = null, passLabel = "第一次", isSecondPass = false, silentBusyCheck = false } = {}) => {
+    if (busy && !silentBusyCheck) return;
+    busy = true;
+    setBusy(true);
+
+    try {
+      await ensurePotentialTabActive({ phaseLabel: "潜在客户" });
+
+      let initialCount = await waitForUsablePotentialCount("潜在客户");
+      if (initialCount < 0) throw new Error("未找到【潜在客户】数量");
+      if (initialCount === 0) {
+        setStatus("潜在客户数量当前仍为 0，追加等待确认...");
+        await waitFor(() => getPotentialTabCount() > 0 || getRows().length > 0, 8000, 200);
+        const retryCount = getPotentialTabCount();
+        if (retryCount > 0) initialCount = retryCount;
+      }
+      if (initialCount === 0) throw new Error("潜在客户数量为 0，无法运行筛选");
+      setStatus(`${passLabel}开始前读取到潜在客户：${initialCount}`);
+
+      const kws = customKeywords || kwsText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      if (!kws.length) throw new Error("关键词列表为空");
+
+      if (!isSecondPass && initialCount <= DIRECT_PASS_MAX) {
+        finishRunSuccessfully(`初始潜在客户：${initialCount}\n人数不超过 ${DIRECT_PASS_MAX}，无需筛选，已直接完成`);
+        return;
+      }
+
+      setStatus(`${passLabel}开始输入职位关键词...\n共 ${kws.length} 个`);
+      await typeKeywords(kws);
+      await clickSearchAndWait(passLabel);
+
+      const countAfter = await waitForUsableFilteredCount(`${passLabel}筛选结果`);
+      if (countAfter < 0) throw new Error(`${passLabel}筛选后，未成功读取到筛选结果人数`);
+      if (countAfter === 0) throw new Error(`${passLabel}筛选后人数为 0，已停止`);
+
+      if (!isSecondPass && initialCount >= MID_FILTER_MIN && initialCount <= MID_FILTER_MAX) {
+        const removed = Math.max(0, initialCount - countAfter);
+        const removedRatio = initialCount > 0 ? removed / initialCount : 0;
+        if (removedRatio > 0.5) {
+          finishRunSuccessfully(`${passLabel}筛选完成\n初始潜在客户：${initialCount}\n筛选后潜在客户：${countAfter}\n已剔除超过 50%，按筛选后人数继续`);
+        } else {
+          finishRunSuccessfully(`${passLabel}筛选完成\n初始潜在客户：${initialCount}\n筛选后潜在客户：${countAfter}\n已按当前筛选结果完成`);
+        }
+        return;
+      }
+
+      if (countAfter > LARGE_FILTER_STOP_MAX) {
+        if (isSecondPass) {
+          throw new Error(`二次筛选后人数为 ${countAfter}，仍大于 ${LARGE_FILTER_STOP_MAX}，已停止`);
+        }
+        const secondKws = kws.filter(kw => !SECOND_PASS_EXCLUDES.includes(lower(kw)));
+        setStatus(`${passLabel}筛选人数 ${countAfter} > ${LARGE_FILTER_STOP_MAX}\n准备执行二次筛选...`);
+        await sleep(600);
+        await resetForSecondPass();
+        await runFilter({ customKeywords: secondKws, passLabel: "第二次", isSecondPass: true, silentBusyCheck: true });
+        return;
+      }
+
+      finishRunSuccessfully(`${passLabel}筛选完成\n潜在客户：${countAfter}`);
+    } catch (e) {
+      failRun(e);
+    } finally {
+      busy = false;
+      setBusy(false);
+    }
+  };
+
+  const addToList = async () => {
+    if (busy) return;
+    busy = true;
+    setBusy(true);
+
+    const clearListNameInput = () => {
+      const listInput = document.getElementById("__sn_listname__");
+      if (listInput) {
+        listInput.value = "";
+        fireInputEvents(listInput);
+        try { sessionStorage.removeItem(LISTNAME_STORE_KEY); } catch(_) {}
+      }
+    };
+
+    try {
+      await ensurePotentialTabActive({ phaseLabel: "潜在客户" });
+
+      if (!getRows().length) {
+        setStatus("❌ 当前没有列表数据（请先运行筛选）");
+        return;
+      }
+
+      const listName = getPanelListName();
+      if (!listName) {
+        setStatus("❌ 请先在面板里输入“新列表名称”，再点【加入列表】");
+        return;
+      }
+
+      await selectAllAcrossPages();
+
+      const totalCount = getFilteredTotalCount();
+      const selectedCount = getSelectedCount();
+      setStatus(`已完成逐页勾选\n已选择：${selectedCount}/${totalCount}\n准备保存到列表...`);
+
+      const saveBtn = getSaveToListBtn();
+      if (!saveBtn) throw new Error("没找到【保存到列表】按钮");
+      safeClick(saveBtn);
+
+      const openOk = await waitFor(() => !!(findListItemByName(listName) || getCreateListInput()), CFG.waitCreateEnableMs, 200);
+      if (!openOk) throw new Error("打开【保存到列表】下拉失败");
+
+      const existed = findListItemByName(listName);
+      if (existed) {
+        setStatus(`列表已存在：选择【${listName}】...`);
+        safeClick(existed);
+        setStatus(`✅ 已选择已有列表：${listName}`);
+        showSuccessToast("✅ 已加入列表");
+        clearListNameInput();
+        return;
+      }
+
+      const input = getCreateListInput();
+      if (!input) throw new Error("未出现“输入新列表名称”输入框");
+      input.focus();
+      setNativeValue(input, listName);
+      fireInputEvents(input);
+
+      setStatus(`等待【创建】按钮变为可点击...\n${listName}`);
+      const okEnable = await waitFor(() => {
+        const btn = getCreateBtn();
+        return btn && isBtnEnabled(btn);
+      }, CFG.waitCreateEnableMs, 200);
+
+      if (!okEnable) throw new Error("创建按钮仍不可点（可能名称不合法/重复/未触发校验）");
+
+      const createBtn = getCreateBtn();
+      if (!createBtn) throw new Error("没找到【创建】按钮");
+      safeClick(createBtn);
+
+      setStatus(`等待新列表出现在可选列表中...\n${listName}`);
+      const okItem = await waitFor(() => !!findListItemByName(listName), CFG.waitListAppearMs, 300);
+      if (!okItem) throw new Error(`超时：新列表未出现在可选列表中【${listName}】`);
+
+      safeClick(findListItemByName(listName));
+      setStatus(`✅ 已创建并选择列表：${listName}`);
+      showSuccessToast("✅ 已加入列表");
+      clearListNameInput();
+    } catch (e) {
+      setStatus("❌ 加入列表异常：\n" + (e?.message || e?.stack || String(e)));
+      showErrorToast("❌ 加入列表失败");
+    } finally {
+      busy = false;
+      setBusy(false);
+    }
+  };
+
+  // ===================== 启动 =====================
+  createPanel();
+  keepAlive();
+})();
